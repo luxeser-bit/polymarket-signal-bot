@@ -30,9 +30,12 @@ class MarketBacktestTests(unittest.TestCase):
                 store.init_schema()
                 store.upsert_order_books([book], raw_by_asset={"token-1": raw})
                 fetched = store.latest_order_book("token-1")
+                history = store.order_book_history_summary()
 
         self.assertIsNotNone(fetched)
         self.assertEqual(fetched.asset, "token-1")
+        self.assertEqual(int(history["snapshots"]), 1)
+        self.assertEqual(int(history["assets"]), 1)
 
     def test_backtest_replays_copy_trade_with_delay(self) -> None:
         now = int(time.time()) - 3600

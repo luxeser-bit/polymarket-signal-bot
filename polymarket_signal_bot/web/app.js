@@ -223,7 +223,9 @@ function renderScale(state) {
     { status: "DUCKDB", label: state.stats.duckdbExists ? `${formatBytes(state.stats.duckdbSizeBytes)} ${state.stats.duckdbPath}` : "snapshot not built", pct: state.stats.duckdbExists ? 1 : 0 },
     { status: "ANALYTICS", label: `${String(state.meta.analyticsStatus || "idle").toUpperCase()} ${state.meta.analyticsSummary || state.meta.analyticsError || ""}`, pct: state.meta.analyticsStatus === "ready" ? 1 : 0 },
     { status: "POLICY", label: state.meta.signalPolicyActive || state.meta.policySummary || `recommended=${state.meta.policyRecommended}`, pct: state.meta.policySummary ? 1 : 0 },
-    { status: "JOURNAL", label: state.meta.journalSummary || "no decisions logged yet", pct: state.stats.paperEvents ? 1 : 0 }
+    { status: "JOURNAL", label: state.meta.journalSummary || "no decisions logged yet", pct: state.stats.paperEvents ? 1 : 0 },
+    { status: "BOOK HIST", label: state.meta.bookHistorySummary || "no historical order books yet", pct: state.stats.bookHistorySnapshots ? 1 : 0 },
+    { status: "LEARNING", label: state.meta.learningSummary || "no outcome rows yet", pct: state.learning && state.learning.length ? 1 : 0 }
   ];
   els.scaleFeed.innerHTML = rows.map(row => `
     <div class="row">

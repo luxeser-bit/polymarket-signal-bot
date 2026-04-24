@@ -43,12 +43,14 @@ python -m polymarket_signal_bot discover-from-trades --limit 5000 --min-notional
 python -m polymarket_signal_bot wallets-export --out data/watchlist.txt
 python -m polymarket_signal_bot bulk-sync --wallet-limit 100 --max-pages-per-wallet 2
 python -m polymarket_signal_bot sync-books --asset-limit 40 --lookback-minutes 1440
+python -m polymarket_signal_bot history-backfill
 python -m polymarket_signal_bot analytics-export --duckdb data/polysignal.duckdb
 python -m polymarket_signal_bot analytics-report --duckdb data/polysignal.duckdb
 python -m polymarket_signal_bot scan --bankroll 200 --min-wallet-score 0.55 --min-trade-usdc 50
 python -m polymarket_signal_bot backtest --history-days 30 --bankroll 200 --compare-cohort-policy
 python -m polymarket_signal_bot policy-optimizer --history-days 30 --bankroll 200
 python -m polymarket_signal_bot cohort-report --history-days 30 --min-trades 2 --min-notional 100
+python -m polymarket_signal_bot wallet-learning --since-days 90 --limit 20
 python -m polymarket_signal_bot report
 python -m polymarket_signal_bot paper-journal --since-days 30 --limit 20
 python -m polymarket_signal_bot reviews --status PENDING
@@ -183,6 +185,10 @@ python -m polymarket_signal_bot run-once --leaderboard-limit 50 --days 7 --bankr
 - The paper decision journal records created signals, opened paper positions,
   blocked entries, and closed positions with reason, policy, cohort, risk state,
   size, price, PnL, and hold time for future learning.
+- Every order-book sync now appends a historical liquidity snapshot, so spread,
+  depth, and liquidity can be analyzed over time instead of only as latest state.
+- Outcome-aware wallet learning ranks wallet/category pairs by paper decisions,
+  realized PnL, hit rate, blocked rate, and risk-exit rate.
 
 ## Roadmap status
 
@@ -233,6 +239,10 @@ Done:
   and risk-trim exits that gradually unload an over-limit paper portfolio.
 - Paper decision journal v1: `paper_events` logs signal/open/block/close
   decisions and is exported into DuckDB for the three-level learning loop.
+- Order-book history v1: `order_books_history` stores historical spread, depth,
+  and liquidity snapshots from each book sync and exports them into DuckDB.
+- Wallet learning v1: `wallet-learning` ranks wallet/category outcomes from the
+  paper decision journal for adaptive wallet scoring.
 
 Partial:
 
@@ -247,8 +257,8 @@ Partial:
 
 Next:
 
-- Use the paper decision journal to calibrate rules and build outcome-aware
-  wallet stats by market category.
+- Feed outcome-aware wallet stats back into wallet scoring instead of only
+  reporting them.
 - Accumulate deeper multi-day market-flow history before trusting cohort-policy
   backtest deltas.
 - Add an approval inbox action in the dashboard instead of CLI-only approval.

@@ -13,6 +13,7 @@ from .analytics import DEFAULT_DUCKDB_PATH
 from .bulk_sync import TARGET_TRADES, TARGET_WALLETS
 from .cohorts import CohortConfig, wallet_cohort_report
 from .demo import demo_trades, demo_wallets
+from .learning import format_wallet_outcome_summary, wallet_outcome_report
 from .paper import PaperBroker
 from .policy_optimizer import policy_settings_from_recommendation
 from .scoring import score_wallets
@@ -118,12 +119,14 @@ def build_dashboard_state(store: Store, *, bankroll: float = DEFAULT_BANKROLL) -
     summary = store.paper_summary()
     stats = _db_stats(store)
     sync_progress = store.sync_progress()
+    book_history = store.order_book_history_summary()
     duckdb_path = Path(DEFAULT_DUCKDB_PATH)
     duckdb_exists = duckdb_path.exists()
     runtime = store.runtime_state()
     alerts = store.fetch_recent_alerts(limit=8)
     reviews = store.fetch_review_queue("PENDING", limit=8)
     cohort_report = wallet_cohort_report(store, CohortConfig(history_days=30, min_trades=2, min_notional=100, limit=12))
+    learning_report = wallet_outcome_report(store, since_days=90, min_events=1, limit=8)
     marked_positions = [_position_payload(store, position, books) for position in open_positions]
     unrealized = sum(item["unrealizedPnl"] for item in marked_positions)
     current_bankroll = bankroll + summary["realized_pnl"] + unrealized
@@ -155,6 +158,8 @@ def build_dashboard_state(store: Store, *, bankroll: float = DEFAULT_BANKROLL) -
             "exitSummary": _runtime_value(runtime, "exit_last_summary", ""),
             "exitReasons": _runtime_value(runtime, "exit_last_reasons", ""),
             "journalSummary": _journal_summary_label(journal_summary),
+            "learningSummary": format_wallet_outcome_summary(learning_report),
+            "bookHistorySummary": _book_history_label(book_history),
         },
         "stats": {
             "bankroll": round(current_bankroll, 2),
@@ -174,6 +179,8 @@ def build_dashboard_state(store: Store, *, bankroll: float = DEFAULT_BANKROLL) -
             "bulkTradesSeen": sync_progress["trades_seen"],
             "bulkWalletsSeen": sync_progress["wallets_with_state"],
             "bulkPagesSynced": sync_progress["pages_synced"],
+            "bookHistorySnapshots": int(book_history["snapshots"]),
+            "bookHistoryAssets": int(book_history["assets"]),
             "duckdbExists": duckdb_exists,
             "duckdbSizeBytes": duckdb_path.stat().st_size if duckdb_exists else 0,
             "duckdbPath": str(duckdb_path),
@@ -193,6 +200,7 @@ def build_dashboard_state(store: Store, *, bankroll: float = DEFAULT_BANKROLL) -
         "alerts": _alert_rows(alerts),
         "reviews": _review_rows(reviews),
         "cohorts": cohort_report,
+        "learning": learning_report["wallets"],
     }
 
 
@@ -519,6 +527,18 @@ def _journal_summary_label(summary: dict[str, Any]) -> str:
     return (
         f"{int(summary.get('total_events') or 0)} decisions; "
         f"top={top['event_type']}:{top['reason']} x{int(top['events'])}"
+    )
+
+
+def _book_history_label(summary: dict[str, float]) -> str:
+    snapshots = int(summary.get("snapshots") or 0)
+    assets = int(summary.get("assets") or 0)
+    if snapshots <= 0:
+        return "no historical order books yet"
+    return (
+        f"{snapshots} snapshots / {assets} assets; "
+        f"avg_spread={float(summary.get('avg_spread') or 0):.4f} "
+        f"liq={float(summary.get('avg_liquidity') or 0):.3f}"
     )
 
 

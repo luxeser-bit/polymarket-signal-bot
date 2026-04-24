@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import sqlite3
 import time
 import json
@@ -196,6 +197,30 @@ class Store:
             );
             CREATE INDEX IF NOT EXISTS idx_order_books_liquidity
                 ON order_books_latest(liquidity_score DESC, spread ASC);
+
+            CREATE TABLE IF NOT EXISTS order_books_history (
+                snapshot_id TEXT PRIMARY KEY,
+                observed_at INTEGER NOT NULL,
+                asset TEXT NOT NULL,
+                market TEXT NOT NULL DEFAULT '',
+                source_timestamp INTEGER NOT NULL DEFAULT 0,
+                best_bid REAL NOT NULL DEFAULT 0,
+                best_ask REAL NOT NULL DEFAULT 0,
+                mid REAL NOT NULL DEFAULT 0,
+                spread REAL NOT NULL DEFAULT 1,
+                bid_depth_usdc REAL NOT NULL DEFAULT 0,
+                ask_depth_usdc REAL NOT NULL DEFAULT 0,
+                liquidity_score REAL NOT NULL DEFAULT 0,
+                last_trade_price REAL NOT NULL DEFAULT 0,
+                raw_json TEXT NOT NULL DEFAULT '',
+                inserted_at INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_order_books_history_asset_time
+                ON order_books_history(asset, observed_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_order_books_history_time
+                ON order_books_history(observed_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_order_books_history_liquidity
+                ON order_books_history(liquidity_score DESC, spread ASC);
 
             CREATE TABLE IF NOT EXISTS signal_reviews (
                 signal_id TEXT PRIMARY KEY,
@@ -535,6 +560,7 @@ class Store:
         now = int(time.time())
         count = 0
         raw_by_asset = raw_by_asset or {}
+        history_rows: list[tuple[object, ...]] = []
         for book in books:
             if not book.asset:
                 continue
@@ -579,9 +605,71 @@ class Store:
                     now,
                 ),
             )
+            history_rows.append(_order_book_history_values(book, raw_json, now))
             count += 1
+        self.conn.executemany(
+            """
+            INSERT OR IGNORE INTO order_books_history(
+                snapshot_id, observed_at, asset, market, source_timestamp,
+                best_bid, best_ask, mid, spread, bid_depth_usdc, ask_depth_usdc,
+                liquidity_score, last_trade_price, raw_json, inserted_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            history_rows,
+        )
         self.conn.commit()
         return count
+
+    def backfill_order_book_history_from_latest(self) -> int:
+        now = int(time.time())
+        rows = self.conn.execute("SELECT * FROM order_books_latest WHERE asset != ''").fetchall()
+        values = []
+        for row in rows:
+            values.append(
+                _order_book_history_values(
+                    order_book_from_row(row),
+                    str(row["raw_json"] or ""),
+                    int(row["updated_at"] or now),
+                )
+            )
+        cursor = self.conn.executemany(
+            """
+            INSERT OR IGNORE INTO order_books_history(
+                snapshot_id, observed_at, asset, market, source_timestamp,
+                best_bid, best_ask, mid, spread, bid_depth_usdc, ask_depth_usdc,
+                liquidity_score, last_trade_price, raw_json, inserted_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            values,
+        )
+        self.conn.commit()
+        return cursor.rowcount if cursor.rowcount >= 0 else len(values)
+
+    def order_book_history_summary(self) -> dict[str, float]:
+        row = self.conn.execute(
+            """
+            SELECT
+                COUNT(*) AS snapshots,
+                COUNT(DISTINCT asset) AS assets,
+                COALESCE(MIN(observed_at), 0) AS first_seen,
+                COALESCE(MAX(observed_at), 0) AS last_seen,
+                COALESCE(AVG(spread), 0) AS avg_spread,
+                COALESCE(AVG(liquidity_score), 0) AS avg_liquidity,
+                COALESCE(AVG(bid_depth_usdc + ask_depth_usdc), 0) AS avg_depth
+            FROM order_books_history
+            """
+        ).fetchone()
+        return {
+            "snapshots": float(row["snapshots"] or 0),
+            "assets": float(row["assets"] or 0),
+            "first_seen": float(row["first_seen"] or 0),
+            "last_seen": float(row["last_seen"] or 0),
+            "avg_spread": float(row["avg_spread"] or 0),
+            "avg_liquidity": float(row["avg_liquidity"] or 0),
+            "avg_depth": float(row["avg_depth"] or 0),
+        }
 
     def fetch_order_books(self, assets: list[str] | None = None, limit: int = 50) -> dict[str, OrderBookSnapshot]:
         if assets:
@@ -1252,6 +1340,46 @@ def paper_event_from_row(row: sqlite3.Row) -> PaperEvent:
         hold_seconds=row["hold_seconds"],
         metadata_json=row["metadata_json"],
     )
+
+
+def _order_book_history_values(
+    book: OrderBookSnapshot,
+    raw_json: str,
+    observed_at: int,
+) -> tuple[object, ...]:
+    snapshot_id = _order_book_snapshot_id(book, observed_at)
+    return (
+        snapshot_id,
+        observed_at,
+        book.asset,
+        book.market,
+        int(book.timestamp or 0),
+        book.best_bid,
+        book.best_ask,
+        book.mid,
+        book.spread,
+        book.bid_depth_usdc,
+        book.ask_depth_usdc,
+        book.liquidity_score,
+        book.last_trade_price,
+        raw_json,
+        int(time.time()),
+    )
+
+
+def _order_book_snapshot_id(book: OrderBookSnapshot, observed_at: int) -> str:
+    raw = "|".join(
+        [
+            book.asset,
+            str(observed_at),
+            f"{book.best_bid:.8f}",
+            f"{book.best_ask:.8f}",
+            f"{book.mid:.8f}",
+            f"{book.bid_depth_usdc:.4f}",
+            f"{book.ask_depth_usdc:.4f}",
+        ]
+    )
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:32]
 
 
 def order_book_from_row(row: sqlite3.Row) -> OrderBookSnapshot:

@@ -110,6 +110,11 @@ A signal is only useful if it can be entered at a reasonable price:
 - last trade price;
 - stale-price age.
 
+Current implementation: `order_books_latest` stores the latest book per asset,
+and `order_books_history` appends historical spread, depth, and liquidity
+snapshots from each book sync. The DuckDB view `v_order_book_history_daily`
+summarizes this history by day.
+
 ### Paper Decisions
 
 The system must log its own behavior, not only public market behavior:
@@ -126,6 +131,10 @@ Current implementation: the `paper_events` table records `SIGNAL_CREATED`,
 `OPENED`, `BLOCKED`, and `CLOSED` events. It is available through
 `paper-journal`, the dashboard scale panel, and DuckDB export as
 `v_paper_event_summary`.
+
+Outcome-aware wallet learning is available through `wallet-learning` and the
+DuckDB `v_wallet_outcome` view. It ranks wallet/category pairs by paper events,
+open/block behavior, realized PnL, hit rate, and risk-exit rate.
 
 This decision journal is the bridge from rule-based paper trading to adaptive
 learning.

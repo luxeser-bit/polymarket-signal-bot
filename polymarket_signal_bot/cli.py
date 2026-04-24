@@ -25,6 +25,7 @@ from .bulk_sync import BulkSync, BulkSyncConfig
 from .cohorts import CohortConfig, format_cohort_summary, wallet_cohort_report
 from .dashboard import serve_dashboard
 from .demo import demo_trades, demo_wallets
+from .learning import format_wallet_outcome_summary, wallet_outcome_report
 from .market_flow import MarketFlowConfig, format_market_flow_summary, sync_market_flow
 from .monitor import Monitor, MonitorConfig
 from .models import OrderBookSnapshot, Trade, Wallet
@@ -141,6 +142,9 @@ def build_parser() -> argparse.ArgumentParser:
     sync_books.add_argument("--lookback-minutes", type=int, default=24 * 60)
     sync_books.set_defaults(func=cmd_sync_books)
 
+    history_backfill = sub.add_parser("history-backfill", help="Backfill historical learning tables from local snapshots.")
+    history_backfill.set_defaults(func=cmd_history_backfill)
+
     scan = sub.add_parser("scan", help="Score wallets, create signals, and update paper positions.")
     add_signal_args(scan)
     scan.add_argument("--history-days", type=int, default=14, help="Trade history used for wallet scoring.")
@@ -182,6 +186,12 @@ def build_parser() -> argparse.ArgumentParser:
     cohort_report.add_argument("--min-trades", type=int, default=1)
     cohort_report.add_argument("--limit", type=int, default=20)
     cohort_report.set_defaults(func=cmd_cohort_report)
+
+    wallet_learning = sub.add_parser("wallet-learning", help="Rank wallet/category outcomes from paper decisions.")
+    wallet_learning.add_argument("--since-days", type=int, default=90)
+    wallet_learning.add_argument("--min-events", type=int, default=1)
+    wallet_learning.add_argument("--limit", type=int, default=20)
+    wallet_learning.set_defaults(func=cmd_wallet_learning)
 
     analytics_export = sub.add_parser("analytics-export", help="Export SQLite data into a DuckDB analytics snapshot.")
     analytics_export.add_argument("--duckdb", default=str(DEFAULT_DUCKDB_PATH))
@@ -517,7 +527,22 @@ def cmd_sync_books(args: argparse.Namespace) -> int:
             books = [OrderBookSnapshot.from_api(row) for row in rows]
             raw_by_asset = {str(row.get("asset_id") or ""): row for row in rows}
             total += store.upsert_order_books(books, raw_by_asset=raw_by_asset)
+        history = store.order_book_history_summary()
         print(f"Order books synced: {total}")
+        print(f"Order-book history: snapshots={int(history['snapshots'])} assets={int(history['assets'])}")
+    return 0
+
+
+def cmd_history_backfill(args: argparse.Namespace) -> int:
+    with open_store(args.db) as store:
+        store.init_schema()
+        inserted = store.backfill_order_book_history_from_latest()
+        history = store.order_book_history_summary()
+    print(f"Order-book history backfilled: {inserted}")
+    print(
+        f"History snapshots={int(history['snapshots'])} assets={int(history['assets'])} "
+        f"avg_spread={history['avg_spread']:.4f} avg_liquidity={history['avg_liquidity']:.3f}"
+    )
     return 0
 
 
@@ -768,6 +793,46 @@ def cmd_cohort_report(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_wallet_learning(args: argparse.Namespace) -> int:
+    with open_store(args.db) as store:
+        store.init_schema()
+        report = wallet_outcome_report(
+            store,
+            since_days=args.since_days,
+            min_events=args.min_events,
+            limit=args.limit,
+        )
+    print("\nWallet learning report")
+    print(f"  {format_wallet_outcome_summary(report)}")
+
+    print("\nTop wallet/category outcomes")
+    if not report["wallets"]:
+        print("  No paper decision outcomes yet.")
+    for row in report["wallets"]:
+        print(
+            f"  {row['learningScore']:.3f} {row['categoryLabel']:<8} {short_wallet(row['wallet'])} "
+            f"events={row['events']} sig={row['signals']} open={row['opened']} "
+            f"block={row['blocked']} closed={row['closed']} pnl={money(row['pnl'])} "
+            f"hit={row['hitRate']:.0%} risk_exit={row['riskExitRate']:.0%}"
+        )
+        detail = []
+        if row["topCohort"]:
+            detail.append(f"cohort={row['topCohort']}")
+        if row["topBlockReason"]:
+            detail.append(f"top_block={row['topBlockReason']}")
+        if detail:
+            print(f"    {' '.join(detail)}")
+
+    print("\nBy category")
+    for row in report["categories"]:
+        print(
+            f"  {row['categoryLabel']:<8} events={row['events']} open={row['opened']} "
+            f"block={row['blocked']} closed={row['closed']} pnl={money(row['pnl'])} "
+            f"score={row['learningScore']:.3f}"
+        )
+    return 0
+
+
 def cmd_analytics_export(args: argparse.Namespace) -> int:
     try:
         with Store(args.db) as store:
@@ -837,6 +902,20 @@ def cmd_analytics_report(args: argparse.Namespace) -> int:
         print(
             f"  {row['event_type']:<14} {str(row['reason']):<22} "
             f"events={row['events']} pnl={money(row['pnl'])} avg_conf={row['avg_confidence']:.3f}"
+        )
+    print("\nWallet outcomes")
+    for row in report["wallet_outcomes"]:
+        print(
+            f"  {row['learning_score']:.3f} {str(row['category']).upper():<8} "
+            f"{short_wallet(row['wallet'])} events={row['events']} closed={row['closed']} "
+            f"pnl={money(row['pnl'])} hit={row['hit_rate']:.0%} blocked={row['blocked_rate']:.0%}"
+        )
+    print("\nOrder-book history")
+    for row in report["book_history"]:
+        print(
+            f"  {row['observed_day']} snapshots={row['snapshots']} assets={row['assets']} "
+            f"spread={row['avg_spread']:.4f} liquidity={row['avg_liquidity']:.3f} "
+            f"depth={money(row['avg_depth'])}"
         )
     return 0
 

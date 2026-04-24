@@ -23,6 +23,7 @@ EXPORT_TABLES = [
     "paper_positions",
     "paper_events",
     "order_books_latest",
+    "order_books_history",
     "signal_reviews",
     "wallet_sync_state",
     "alert_events",
@@ -199,6 +200,27 @@ def analytics_report(duckdb_path: str | Path = DEFAULT_DUCKDB_PATH, *, limit: in
                 SELECT event_type, reason, events, pnl, avg_confidence
                 FROM v_paper_event_summary
                 ORDER BY events DESC, event_type ASC, reason ASC
+                LIMIT ?
+                """,
+                (limit,),
+            ),
+            "wallet_outcomes": _fetch_all(
+                conn,
+                """
+                SELECT wallet, category, events, opened, blocked, closed, wins, losses,
+                       pnl, hit_rate, blocked_rate, learning_score
+                FROM v_wallet_outcome
+                ORDER BY learning_score DESC, pnl DESC, events DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ),
+            "book_history": _fetch_all(
+                conn,
+                """
+                SELECT observed_day, snapshots, assets, avg_spread, avg_liquidity, avg_depth
+                FROM v_order_book_history_daily
+                ORDER BY observed_day DESC
                 LIMIT ?
                 """,
                 (limit,),
@@ -492,6 +514,77 @@ def _create_views(conn: Any) -> None:
             COALESCE(AVG(wallet_score), 0) AS avg_wallet_score
         FROM paper_events
         GROUP BY event_type, COALESCE(NULLIF(reason, ''), 'none')
+        """
+    )
+    conn.execute(
+        """
+        CREATE OR REPLACE VIEW v_wallet_outcome AS
+        WITH grouped AS (
+            SELECT
+                e.wallet,
+                COALESCE(c.category, 'other') AS category,
+                COUNT(*) AS events,
+                SUM(CASE WHEN e.event_type = 'SIGNAL_CREATED' THEN 1 ELSE 0 END) AS signals,
+                SUM(CASE WHEN e.event_type = 'OPENED' THEN 1 ELSE 0 END) AS opened,
+                SUM(CASE WHEN e.event_type = 'BLOCKED' THEN 1 ELSE 0 END) AS blocked,
+                SUM(CASE WHEN e.event_type = 'CLOSED' THEN 1 ELSE 0 END) AS closed,
+                SUM(CASE WHEN e.event_type = 'CLOSED' AND e.pnl > 0 THEN 1 ELSE 0 END) AS wins,
+                SUM(CASE WHEN e.event_type = 'CLOSED' AND e.pnl < 0 THEN 1 ELSE 0 END) AS losses,
+                COALESCE(SUM(CASE WHEN e.event_type = 'CLOSED' THEN e.pnl ELSE 0 END), 0) AS pnl,
+                COALESCE(AVG(e.confidence), 0) AS avg_confidence,
+                COALESCE(AVG(e.wallet_score), 0) AS avg_wallet_score,
+                SUM(CASE WHEN e.reason IN ('risk_trim', 'stop_loss', 'stale_price') THEN 1 ELSE 0 END) AS risk_exits
+            FROM paper_events e
+            LEFT JOIN asset_categories c ON c.asset = e.asset
+            WHERE e.wallet != ''
+            GROUP BY e.wallet, COALESCE(c.category, 'other')
+        )
+        SELECT
+            *,
+            CASE WHEN closed > 0 THEN wins::DOUBLE / closed ELSE 0 END AS hit_rate,
+            CASE WHEN signals > 0 THEN blocked::DOUBLE / signals ELSE 0 END AS blocked_rate,
+            CASE WHEN closed > 0 THEN risk_exits::DOUBLE / closed ELSE 0 END AS risk_exit_rate,
+            CASE
+                WHEN closed > 0 AND wins = 0 AND pnl <= 0 THEN LEAST(0.20, LEAST(1.0, GREATEST(0.0,
+                    0.45 * CASE WHEN closed > 0 THEN wins::DOUBLE / closed ELSE 0 END
+                    + 0.25 * LEAST(1.0, GREATEST(0.0, 0.5 + (CASE WHEN closed > 0 THEN pnl / closed ELSE 0 END) / 10.0))
+                    + 0.20 * CASE
+                        WHEN signals > 0 THEN 1.0 - LEAST(1.0, GREATEST(0.0, blocked::DOUBLE / signals))
+                        ELSE 0.5
+                    END
+                    + 0.10 * CASE
+                        WHEN closed > 0 THEN 1.0 - LEAST(1.0, GREATEST(0.0, risk_exits::DOUBLE / closed))
+                        ELSE 0.5
+                    END
+                )))
+                ELSE LEAST(1.0, GREATEST(0.0,
+                    0.45 * CASE WHEN closed > 0 THEN wins::DOUBLE / closed ELSE 0 END
+                    + 0.25 * LEAST(1.0, GREATEST(0.0, 0.5 + (CASE WHEN closed > 0 THEN pnl / closed ELSE 0 END) / 10.0))
+                    + 0.20 * CASE
+                        WHEN signals > 0 THEN 1.0 - LEAST(1.0, GREATEST(0.0, blocked::DOUBLE / signals))
+                        ELSE 0.5
+                    END
+                    + 0.10 * CASE
+                        WHEN closed > 0 THEN 1.0 - LEAST(1.0, GREATEST(0.0, risk_exits::DOUBLE / closed))
+                        ELSE 0.5
+                    END
+                ))
+            END AS learning_score
+        FROM grouped
+        """
+    )
+    conn.execute(
+        """
+        CREATE OR REPLACE VIEW v_order_book_history_daily AS
+        SELECT
+            CAST(to_timestamp(observed_at) AS DATE) AS observed_day,
+            COUNT(*) AS snapshots,
+            COUNT(DISTINCT asset) AS assets,
+            COALESCE(AVG(spread), 0) AS avg_spread,
+            COALESCE(AVG(liquidity_score), 0) AS avg_liquidity,
+            COALESCE(AVG(bid_depth_usdc + ask_depth_usdc), 0) AS avg_depth
+        FROM order_books_history
+        GROUP BY CAST(to_timestamp(observed_at) AS DATE)
         """
     )
 
