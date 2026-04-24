@@ -113,6 +113,7 @@ def build_dashboard_state(store: Store, *, bankroll: float = DEFAULT_BANKROLL) -
     recent_trades = store.fetch_recent_trades(limit=80)
     books = store.fetch_order_books(limit=30)
     open_positions = store.fetch_open_positions()
+    closed_positions = store.fetch_recent_closed_positions(limit=8)
     summary = store.paper_summary()
     stats = _db_stats(store)
     sync_progress = store.sync_progress()
@@ -150,6 +151,8 @@ def build_dashboard_state(store: Store, *, bankroll: float = DEFAULT_BANKROLL) -
             "riskStatus": risk_snapshot["status"],
             "riskSummary": _runtime_value(runtime, "risk_last_summary", ""),
             "riskBlocks": _runtime_value(runtime, "risk_last_blocks", ""),
+            "exitSummary": _runtime_value(runtime, "exit_last_summary", ""),
+            "exitReasons": _runtime_value(runtime, "exit_last_reasons", ""),
         },
         "stats": {
             "bankroll": round(current_bankroll, 2),
@@ -180,7 +183,8 @@ def build_dashboard_state(store: Store, *, bankroll: float = DEFAULT_BANKROLL) -
         "risk": _risk_rows(marked_positions, bankroll, risk_snapshot),
         "riskState": risk_snapshot,
         "orderBook": _order_book_rows(books, recent_signals, recent_trades),
-        "exitTriggers": _exit_triggers(open_positions, store, now),
+        "exitTriggers": _exit_triggers(open_positions, closed_positions, store, now),
+        "closedPositions": _closed_position_rows(closed_positions),
         "tradeLog": _trade_log(recent_trades),
         "alerts": _alert_rows(alerts),
         "reviews": _review_rows(reviews),
@@ -450,8 +454,17 @@ def _order_book_rows(books: dict[str, Any], signals, trades) -> list[dict[str, A
     return levels
 
 
-def _exit_triggers(positions, store: Store, now: int) -> list[dict[str, Any]]:
+def _exit_triggers(positions, closed_positions, store: Store, now: int) -> list[dict[str, Any]]:
     rows = []
+    for position in closed_positions[:5]:
+        rows.append(
+            {
+                "rule": str(position.close_reason or "CLOSED").upper(),
+                "market": _compact_market(position.title or position.asset),
+                "price": round(float(position.exit_price or position.entry_price), 4),
+                "state": _exit_state(position.close_reason),
+            }
+        )
     for position in positions[:10]:
         latest = store.latest_trade_price(position.asset) or position.entry_price
         if latest <= position.stop_loss:
@@ -475,6 +488,37 @@ def _exit_triggers(positions, store: Store, now: int) -> list[dict[str, Any]]:
             }
         )
     return rows
+
+
+def _closed_position_rows(positions) -> list[dict[str, Any]]:
+    rows = []
+    for position in positions:
+        rows.append(
+            {
+                "reason": str(position.close_reason or "closed"),
+                "market": _compact_market(position.title or position.asset),
+                "outcome": position.outcome or position.asset,
+                "entry": round(float(position.entry_price), 4),
+                "exit": round(float(position.exit_price or 0.0), 4),
+                "pnl": round(float(position.realized_pnl), 4),
+            }
+        )
+    return rows
+
+
+def _exit_state(reason: str) -> str:
+    reason = reason.lower()
+    if reason == "take_profit":
+        return "TAKE"
+    if reason == "stop_loss":
+        return "KILL"
+    if reason == "risk_trim":
+        return "TRIM"
+    if reason == "max_hold":
+        return "TIME"
+    if reason == "stale_price":
+        return "STALE"
+    return "CLOSED"
 
 
 def _trade_log(trades) -> list[dict[str, Any]]:

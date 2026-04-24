@@ -9,7 +9,7 @@ from .api import ApiError, PolymarketClient
 from .cohorts import CohortConfig, wallet_cohort_report
 from .market_flow import MarketFlowConfig, sync_market_flow
 from .models import OrderBookSnapshot, Trade, Wallet
-from .paper import PaperBroker, RiskConfig
+from .paper import ExitConfig, PaperBroker, RiskConfig
 from .policy_optimizer import policy_settings_from_recommendation
 from .scoring import score_wallets
 from .signals import SignalConfig, generate_signals
@@ -48,6 +48,10 @@ class MonitorConfig:
     max_wallet_exposure_usdc: float = 60.0
     max_daily_loss_usdc: float = 20.0
     max_worst_stop_loss_usdc: float = 35.0
+    paper_max_hold_hours: int = 36
+    paper_stale_price_hours: int = 48
+    max_risk_trim_per_run: int = 4
+    risk_trim_enabled: bool = True
     market_flow_every: int = 0
     market_flow_market_limit: int = 15
     market_flow_trades_per_market: int = 100
@@ -258,7 +262,7 @@ class Monitor:
         )
         self.store.set_runtime_state("signal_policy_active", f"enabled={int(policy_enabled)} mode={policy_mode}")
         created = self.store.insert_signals(signals)
-        broker = PaperBroker(self.store, risk_config=self.risk_config())
+        broker = PaperBroker(self.store, risk_config=self.risk_config(), exit_config=self.exit_config())
         closed = len(broker.mark_and_close())
         opened = len(broker.open_from_signals(signals))
         return created, opened, closed
@@ -281,6 +285,14 @@ class Monitor:
             max_new_positions_per_run=self.config.max_new_positions_per_run,
             max_daily_realized_loss_usdc=self.config.max_daily_loss_usdc,
             max_worst_stop_loss_usdc=self.config.max_worst_stop_loss_usdc,
+        )
+
+    def exit_config(self) -> ExitConfig:
+        return ExitConfig(
+            max_hold_hours=self.config.paper_max_hold_hours,
+            stale_price_hours=self.config.paper_stale_price_hours,
+            risk_trim_enabled=self.config.risk_trim_enabled,
+            max_risk_trim_positions_per_run=self.config.max_risk_trim_per_run,
         )
 
 

@@ -137,6 +137,7 @@ class PaperPosition:
     closed_at: int | None = None
     exit_price: float | None = None
     realized_pnl: float = 0.0
+    close_reason: str = ""
 
 
 @dataclass(frozen=True)

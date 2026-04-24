@@ -165,6 +165,8 @@ python -m polymarket_signal_bot run-once --leaderboard-limit 50 --days 7 --bankr
   and duplicate-position checks.
 - Paper risk limits cap total exposure, market exposure, wallet exposure, new
   positions per scan, worst stop loss, and 24-hour realized loss.
+- Paper exit engine closes positions on stop loss, take profit, max hold,
+  stale prices, and gradual risk trimming when the portfolio is locked.
 - Cohort policy changes signal size and review priority. `STABLE` wallets get
   more weight, `CANDIDATE` wallets are sized cautiously, and `WATCH`/`NOISE`
   signals require manual approval before paper opening.
@@ -218,6 +220,8 @@ Done:
   with a saved recommended paper mode in runtime state, used by paper scans.
 - Paper risk guard v1: total exposure, market/wallet exposure, open-position,
   per-scan, daily-loss, and worst-stop caps before opening paper positions.
+- Paper exit engine v1: close reasons, max-hold exits, stale-price exits,
+  and risk-trim exits that gradually unload an over-limit paper portfolio.
 
 Partial:
 

@@ -26,10 +26,27 @@ class RiskConfig:
         return max(0.0, self.bankroll * self.max_total_exposure_pct)
 
 
+@dataclass(frozen=True)
+class ExitConfig:
+    max_hold_hours: int = 36
+    stale_price_hours: int = 48
+    risk_trim_enabled: bool = True
+    max_risk_trim_positions_per_run: int = 4
+    trim_to_total_exposure_pct: float = 0.55
+    trim_to_open_positions: int = 18
+    trim_to_worst_stop_loss_usdc: float = 30.0
+
+
 class PaperBroker:
-    def __init__(self, store: Store, risk_config: RiskConfig | None = None) -> None:
+    def __init__(
+        self,
+        store: Store,
+        risk_config: RiskConfig | None = None,
+        exit_config: ExitConfig | None = None,
+    ) -> None:
         self.store = store
         self.risk_config = risk_config or RiskConfig()
+        self.exit_config = exit_config or ExitConfig()
 
     def open_from_signals(
         self,
@@ -123,24 +140,79 @@ class PaperBroker:
             "daily_loss_limit": round(risk_config.max_daily_realized_loss_usdc, 2),
         }
 
-    def mark_and_close(self) -> list[tuple[PaperPosition, float, str]]:
+    def mark_and_close(self, exit_config: ExitConfig | None = None) -> list[tuple[PaperPosition, float, str]]:
+        exit_config = exit_config or self.exit_config
         closed: list[tuple[PaperPosition, float, str]] = []
         now = int(time.time())
         for position in self.store.fetch_open_positions():
-            price = self.store.latest_trade_price(position.asset)
-            if price is None:
-                continue
+            mark = self._price_mark(position, now)
+            price = mark["price"]
+            price_age = now - int(mark["timestamp"] or 0) if mark["timestamp"] else 0
             reason = ""
             if price <= position.stop_loss:
                 reason = "stop_loss"
             elif price >= position.take_profit:
                 reason = "take_profit"
+            elif now - position.opened_at >= exit_config.max_hold_hours * 3600:
+                reason = "max_hold"
+            elif price_age >= exit_config.stale_price_hours * 3600:
+                reason = "stale_price"
             if not reason:
                 continue
-            pnl = position.shares * price - position.size_usdc
-            self.store.close_position(position.position_id, now, price, round(pnl, 4))
-            closed.append((position, price, reason))
+            closed.append(self._close_position(position, now, price, reason))
+
+        if exit_config.risk_trim_enabled:
+            closed.extend(self._risk_trim(now, exit_config))
+
+        self._record_exit_state(closed, now)
+        self._record_risk_state(self.risk_config, opened_count=0, blocked={}, now=now)
         return closed
+
+    def _price_mark(self, position: PaperPosition, now: int) -> dict[str, float | int | str]:
+        mark = self.store.latest_trade_mark(position.asset)
+        if mark and float(mark["price"]) > 0:
+            return {"price": float(mark["price"]), "timestamp": int(mark["timestamp"]), "source": "trade"}
+        book = self.store.latest_order_book(position.asset)
+        if book and (book.mid > 0 or book.last_trade_price > 0):
+            price = book.mid if book.mid > 0 else book.last_trade_price
+            return {"price": float(price), "timestamp": int(book.timestamp or now), "source": "book"}
+        return {"price": float(position.entry_price), "timestamp": int(position.opened_at), "source": "entry"}
+
+    def _close_position(
+        self,
+        position: PaperPosition,
+        timestamp: int,
+        price: float,
+        reason: str,
+    ) -> tuple[PaperPosition, float, str]:
+        pnl = position.shares * price - position.size_usdc
+        self.store.close_position(position.position_id, timestamp, price, round(pnl, 4), reason)
+        return position, price, reason
+
+    def _risk_trim(self, now: int, exit_config: ExitConfig) -> list[tuple[PaperPosition, float, str]]:
+        trimmed: list[tuple[PaperPosition, float, str]] = []
+        positions = self.store.fetch_open_positions()
+        for _ in range(max(0, exit_config.max_risk_trim_positions_per_run)):
+            if not _needs_risk_trim(positions, self.risk_config, exit_config):
+                break
+            candidate = self._risk_trim_candidate(positions, now)
+            if candidate is None:
+                break
+            mark = self._price_mark(candidate, now)
+            trimmed.append(self._close_position(candidate, now, float(mark["price"]), "risk_trim"))
+            positions = [position for position in positions if position.position_id != candidate.position_id]
+        return trimmed
+
+    def _risk_trim_candidate(self, positions: list[PaperPosition], now: int) -> PaperPosition | None:
+        if not positions:
+            return None
+
+        def key(position: PaperPosition) -> tuple[float, int]:
+            mark = self._price_mark(position, now)
+            pnl = position.shares * float(mark["price"]) - position.size_usdc
+            return (pnl, position.opened_at)
+
+        return sorted(positions, key=key)[0]
 
     def _risk_block_reason(
         self,
@@ -191,6 +263,22 @@ class PaperBroker:
         self.store.set_runtime_state("risk_status", str(snapshot["status"]))
         self.store.set_runtime_state("risk_last_summary", summary)
         self.store.set_runtime_state("risk_last_blocks", block_summary)
+
+    def _record_exit_state(self, closed: list[tuple[PaperPosition, float, str]], now: int) -> None:
+        if not closed:
+            self.store.set_runtime_state("exit_last_summary", "closed=0")
+            return
+        reasons: dict[str, int] = {}
+        pnl = 0.0
+        for position, price, reason in closed:
+            _count(reasons, reason)
+            pnl += position.shares * price - position.size_usdc
+        reason_summary = ",".join(f"{reason}:{count}" for reason, count in sorted(reasons.items()))
+        self.store.set_runtime_state(
+            "exit_last_summary",
+            f"closed={len(closed)} pnl=${pnl:.2f} reasons={reason_summary}",
+        )
+        self.store.set_runtime_state("exit_last_reasons", reason_summary)
 
 
 def _position_id(signal_id: str, asset: str) -> str:
@@ -269,6 +357,19 @@ def _risk_status(
     if worst_stop_loss >= config.max_worst_stop_loss_usdc * 0.85:
         return "WARN"
     return "OK"
+
+
+def _needs_risk_trim(positions: list[PaperPosition], config: RiskConfig, exit_config: ExitConfig) -> bool:
+    if not positions:
+        return False
+    target_exposure = max(0.0, config.bankroll * exit_config.trim_to_total_exposure_pct)
+    target_positions = min(config.max_open_positions, exit_config.trim_to_open_positions)
+    target_stop = min(config.max_worst_stop_loss_usdc, exit_config.trim_to_worst_stop_loss_usdc)
+    return (
+        len(positions) > target_positions
+        or _open_cost(positions) > target_exposure
+        or _worst_stop_loss(positions) > target_stop
+    )
 
 
 def _count(values: dict[str, int], key: str) -> None:

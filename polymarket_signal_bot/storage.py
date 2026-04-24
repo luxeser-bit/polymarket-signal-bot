@@ -124,7 +124,8 @@ class Store:
                 status TEXT NOT NULL,
                 closed_at INTEGER,
                 exit_price REAL,
-                realized_pnl REAL NOT NULL DEFAULT 0
+                realized_pnl REAL NOT NULL DEFAULT 0,
+                close_reason TEXT NOT NULL DEFAULT ''
             );
             CREATE INDEX IF NOT EXISTS idx_paper_status ON paper_positions(status, opened_at DESC);
 
@@ -187,6 +188,7 @@ class Store:
         )
         self._ensure_column("wallet_scores", "repeatability_score", "REAL NOT NULL DEFAULT 0")
         self._ensure_column("wallet_scores", "drawdown_score", "REAL NOT NULL DEFAULT 0")
+        self._ensure_column("paper_positions", "close_reason", "TEXT NOT NULL DEFAULT ''")
         self.conn.commit()
 
     def _ensure_column(self, table: str, column: str, definition: str) -> None:
@@ -472,6 +474,15 @@ class Store:
             (asset,),
         ).fetchone()
         return None if row is None else float(row["price"])
+
+    def latest_trade_mark(self, asset: str) -> dict[str, float | int] | None:
+        row = self.conn.execute(
+            "SELECT price, timestamp FROM trades WHERE asset = ? ORDER BY timestamp DESC LIMIT 1",
+            (asset,),
+        ).fetchone()
+        if row is None:
+            return None
+        return {"price": float(row["price"]), "timestamp": int(row["timestamp"] or 0)}
 
     def recent_assets(self, limit: int = 50, since_ts: int | None = None) -> list[str]:
         sql = "SELECT asset, MAX(timestamp) AS last_seen FROM trades WHERE asset != ''"
@@ -858,9 +869,9 @@ class Store:
                 INSERT OR IGNORE INTO paper_positions(
                     position_id, signal_id, opened_at, wallet, condition_id, asset,
                     outcome, title, entry_price, size_usdc, shares, stop_loss,
-                    take_profit, status, closed_at, exit_price, realized_pnl
+                    take_profit, status, closed_at, exit_price, realized_pnl, close_reason
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     position.position_id,
@@ -880,6 +891,7 @@ class Store:
                     position.closed_at,
                     position.exit_price,
                     position.realized_pnl,
+                    position.close_reason,
                 ),
             )
             count += cursor.rowcount
@@ -892,16 +904,36 @@ class Store:
         )
         return [paper_position_from_row(row) for row in rows]
 
-    def close_position(self, position_id: str, closed_at: int, exit_price: float, realized_pnl: float) -> None:
+    def close_position(
+        self,
+        position_id: str,
+        closed_at: int,
+        exit_price: float,
+        realized_pnl: float,
+        close_reason: str = "",
+    ) -> None:
         self.conn.execute(
             """
             UPDATE paper_positions
-            SET status = 'CLOSED', closed_at = ?, exit_price = ?, realized_pnl = ?
+            SET status = 'CLOSED', closed_at = ?, exit_price = ?, realized_pnl = ?, close_reason = ?
             WHERE position_id = ?
             """,
-            (closed_at, exit_price, realized_pnl, position_id),
+            (closed_at, exit_price, realized_pnl, close_reason, position_id),
         )
         self.conn.commit()
+
+    def fetch_recent_closed_positions(self, limit: int = 10) -> list[PaperPosition]:
+        rows = self.conn.execute(
+            """
+            SELECT *
+            FROM paper_positions
+            WHERE status = 'CLOSED'
+            ORDER BY COALESCE(closed_at, opened_at) DESC
+            LIMIT ?
+            """,
+            (limit,),
+        )
+        return [paper_position_from_row(row) for row in rows]
 
     def paper_summary(self) -> dict[str, float]:
         row = self.conn.execute(
@@ -1016,6 +1048,7 @@ def paper_position_from_row(row: sqlite3.Row) -> PaperPosition:
         closed_at=row["closed_at"],
         exit_price=row["exit_price"],
         realized_pnl=row["realized_pnl"],
+        close_reason=row["close_reason"],
     )
 
 

@@ -28,7 +28,7 @@ from .demo import demo_trades, demo_wallets
 from .market_flow import MarketFlowConfig, format_market_flow_summary, sync_market_flow
 from .monitor import Monitor, MonitorConfig
 from .models import OrderBookSnapshot, Trade, Wallet
-from .paper import PaperBroker, RiskConfig
+from .paper import ExitConfig, PaperBroker, RiskConfig
 from .policy_optimizer import OptimizerConfig, policy_settings_from_recommendation, run_policy_optimizer
 from .scoring import score_wallets
 from .signals import SignalConfig, generate_signals
@@ -259,6 +259,10 @@ def build_parser() -> argparse.ArgumentParser:
     monitor.add_argument("--max-wallet-exposure-usdc", type=float, default=60.0)
     monitor.add_argument("--max-daily-loss-usdc", type=float, default=20.0)
     monitor.add_argument("--max-worst-stop-loss-usdc", type=float, default=35.0)
+    monitor.add_argument("--paper-max-hold-hours", type=int, default=36)
+    monitor.add_argument("--paper-stale-price-hours", type=int, default=48)
+    monitor.add_argument("--max-risk-trim-per-run", type=int, default=4)
+    monitor.add_argument("--no-risk-trim", action="store_true")
     monitor.add_argument("--no-discover", action="store_true", help="Use wallets already in the database.")
     monitor.add_argument("--no-sync", action="store_true", help="Skip API activity sync and only rescan local data.")
     monitor.add_argument("--no-books", action="store_true", help="Skip CLOB order-book sync.")
@@ -303,6 +307,10 @@ def add_signal_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--max-wallet-exposure-usdc", type=float, default=60.0)
     parser.add_argument("--max-daily-loss-usdc", type=float, default=20.0)
     parser.add_argument("--max-worst-stop-loss-usdc", type=float, default=35.0)
+    parser.add_argument("--paper-max-hold-hours", type=int, default=36)
+    parser.add_argument("--paper-stale-price-hours", type=int, default=48)
+    parser.add_argument("--max-risk-trim-per-run", type=int, default=4)
+    parser.add_argument("--no-risk-trim", action="store_true")
 
 
 def cmd_init_db(args: argparse.Namespace) -> int:
@@ -515,6 +523,7 @@ def cmd_scan(args: argparse.Namespace) -> int:
         print(f"Signals created: {len(signals)}")
         print(f"Paper positions opened: {len(opened)}")
         print(f"Paper positions closed: {len(closed)}")
+        _print_runtime_line(store, "exit_last_summary", "Exit")
         _print_runtime_line(store, "risk_last_summary", "Risk")
     return 0
 
@@ -864,6 +873,7 @@ def cmd_demo(args: argparse.Namespace) -> int:
         print(f"Signals created: {len(signals)}")
         print(f"Paper positions opened: {len(opened)}")
         print(f"Paper positions closed: {len(closed)}")
+        _print_runtime_line(store, "exit_last_summary", "Exit")
         _print_runtime_line(store, "risk_last_summary", "Risk")
     return cmd_report(argparse.Namespace(db=args.db, limit=10))
 
@@ -874,6 +884,7 @@ def cmd_report(args: argparse.Namespace) -> int:
         scores = list(store.fetch_scores().values())[: args.limit]
         signals = store.fetch_recent_signals(args.limit)
         positions = store.fetch_open_positions()
+        closed_positions = store.fetch_recent_closed_positions(limit=args.limit)
         books = store.fetch_order_books([position.asset for position in positions])
         summary = store.paper_summary()
         risk = PaperBroker(store).risk_snapshot()
@@ -919,6 +930,14 @@ def cmd_report(args: argparse.Namespace) -> int:
             f"  OPEN {position.outcome or position.asset} entry={position.entry_price:.3f} "
             f"cost={money(position.size_usdc)} latest={latest}"
         )
+    if closed_positions:
+        print("\nRecent paper exits")
+        for position in closed_positions[: args.limit]:
+            print(
+                f"  {position.close_reason or 'closed'} {position.outcome or position.asset} "
+                f"entry={position.entry_price:.3f} exit={(position.exit_price or 0):.3f} "
+                f"pnl={money(position.realized_pnl)}"
+            )
     return 0
 
 
@@ -999,6 +1018,10 @@ def cmd_monitor(args: argparse.Namespace) -> int:
         max_wallet_exposure_usdc=args.max_wallet_exposure_usdc,
         max_daily_loss_usdc=args.max_daily_loss_usdc,
         max_worst_stop_loss_usdc=args.max_worst_stop_loss_usdc,
+        paper_max_hold_hours=args.paper_max_hold_hours,
+        paper_stale_price_hours=args.paper_stale_price_hours,
+        max_risk_trim_per_run=args.max_risk_trim_per_run,
+        risk_trim_enabled=not args.no_risk_trim,
         market_flow_every=args.market_flow_every,
         market_flow_market_limit=args.market_flow_market_limit,
         market_flow_trades_per_market=args.market_flow_trades_per_market,
@@ -1081,7 +1104,7 @@ def run_scan(args: argparse.Namespace, store: Store):
         wallet_cohorts=wallet_cohorts,
     )
     store.insert_signals(signals)
-    broker = PaperBroker(store, risk_config=_risk_config_from_args(args))
+    broker = PaperBroker(store, risk_config=_risk_config_from_args(args), exit_config=_exit_config_from_args(args))
     closed = broker.mark_and_close()
     opened = broker.open_from_signals(signals)
     return signals, opened, closed
@@ -1098,6 +1121,15 @@ def _risk_config_from_args(args: argparse.Namespace) -> RiskConfig:
         max_new_positions_per_run=int(getattr(args, "max_new_positions_per_run", 6)),
         max_daily_realized_loss_usdc=float(getattr(args, "max_daily_loss_usdc", 20.0)),
         max_worst_stop_loss_usdc=float(getattr(args, "max_worst_stop_loss_usdc", 35.0)),
+    )
+
+
+def _exit_config_from_args(args: argparse.Namespace) -> ExitConfig:
+    return ExitConfig(
+        max_hold_hours=int(getattr(args, "paper_max_hold_hours", 36)),
+        stale_price_hours=int(getattr(args, "paper_stale_price_hours", 48)),
+        risk_trim_enabled=not bool(getattr(args, "no_risk_trim", False)),
+        max_risk_trim_positions_per_run=int(getattr(args, "max_risk_trim_per_run", 4)),
     )
 
 

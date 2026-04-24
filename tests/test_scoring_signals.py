@@ -5,8 +5,8 @@ import time
 import unittest
 
 from polymarket_signal_bot.demo import demo_trades, demo_wallets
-from polymarket_signal_bot.models import Signal, Trade, WalletScore
-from polymarket_signal_bot.paper import PaperBroker, RiskConfig
+from polymarket_signal_bot.models import PaperPosition, Signal, Trade, WalletScore
+from polymarket_signal_bot.paper import ExitConfig, PaperBroker, RiskConfig
 from polymarket_signal_bot.scoring import score_wallets
 from polymarket_signal_bot.signals import SignalConfig, generate_signals
 from polymarket_signal_bot.storage import Store
@@ -168,6 +168,114 @@ class ScoringSignalTests(unittest.TestCase):
         self.assertIn("total_exposure_cap", runtime["risk_last_blocks"]["value"])
         self.assertIn("blocked=1", runtime["risk_last_summary"]["value"])
 
+    def test_paper_broker_closes_max_hold_positions_with_reason(self) -> None:
+        now = int(time.time())
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with Store(f"{tmpdir}/exit.db") as store:
+                store.init_schema()
+                store.insert_paper_positions(
+                    [
+                        self.position(
+                            "pos-max-hold",
+                            "sig-max-hold",
+                            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                            "exit-asset",
+                            "exit-cond",
+                            now - 3 * 3600,
+                        )
+                    ]
+                )
+                store.insert_trades(
+                    [
+                        Trade(
+                            trade_id="exit-trade",
+                            proxy_wallet="0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                            side="BUY",
+                            asset="exit-asset",
+                            condition_id="exit-cond",
+                            size=100,
+                            price=0.45,
+                            timestamp=now,
+                            title="Exit test",
+                            outcome="Yes",
+                        )
+                    ]
+                )
+                closed = PaperBroker(store).mark_and_close(
+                    ExitConfig(max_hold_hours=1, stale_price_hours=24, risk_trim_enabled=False)
+                )
+                recent = store.fetch_recent_closed_positions(limit=1)
+
+        self.assertEqual(len(closed), 1)
+        self.assertEqual(closed[0][2], "max_hold")
+        self.assertEqual(recent[0].close_reason, "max_hold")
+        self.assertGreater(recent[0].realized_pnl, 0)
+
+    def test_paper_broker_risk_trims_locked_portfolio(self) -> None:
+        now = int(time.time())
+        wallet = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        positions = [
+            self.position(f"pos-trim-{index}", f"sig-trim-{index}", wallet, f"trim-asset-{index}", f"trim-cond-{index}", now - index)
+            for index in range(3)
+        ]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with Store(f"{tmpdir}/trim.db") as store:
+                store.init_schema()
+                store.insert_paper_positions(positions)
+                closed = PaperBroker(
+                    store,
+                    RiskConfig(
+                        bankroll=100,
+                        max_total_exposure_pct=0.50,
+                        max_open_positions=10,
+                        max_market_exposure_usdc=100,
+                        max_wallet_exposure_usdc=100,
+                        max_daily_realized_loss_usdc=100,
+                        max_worst_stop_loss_usdc=100,
+                    ),
+                ).mark_and_close(
+                    ExitConfig(
+                        max_hold_hours=24,
+                        stale_price_hours=24,
+                        risk_trim_enabled=True,
+                        max_risk_trim_positions_per_run=2,
+                        trim_to_total_exposure_pct=0.40,
+                    )
+                )
+                open_positions = store.fetch_open_positions()
+                recent = store.fetch_recent_closed_positions(limit=3)
+
+        self.assertEqual(len(closed), 2)
+        self.assertEqual(len(open_positions), 1)
+        self.assertEqual({position.close_reason for position in recent[:2]}, {"risk_trim"})
+
+    def test_paper_broker_closes_stale_price_positions_at_entry(self) -> None:
+        now = int(time.time())
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with Store(f"{tmpdir}/stale.db") as store:
+                store.init_schema()
+                store.insert_paper_positions(
+                    [
+                        self.position(
+                            "pos-stale",
+                            "sig-stale",
+                            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                            "stale-asset",
+                            "stale-cond",
+                            now - 3 * 3600,
+                        )
+                    ]
+                )
+                closed = PaperBroker(store).mark_and_close(
+                    ExitConfig(max_hold_hours=24, stale_price_hours=1, risk_trim_enabled=False)
+                )
+                recent = store.fetch_recent_closed_positions(limit=1)
+
+        self.assertEqual(len(closed), 1)
+        self.assertEqual(closed[0][2], "stale_price")
+        self.assertEqual(recent[0].close_reason, "stale_price")
+        self.assertEqual(recent[0].realized_pnl, 0)
+
     @staticmethod
     def wallet_score(wallet: str, score: float, now: int) -> WalletScore:
         return WalletScore(
@@ -210,6 +318,31 @@ class ScoringSignalTests(unittest.TestCase):
             expires_at=now + 3600,
             source_trade_id=signal_id,
             reason="test",
+        )
+
+    @staticmethod
+    def position(
+        position_id: str,
+        signal_id: str,
+        wallet: str,
+        asset: str,
+        condition_id: str,
+        opened_at: int,
+    ) -> PaperPosition:
+        return PaperPosition(
+            position_id=position_id,
+            signal_id=signal_id,
+            opened_at=opened_at,
+            wallet=wallet,
+            condition_id=condition_id,
+            asset=asset,
+            outcome="Yes",
+            title="Paper exit test",
+            entry_price=0.4,
+            size_usdc=30,
+            shares=75,
+            stop_loss=0.3,
+            take_profit=0.8,
         )
 
 

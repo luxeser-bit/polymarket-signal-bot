@@ -321,7 +321,7 @@ function setNotice(value) {
 
 function tagClass(value) {
   if (["KILL", "HIGH", "SELL", "EXIT", "LOCKED"].includes(value)) return "bad";
-  if (["WATCH", "CHECK", "ARMED", "TAKE"].includes(value)) return "warn";
+  if (["WATCH", "CHECK", "ARMED", "TAKE", "TRIM", "TIME", "STALE"].includes(value)) return "warn";
   return "";
 }
 
