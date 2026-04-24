@@ -8,6 +8,11 @@ Primary scale target: build toward 86,000,000 analyzed trades and 14,000 tracked
 wallets. The current code is still a local research system, but ingestion is
 structured around resumable wallet checkpoints.
 
+The project learning strategy is documented in
+[`docs/learning_model.md`](docs/learning_model.md). Future work should follow
+that three-level model: rule auto-calibration, adaptive wallet scoring, and an
+ML signal classifier once enough paper decisions exist.
+
 It does not place real orders and does not store private keys. Add live trading
 only after legal review, exchange access review, and a long paper-trading run.
 
@@ -236,6 +241,8 @@ Partial:
 
 Next:
 
+- Implement a paper decision journal so historical data and live paper decisions
+  can train the three-level learning loop.
 - Accumulate deeper multi-day market-flow history before trusting cohort-policy
   backtest deltas.
 - Add an approval inbox action in the dashboard instead of CLI-only approval.
