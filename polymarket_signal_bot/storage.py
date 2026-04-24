@@ -6,7 +6,7 @@ import json
 from pathlib import Path
 from typing import Iterable
 
-from .models import OrderBookSnapshot, PaperPosition, Signal, Trade, Wallet, WalletScore
+from .models import OrderBookSnapshot, PaperEvent, PaperPosition, Signal, Trade, Wallet, WalletScore
 
 
 DEFAULT_DB_PATH = Path("data/polysignal.db")
@@ -128,6 +128,38 @@ class Store:
                 close_reason TEXT NOT NULL DEFAULT ''
             );
             CREATE INDEX IF NOT EXISTS idx_paper_status ON paper_positions(status, opened_at DESC);
+
+            CREATE TABLE IF NOT EXISTS paper_events (
+                event_id TEXT PRIMARY KEY,
+                event_at INTEGER NOT NULL,
+                event_type TEXT NOT NULL,
+                signal_id TEXT NOT NULL DEFAULT '',
+                position_id TEXT NOT NULL DEFAULT '',
+                wallet TEXT NOT NULL DEFAULT '',
+                condition_id TEXT NOT NULL DEFAULT '',
+                asset TEXT NOT NULL DEFAULT '',
+                outcome TEXT NOT NULL DEFAULT '',
+                title TEXT NOT NULL DEFAULT '',
+                policy_mode TEXT NOT NULL DEFAULT '',
+                cohort_status TEXT NOT NULL DEFAULT '',
+                risk_status TEXT NOT NULL DEFAULT '',
+                reason TEXT NOT NULL DEFAULT '',
+                price REAL NOT NULL DEFAULT 0,
+                size_usdc REAL NOT NULL DEFAULT 0,
+                pnl REAL NOT NULL DEFAULT 0,
+                confidence REAL NOT NULL DEFAULT 0,
+                wallet_score REAL NOT NULL DEFAULT 0,
+                hold_seconds INTEGER NOT NULL DEFAULT 0,
+                metadata_json TEXT NOT NULL DEFAULT ''
+            );
+            CREATE INDEX IF NOT EXISTS idx_paper_events_time
+                ON paper_events(event_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_paper_events_type_reason
+                ON paper_events(event_type, reason, event_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_paper_events_wallet
+                ON paper_events(wallet, event_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_paper_events_asset
+                ON paper_events(asset, event_at DESC);
 
             CREATE TABLE IF NOT EXISTS runtime_state (
                 key TEXT PRIMARY KEY,
@@ -964,6 +996,150 @@ class Store:
         ).fetchone()
         return float(row["realized_pnl"] or 0.0)
 
+    def insert_paper_events(self, events: Iterable[PaperEvent]) -> int:
+        count = 0
+        for event in events:
+            cursor = self.conn.execute(
+                """
+                INSERT OR IGNORE INTO paper_events(
+                    event_id, event_at, event_type, signal_id, position_id, wallet,
+                    condition_id, asset, outcome, title, policy_mode, cohort_status,
+                    risk_status, reason, price, size_usdc, pnl, confidence,
+                    wallet_score, hold_seconds, metadata_json
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    event.event_id,
+                    event.event_at,
+                    event.event_type,
+                    event.signal_id,
+                    event.position_id,
+                    event.wallet,
+                    event.condition_id,
+                    event.asset,
+                    event.outcome,
+                    event.title,
+                    event.policy_mode,
+                    event.cohort_status,
+                    event.risk_status,
+                    event.reason,
+                    event.price,
+                    event.size_usdc,
+                    event.pnl,
+                    event.confidence,
+                    event.wallet_score,
+                    event.hold_seconds,
+                    event.metadata_json,
+                ),
+            )
+            count += cursor.rowcount
+        self.conn.commit()
+        return count
+
+    def fetch_recent_paper_events(
+        self,
+        limit: int = 20,
+        *,
+        since_ts: int | None = None,
+    ) -> list[PaperEvent]:
+        params: list[object] = []
+        where = ""
+        if since_ts is not None:
+            where = "WHERE event_at >= ?"
+            params.append(since_ts)
+        params.append(limit)
+        rows = self.conn.execute(
+            f"""
+            SELECT *
+            FROM paper_events
+            {where}
+            ORDER BY event_at DESC,
+                CASE event_type
+                    WHEN 'CLOSED' THEN 1
+                    WHEN 'BLOCKED' THEN 2
+                    WHEN 'OPENED' THEN 3
+                    WHEN 'SIGNAL_CREATED' THEN 4
+                    ELSE 5
+                END ASC
+            LIMIT ?
+            """,
+            tuple(params),
+        )
+        return [paper_event_from_row(row) for row in rows]
+
+    def paper_event_summary(
+        self,
+        *,
+        since_ts: int | None = None,
+        limit: int = 20,
+    ) -> dict[str, object]:
+        params: list[object] = []
+        where = ""
+        if since_ts is not None:
+            where = "WHERE event_at >= ?"
+            params.append(since_ts)
+        total = self.conn.execute(
+            f"""
+            SELECT COUNT(*) AS events,
+                   COALESCE(SUM(pnl), 0) AS pnl,
+                   COALESCE(AVG(confidence), 0) AS avg_confidence
+            FROM paper_events
+            {where}
+            """,
+            tuple(params),
+        ).fetchone()
+        by_reason = self.conn.execute(
+            f"""
+            SELECT event_type,
+                   COALESCE(NULLIF(reason, ''), 'none') AS reason,
+                   COUNT(*) AS events,
+                   COALESCE(SUM(pnl), 0) AS pnl,
+                   COALESCE(AVG(confidence), 0) AS avg_confidence
+            FROM paper_events
+            {where}
+            GROUP BY event_type, COALESCE(NULLIF(reason, ''), 'none')
+            ORDER BY events DESC, event_type ASC, reason ASC
+            LIMIT ?
+            """,
+            tuple([*params, limit]),
+        )
+        by_wallet = self.conn.execute(
+            f"""
+            SELECT wallet,
+                   COUNT(*) AS events,
+                   COALESCE(SUM(pnl), 0) AS pnl,
+                   COALESCE(AVG(wallet_score), 0) AS avg_wallet_score
+            FROM paper_events
+            {where}
+            WHERE wallet != ''
+            GROUP BY wallet
+            ORDER BY events DESC, pnl DESC
+            LIMIT ?
+            """
+            if not where
+            else f"""
+            SELECT wallet,
+                   COUNT(*) AS events,
+                   COALESCE(SUM(pnl), 0) AS pnl,
+                   COALESCE(AVG(wallet_score), 0) AS avg_wallet_score
+            FROM paper_events
+            {where} AND wallet != ''
+            GROUP BY wallet
+            ORDER BY events DESC, pnl DESC
+            LIMIT ?
+            """,
+            tuple([*params, limit]),
+        )
+        return {
+            "total_events": int(total["events"] or 0),
+            "pnl": float(total["pnl"] or 0.0),
+            "avg_confidence": float(total["avg_confidence"] or 0.0),
+            "by_reason": [dict(row) for row in by_reason],
+            "by_wallet": [dict(row) for row in by_wallet],
+            "recent": self.fetch_recent_paper_events(limit=limit, since_ts=since_ts),
+        }
+
 
 def trade_from_row(row: sqlite3.Row) -> Trade:
     return Trade(
@@ -1049,6 +1225,32 @@ def paper_position_from_row(row: sqlite3.Row) -> PaperPosition:
         exit_price=row["exit_price"],
         realized_pnl=row["realized_pnl"],
         close_reason=row["close_reason"],
+    )
+
+
+def paper_event_from_row(row: sqlite3.Row) -> PaperEvent:
+    return PaperEvent(
+        event_id=row["event_id"],
+        event_at=row["event_at"],
+        event_type=row["event_type"],
+        signal_id=row["signal_id"],
+        position_id=row["position_id"],
+        wallet=row["wallet"],
+        condition_id=row["condition_id"],
+        asset=row["asset"],
+        outcome=row["outcome"],
+        title=row["title"],
+        policy_mode=row["policy_mode"],
+        cohort_status=row["cohort_status"],
+        risk_status=row["risk_status"],
+        reason=row["reason"],
+        price=row["price"],
+        size_usdc=row["size_usdc"],
+        pnl=row["pnl"],
+        confidence=row["confidence"],
+        wallet_score=row["wallet_score"],
+        hold_seconds=row["hold_seconds"],
+        metadata_json=row["metadata_json"],
     )
 
 

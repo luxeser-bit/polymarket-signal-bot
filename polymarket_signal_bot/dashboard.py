@@ -114,6 +114,7 @@ def build_dashboard_state(store: Store, *, bankroll: float = DEFAULT_BANKROLL) -
     books = store.fetch_order_books(limit=30)
     open_positions = store.fetch_open_positions()
     closed_positions = store.fetch_recent_closed_positions(limit=8)
+    journal_summary = store.paper_event_summary(limit=8)
     summary = store.paper_summary()
     stats = _db_stats(store)
     sync_progress = store.sync_progress()
@@ -153,6 +154,7 @@ def build_dashboard_state(store: Store, *, bankroll: float = DEFAULT_BANKROLL) -
             "riskBlocks": _runtime_value(runtime, "risk_last_blocks", ""),
             "exitSummary": _runtime_value(runtime, "exit_last_summary", ""),
             "exitReasons": _runtime_value(runtime, "exit_last_reasons", ""),
+            "journalSummary": _journal_summary_label(journal_summary),
         },
         "stats": {
             "bankroll": round(current_bankroll, 2),
@@ -160,6 +162,7 @@ def build_dashboard_state(store: Store, *, bankroll: float = DEFAULT_BANKROLL) -
             "wallets": int(stats["wallets"]),
             "trades": int(stats["trades"]),
             "signals": int(stats["signals"]),
+            "paperEvents": int(journal_summary["total_events"]),
             "winRate": _estimated_win_rate(marked_positions, summary),
             "openPositions": int(summary["open_positions"]),
             "openCost": round(summary["open_cost"], 2),
@@ -185,6 +188,7 @@ def build_dashboard_state(store: Store, *, bankroll: float = DEFAULT_BANKROLL) -
         "orderBook": _order_book_rows(books, recent_signals, recent_trades),
         "exitTriggers": _exit_triggers(open_positions, closed_positions, store, now),
         "closedPositions": _closed_position_rows(closed_positions),
+        "journal": _journal_rows(journal_summary["recent"]),
         "tradeLog": _trade_log(recent_trades),
         "alerts": _alert_rows(alerts),
         "reviews": _review_rows(reviews),
@@ -232,6 +236,7 @@ def _run_default_scan(store: Store) -> int:
     store.set_runtime_state("signal_policy_active", f"enabled={int(policy_enabled)} mode={policy_mode}")
     store.insert_signals(signals)
     broker = PaperBroker(store)
+    broker.record_signal_created(signals)
     broker.mark_and_close()
     return len(broker.open_from_signals(signals))
 
@@ -501,6 +506,35 @@ def _closed_position_rows(positions) -> list[dict[str, Any]]:
                 "entry": round(float(position.entry_price), 4),
                 "exit": round(float(position.exit_price or 0.0), 4),
                 "pnl": round(float(position.realized_pnl), 4),
+            }
+        )
+    return rows
+
+
+def _journal_summary_label(summary: dict[str, Any]) -> str:
+    rows = summary.get("by_reason") or []
+    if not rows:
+        return "no decisions logged yet"
+    top = rows[0]
+    return (
+        f"{int(summary.get('total_events') or 0)} decisions; "
+        f"top={top['event_type']}:{top['reason']} x{int(top['events'])}"
+    )
+
+
+def _journal_rows(events) -> list[dict[str, Any]]:
+    rows = []
+    for event in events:
+        rows.append(
+            {
+                "type": event.event_type,
+                "reason": event.reason,
+                "wallet": _short_wallet(event.wallet),
+                "market": _compact_market(event.title or event.asset),
+                "outcome": event.outcome or event.asset,
+                "price": round(float(event.price or 0.0), 4),
+                "size": round(float(event.size_usdc or 0.0), 2),
+                "pnl": round(float(event.pnl or 0.0), 4),
             }
         )
     return rows

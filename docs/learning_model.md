@@ -122,6 +122,11 @@ The system must log its own behavior, not only public market behavior:
 - policy mode, cohort status, risk state at decision time;
 - price, size, PnL, hold time.
 
+Current implementation: the `paper_events` table records `SIGNAL_CREATED`,
+`OPENED`, `BLOCKED`, and `CLOSED` events. It is available through
+`paper-journal`, the dashboard scale panel, and DuckDB export as
+`v_paper_event_summary`.
+
 This decision journal is the bridge from rule-based paper trading to adaptive
 learning.
 

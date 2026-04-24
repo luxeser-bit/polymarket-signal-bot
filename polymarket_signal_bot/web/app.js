@@ -88,7 +88,8 @@ function renderMetrics(state) {
     ["OPEN POS", intfmt(state.stats.openPositions)],
     ["OPEN COST", money(state.stats.openCost)],
     ["UNREAL", money(state.stats.unrealizedPnl)],
-    ["SIGNALS", intfmt(state.stats.signals)]
+    ["SIGNALS", intfmt(state.stats.signals)],
+    ["DECISIONS", intfmt(state.stats.paperEvents)]
   ];
   els.metrics.innerHTML = metrics.map(([label, value]) => `
     <div class="metric">
@@ -221,7 +222,8 @@ function renderScale(state) {
     { status: "PAGES", label: `${intfmt(state.stats.bulkPagesSynced)} synced`, pct: Math.min(1, state.stats.bulkPagesSynced / 1000) },
     { status: "DUCKDB", label: state.stats.duckdbExists ? `${formatBytes(state.stats.duckdbSizeBytes)} ${state.stats.duckdbPath}` : "snapshot not built", pct: state.stats.duckdbExists ? 1 : 0 },
     { status: "ANALYTICS", label: `${String(state.meta.analyticsStatus || "idle").toUpperCase()} ${state.meta.analyticsSummary || state.meta.analyticsError || ""}`, pct: state.meta.analyticsStatus === "ready" ? 1 : 0 },
-    { status: "POLICY", label: state.meta.signalPolicyActive || state.meta.policySummary || `recommended=${state.meta.policyRecommended}`, pct: state.meta.policySummary ? 1 : 0 }
+    { status: "POLICY", label: state.meta.signalPolicyActive || state.meta.policySummary || `recommended=${state.meta.policyRecommended}`, pct: state.meta.policySummary ? 1 : 0 },
+    { status: "JOURNAL", label: state.meta.journalSummary || "no decisions logged yet", pct: state.stats.paperEvents ? 1 : 0 }
   ];
   els.scaleFeed.innerHTML = rows.map(row => `
     <div class="row">

@@ -263,6 +263,7 @@ class Monitor:
         self.store.set_runtime_state("signal_policy_active", f"enabled={int(policy_enabled)} mode={policy_mode}")
         created = self.store.insert_signals(signals)
         broker = PaperBroker(self.store, risk_config=self.risk_config(), exit_config=self.exit_config())
+        broker.record_signal_created(signals)
         closed = len(broker.mark_and_close())
         opened = len(broker.open_from_signals(signals))
         return created, opened, closed

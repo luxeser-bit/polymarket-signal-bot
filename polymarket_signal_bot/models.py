@@ -141,6 +141,31 @@ class PaperPosition:
 
 
 @dataclass(frozen=True)
+class PaperEvent:
+    event_id: str
+    event_at: int
+    event_type: str
+    signal_id: str = ""
+    position_id: str = ""
+    wallet: str = ""
+    condition_id: str = ""
+    asset: str = ""
+    outcome: str = ""
+    title: str = ""
+    policy_mode: str = ""
+    cohort_status: str = ""
+    risk_status: str = ""
+    reason: str = ""
+    price: float = 0.0
+    size_usdc: float = 0.0
+    pnl: float = 0.0
+    confidence: float = 0.0
+    wallet_score: float = 0.0
+    hold_seconds: int = 0
+    metadata_json: str = ""
+
+
+@dataclass(frozen=True)
 class OrderBookSnapshot:
     asset: str
     market: str

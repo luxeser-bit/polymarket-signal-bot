@@ -21,6 +21,7 @@ EXPORT_TABLES = [
     "wallet_scores",
     "signals",
     "paper_positions",
+    "paper_events",
     "order_books_latest",
     "signal_reviews",
     "wallet_sync_state",
@@ -188,6 +189,16 @@ def analytics_report(duckdb_path: str | Path = DEFAULT_DUCKDB_PATH, *, limit: in
                 SELECT trade_day, trades, notional, wallets
                 FROM v_daily_flow
                 ORDER BY trade_day DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ),
+            "paper_events": _fetch_all(
+                conn,
+                """
+                SELECT event_type, reason, events, pnl, avg_confidence
+                FROM v_paper_event_summary
+                ORDER BY events DESC, event_type ASC, reason ASC
                 LIMIT ?
                 """,
                 (limit,),
@@ -467,6 +478,20 @@ def _create_views(conn: Any) -> None:
             liquidity_score,
             updated_at
         FROM order_books_latest
+        """
+    )
+    conn.execute(
+        """
+        CREATE OR REPLACE VIEW v_paper_event_summary AS
+        SELECT
+            event_type,
+            COALESCE(NULLIF(reason, ''), 'none') AS reason,
+            COUNT(*) AS events,
+            COALESCE(SUM(pnl), 0) AS pnl,
+            COALESCE(AVG(confidence), 0) AS avg_confidence,
+            COALESCE(AVG(wallet_score), 0) AS avg_wallet_score
+        FROM paper_events
+        GROUP BY event_type, COALESCE(NULLIF(reason, ''), 'none')
         """
     )
 

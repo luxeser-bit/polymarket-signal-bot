@@ -50,6 +50,7 @@ python -m polymarket_signal_bot backtest --history-days 30 --bankroll 200 --comp
 python -m polymarket_signal_bot policy-optimizer --history-days 30 --bankroll 200
 python -m polymarket_signal_bot cohort-report --history-days 30 --min-trades 2 --min-notional 100
 python -m polymarket_signal_bot report
+python -m polymarket_signal_bot paper-journal --since-days 30 --limit 20
 python -m polymarket_signal_bot reviews --status PENDING
 ```
 
@@ -179,6 +180,9 @@ python -m polymarket_signal_bot run-once --leaderboard-limit 50 --days 7 --bankr
   stable-only, and liquidity-watch modes on the same replay and saves the best
   paper-mode recommendation. `scan`, dashboard scan, and monitor use that saved
   recommendation unless cohort policy is explicitly disabled.
+- The paper decision journal records created signals, opened paper positions,
+  blocked entries, and closed positions with reason, policy, cohort, risk state,
+  size, price, PnL, and hold time for future learning.
 
 ## Roadmap status
 
@@ -227,6 +231,8 @@ Done:
   per-scan, daily-loss, and worst-stop caps before opening paper positions.
 - Paper exit engine v1: close reasons, max-hold exits, stale-price exits,
   and risk-trim exits that gradually unload an over-limit paper portfolio.
+- Paper decision journal v1: `paper_events` logs signal/open/block/close
+  decisions and is exported into DuckDB for the three-level learning loop.
 
 Partial:
 
@@ -241,8 +247,8 @@ Partial:
 
 Next:
 
-- Implement a paper decision journal so historical data and live paper decisions
-  can train the three-level learning loop.
+- Use the paper decision journal to calibrate rules and build outcome-aware
+  wallet stats by market category.
 - Accumulate deeper multi-day market-flow history before trusting cohort-policy
   backtest deltas.
 - Add an approval inbox action in the dashboard instead of CLI-only approval.

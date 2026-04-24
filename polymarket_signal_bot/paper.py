@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import time
 from dataclasses import dataclass
 from typing import Any
 
-from .models import PaperPosition, Signal
+from .models import PaperEvent, PaperPosition, Signal
 from .storage import Store
 
 
@@ -58,24 +59,30 @@ class PaperBroker:
         risk_config = risk_config or self.risk_config
         opened: list[PaperPosition] = []
         blocked: dict[str, int] = {}
+        events: list[PaperEvent] = []
         now = int(time.time())
+        risk_status = str(self.risk_snapshot(risk_config, now=now)["status"])
         existing_positions = self.store.fetch_open_positions()
         for signal in signals:
             if signal.action != "BUY":
                 continue
             if respect_auto_policy and not _auto_open_allowed(signal):
                 _count(blocked, "cohort_auto_policy")
+                events.append(_signal_event("BLOCKED", signal, now, "cohort_auto_policy", risk_status=risk_status))
                 continue
             if signal.suggested_price <= 0:
                 _count(blocked, "invalid_price")
+                events.append(_signal_event("BLOCKED", signal, now, "invalid_price", risk_status=risk_status))
                 continue
             current_positions = existing_positions + opened
             if _has_open_position_for_asset(current_positions, signal.asset):
                 _count(blocked, "duplicate_asset")
+                events.append(_signal_event("BLOCKED", signal, now, "duplicate_asset", risk_status=risk_status))
                 continue
             risk_reason = self._risk_block_reason(signal, current_positions, len(opened), risk_config, now)
             if risk_reason:
                 _count(blocked, risk_reason)
+                events.append(_signal_event("BLOCKED", signal, now, risk_reason, risk_status=risk_status))
                 continue
             shares = signal.size_usdc / signal.suggested_price
             position = PaperPosition(
@@ -94,7 +101,18 @@ class PaperBroker:
                 take_profit=signal.take_profit,
             )
             opened.append(position)
+            events.append(
+                _signal_event(
+                    "OPENED",
+                    signal,
+                    now,
+                    "opened",
+                    risk_status=risk_status,
+                    position_id=position.position_id,
+                )
+            )
         self.store.insert_paper_positions(opened)
+        self.store.insert_paper_events(events)
         self._record_risk_state(risk_config, opened_count=len(opened), blocked=blocked, now=now)
         return opened
 
@@ -103,6 +121,15 @@ class PaperBroker:
             self.store.fetch_approved_unopened_signals(limit=limit),
             respect_auto_policy=False,
         )
+
+    def record_signal_created(self, signals: list[Signal]) -> int:
+        now = int(time.time())
+        risk_status = str(self.risk_snapshot(now=now)["status"])
+        events = [
+            _signal_event("SIGNAL_CREATED", signal, signal.generated_at or now, "created", risk_status=risk_status)
+            for signal in signals
+        ]
+        return self.store.insert_paper_events(events)
 
     def risk_snapshot(self, risk_config: RiskConfig | None = None, *, now: int | None = None) -> dict[str, Any]:
         risk_config = risk_config or self.risk_config
@@ -164,6 +191,7 @@ class PaperBroker:
         if exit_config.risk_trim_enabled:
             closed.extend(self._risk_trim(now, exit_config))
 
+        self._record_close_events(closed, now)
         self._record_exit_state(closed, now)
         self._record_risk_state(self.risk_config, opened_count=0, blocked={}, now=now)
         return closed
@@ -280,9 +308,112 @@ class PaperBroker:
         )
         self.store.set_runtime_state("exit_last_reasons", reason_summary)
 
+    def _record_close_events(self, closed: list[tuple[PaperPosition, float, str]], now: int) -> None:
+        if not closed:
+            return
+        risk_status = str(self.risk_snapshot(self.risk_config, now=now)["status"])
+        events = [
+            _position_event("CLOSED", position, now, reason, price, risk_status=risk_status)
+            for position, price, reason in closed
+        ]
+        self.store.insert_paper_events(events)
+
 
 def _position_id(signal_id: str, asset: str) -> str:
     return hashlib.sha256(f"{signal_id}|{asset}".encode("utf-8")).hexdigest()[:32]
+
+
+def _event_id(*parts: object) -> str:
+    raw = "|".join(str(part) for part in parts)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:32]
+
+
+def _signal_event(
+    event_type: str,
+    signal: Signal,
+    event_at: int,
+    reason: str,
+    *,
+    risk_status: str = "",
+    position_id: str = "",
+) -> PaperEvent:
+    if event_type == "BLOCKED":
+        event_id = _event_id(event_type, signal.signal_id, reason, event_at)
+    elif event_type == "OPENED":
+        event_id = _event_id(event_type, position_id or signal.signal_id)
+    else:
+        event_id = _event_id(event_type, signal.signal_id)
+    return PaperEvent(
+        event_id=event_id,
+        event_at=event_at,
+        event_type=event_type,
+        signal_id=signal.signal_id,
+        position_id=position_id,
+        wallet=signal.wallet,
+        condition_id=signal.condition_id,
+        asset=signal.asset,
+        outcome=signal.outcome,
+        title=signal.title,
+        policy_mode=_reason_value(signal.reason, "policy"),
+        cohort_status=_reason_value(signal.reason, "cohort"),
+        risk_status=risk_status,
+        reason=reason,
+        price=float(signal.suggested_price or signal.observed_price or 0.0),
+        size_usdc=float(signal.size_usdc or 0.0),
+        confidence=float(signal.confidence or 0.0),
+        wallet_score=float(signal.wallet_score or 0.0),
+        metadata_json=_json_meta({"source_trade_id": signal.source_trade_id, "signal_reason": signal.reason}),
+    )
+
+
+def _position_event(
+    event_type: str,
+    position: PaperPosition,
+    event_at: int,
+    reason: str,
+    price: float,
+    *,
+    risk_status: str = "",
+) -> PaperEvent:
+    pnl = position.shares * price - position.size_usdc
+    return PaperEvent(
+        event_id=_event_id(event_type, position.position_id),
+        event_at=event_at,
+        event_type=event_type,
+        signal_id=position.signal_id,
+        position_id=position.position_id,
+        wallet=position.wallet,
+        condition_id=position.condition_id,
+        asset=position.asset,
+        outcome=position.outcome,
+        title=position.title,
+        risk_status=risk_status,
+        reason=reason,
+        price=float(price or 0.0),
+        size_usdc=float(position.size_usdc or 0.0),
+        pnl=round(pnl, 4),
+        hold_seconds=max(0, event_at - position.opened_at),
+        metadata_json=_json_meta(
+            {
+                "entry_price": position.entry_price,
+                "stop_loss": position.stop_loss,
+                "take_profit": position.take_profit,
+            }
+        ),
+    )
+
+
+def _reason_value(reason: str, key: str) -> str:
+    prefix = f"{key}="
+    for part in reason.split(";"):
+        item = part.strip()
+        if item.startswith(prefix):
+            return item[len(prefix) :].strip()
+    return ""
+
+
+def _json_meta(value: dict[str, object]) -> str:
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
 def _auto_open_allowed(signal: Signal) -> bool:

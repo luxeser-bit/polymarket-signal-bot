@@ -212,6 +212,11 @@ def build_parser() -> argparse.ArgumentParser:
     report.add_argument("--limit", type=int, default=10)
     report.set_defaults(func=cmd_report)
 
+    journal = sub.add_parser("paper-journal", help="Show the paper decision journal for learning.")
+    journal.add_argument("--limit", type=int, default=20)
+    journal.add_argument("--since-days", type=int, default=30)
+    journal.set_defaults(func=cmd_paper_journal)
+
     reviews = sub.add_parser("reviews", help="List pending, approved, or rejected signal reviews.")
     reviews.add_argument("--status", default="PENDING", choices=["PENDING", "APPROVED", "REJECTED"])
     reviews.add_argument("--limit", type=int, default=20)
@@ -827,6 +832,12 @@ def cmd_analytics_report(args: argparse.Namespace) -> int:
             f"days={row['active_days']} markets={row['market_count']} "
             f"notional={money(row['notional'])}"
         )
+    print("\nPaper decisions")
+    for row in report["paper_events"]:
+        print(
+            f"  {row['event_type']:<14} {str(row['reason']):<22} "
+            f"events={row['events']} pnl={money(row['pnl'])} avg_conf={row['avg_confidence']:.3f}"
+        )
     return 0
 
 
@@ -887,6 +898,7 @@ def cmd_report(args: argparse.Namespace) -> int:
         closed_positions = store.fetch_recent_closed_positions(limit=args.limit)
         books = store.fetch_order_books([position.asset for position in positions])
         summary = store.paper_summary()
+        journal = store.paper_event_summary(limit=5)
         risk = PaperBroker(store).risk_snapshot()
 
     print("\nTop wallets")
@@ -922,6 +934,7 @@ def cmd_report(args: argparse.Namespace) -> int:
         f"worst_stop={money(risk['worst_stop_loss'])}/{money(risk['worst_stop_limit'])} "
         f"pnl24h={money(risk['realized_pnl_24h'])}"
     )
+    print(f"  decisions={journal['total_events']} journal_pnl={money(float(journal['pnl']))}")
     for position in positions[: args.limit]:
         book = books.get(position.asset)
         latest_value = book.mid if book and book.mid > 0 else None
@@ -938,6 +951,42 @@ def cmd_report(args: argparse.Namespace) -> int:
                 f"entry={position.entry_price:.3f} exit={(position.exit_price or 0):.3f} "
                 f"pnl={money(position.realized_pnl)}"
             )
+    return 0
+
+
+def cmd_paper_journal(args: argparse.Namespace) -> int:
+    since_ts = int(time.time()) - max(1, args.since_days) * 86400
+    with open_store(args.db) as store:
+        store.init_schema()
+        summary = store.paper_event_summary(since_ts=since_ts, limit=args.limit)
+
+    print("\nPaper decision journal")
+    print(
+        f"  window={args.since_days}d decisions={summary['total_events']} "
+        f"pnl={money(float(summary['pnl']))} avg_conf={float(summary['avg_confidence']):.3f}"
+    )
+
+    print("\nBy decision/reason")
+    if not summary["by_reason"]:
+        print("  No paper events yet.")
+    for row in summary["by_reason"]:
+        print(
+            f"  {str(row['event_type']):<14} {str(row['reason']):<22} "
+            f"events={int(row['events'])} pnl={money(float(row['pnl']))} "
+            f"avg_conf={float(row['avg_confidence']):.3f}"
+        )
+
+    print("\nRecent decisions")
+    recent = summary["recent"]
+    if not recent:
+        print("  No recent decisions.")
+    for event in recent:
+        subject = event.outcome or event.asset
+        print(
+            f"  {format_ts(event.event_at)} {event.event_type:<14} {event.reason:<22} "
+            f"{short_wallet(event.wallet)} {subject[:40]} "
+            f"price={event.price:.3f} size={money(event.size_usdc)} pnl={money(event.pnl)}"
+        )
     return 0
 
 
@@ -1105,6 +1154,7 @@ def run_scan(args: argparse.Namespace, store: Store):
     )
     store.insert_signals(signals)
     broker = PaperBroker(store, risk_config=_risk_config_from_args(args), exit_config=_exit_config_from_args(args))
+    broker.record_signal_created(signals)
     closed = broker.mark_and_close()
     opened = broker.open_from_signals(signals)
     return signals, opened, closed

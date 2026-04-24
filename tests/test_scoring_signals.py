@@ -64,11 +64,15 @@ class ScoringSignalTests(unittest.TestCase):
                     now=now,
                 )
                 broker = PaperBroker(store)
+                created_events = broker.record_signal_created(signals)
                 opened_first = broker.open_from_signals(signals)
                 opened_second = broker.open_from_signals(signals)
+                journal = store.paper_event_summary(limit=10)
 
+                self.assertEqual(created_events, len(signals))
                 self.assertTrue(opened_first)
                 self.assertEqual(opened_second, [])
+                self.assertGreaterEqual(journal["total_events"], len(signals) + len(opened_first))
             finally:
                 store.close()
 
@@ -163,10 +167,14 @@ class ScoringSignalTests(unittest.TestCase):
                     ),
                 ).open_from_signals(signals)
                 runtime = store.runtime_state()
+                journal = store.paper_event_summary(limit=10)
 
         self.assertEqual(len(opened), 1)
         self.assertIn("total_exposure_cap", runtime["risk_last_blocks"]["value"])
         self.assertIn("blocked=1", runtime["risk_last_summary"]["value"])
+        reasons = {(row["event_type"], row["reason"]): row["events"] for row in journal["by_reason"]}
+        self.assertEqual(reasons[("OPENED", "opened")], 1)
+        self.assertEqual(reasons[("BLOCKED", "total_exposure_cap")], 1)
 
     def test_paper_broker_closes_max_hold_positions_with_reason(self) -> None:
         now = int(time.time())
@@ -205,11 +213,14 @@ class ScoringSignalTests(unittest.TestCase):
                     ExitConfig(max_hold_hours=1, stale_price_hours=24, risk_trim_enabled=False)
                 )
                 recent = store.fetch_recent_closed_positions(limit=1)
+                events = store.fetch_recent_paper_events(limit=5)
 
         self.assertEqual(len(closed), 1)
         self.assertEqual(closed[0][2], "max_hold")
         self.assertEqual(recent[0].close_reason, "max_hold")
         self.assertGreater(recent[0].realized_pnl, 0)
+        self.assertEqual(events[0].event_type, "CLOSED")
+        self.assertEqual(events[0].reason, "max_hold")
 
     def test_paper_broker_risk_trims_locked_portfolio(self) -> None:
         now = int(time.time())
