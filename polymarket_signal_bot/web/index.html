@@ -1,0 +1,115 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>PolySignal 200 Seed</title>
+    <link rel="stylesheet" href="/styles.css">
+  </head>
+  <body>
+    <div class="terminal-shell">
+      <header class="topbar">
+        <div class="brand">
+          <span class="led"></span>
+          <span id="appName">POLYMARKET 200 SEED</span>
+        </div>
+        <div class="topline">
+          <span>ENGINE poly_signal</span>
+          <span>MONITOR <b id="monitorStatus">OFFLINE</b></span>
+          <span>WALLETS <b id="walletCount">0</b></span>
+          <span>TRADES <b id="tradeCount">0</b></span>
+          <span class="live">LIVE</span>
+          <span>PAPER ONLY</span>
+        </div>
+      </header>
+
+      <section class="cyclebar">
+        <div>
+          <span>RUNWAY</span>
+          <b id="runway">DAY 1</b>
+        </div>
+        <div class="progress-track">
+          <span id="progressFill"></span>
+        </div>
+        <div>
+          <b id="modeStatus">SCANNING</b>
+        </div>
+        <div class="actions">
+          <button id="demoBtn">DEMO</button>
+          <button id="scanBtn">SCAN</button>
+        </div>
+      </section>
+
+      <section class="metrics" id="metrics"></section>
+
+      <main class="grid">
+        <section class="panel scanner">
+          <div class="panel-title">MARKET SCANNER // TOP FLOW</div>
+          <div class="feed" id="scannerFeed"></div>
+        </section>
+
+        <section class="panel consensus">
+          <div class="panel-title">AGENT CONSENSUS // COPY CANDIDATES</div>
+          <div class="feed" id="consensusFeed"></div>
+        </section>
+
+        <section class="panel positions">
+          <div class="panel-title">ACTIVE POSITIONS</div>
+          <div class="feed" id="positionsFeed"></div>
+        </section>
+
+        <section class="panel curve">
+          <div class="panel-title">BANKROLL CURVE // PAPER</div>
+          <div class="bankroll-big" id="bankroll">$200</div>
+          <canvas id="curveCanvas" width="680" height="260"></canvas>
+        </section>
+
+        <section class="panel whales">
+          <div class="panel-title">WHALE TRACKER // SCORED WALLETS</div>
+          <div class="feed" id="whaleFeed"></div>
+        </section>
+
+        <section class="panel votes">
+          <div class="panel-title">TRADE LOG</div>
+          <div class="feed" id="tradeLog"></div>
+        </section>
+
+        <section class="panel depth">
+          <div class="panel-title">ORDER BOOK DEPTH // CLOB</div>
+          <div id="depthBook"></div>
+        </section>
+
+        <section class="panel risk">
+          <div class="panel-title">RISK MONITOR</div>
+          <div class="feed" id="riskFeed"></div>
+        </section>
+
+        <section class="panel exits">
+          <div class="panel-title">EXIT TRIGGERS</div>
+          <div class="feed" id="exitFeed"></div>
+        </section>
+
+        <section class="panel alerts">
+          <div class="panel-title">ALERT ROUTER // TELEGRAM</div>
+          <div class="feed" id="alertFeed"></div>
+        </section>
+
+        <section class="panel reviews">
+          <div class="panel-title">MANUAL APPROVAL QUEUE</div>
+          <div class="feed" id="reviewFeed"></div>
+        </section>
+
+        <section class="panel scale">
+          <div class="panel-title">SCALE TARGET // 86M TRADES / 14K WALLETS</div>
+          <div class="feed" id="scaleFeed"></div>
+        </section>
+      </main>
+
+      <footer class="statusbar">
+        <span id="notice">READY</span>
+        <span id="clock"></span>
+      </footer>
+    </div>
+    <script src="/app.js"></script>
+  </body>
+</html>
