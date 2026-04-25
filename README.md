@@ -53,6 +53,7 @@ python -m polymarket_signal_bot backtest --history-days 30 --bankroll 200 --comp
 python -m polymarket_signal_bot policy-optimizer --history-days 30 --bankroll 200
 python -m polymarket_signal_bot cohort-report --history-days 30 --min-trades 2 --min-notional 100
 python -m polymarket_signal_bot wallet-learning --since-days 90 --limit 20
+python -m polymarket_signal_bot live-paper --dry-run --poll-interval 60 --price-interval 15
 python -m polymarket_signal_bot report
 python -m polymarket_signal_bot paper-journal --since-days 30 --limit 20
 python -m polymarket_signal_bot features-build
@@ -89,6 +90,40 @@ python -m polymarket_signal_bot monitor
 ```
 
 Use `--telegram-dry-run` to record what would be sent without sending messages.
+
+## Live paper runner
+
+`live-paper` is the async runner that combines monitoring with paper position
+management. It polls public APIs for fresh wallet activity and order books,
+generates signals without immediately opening them, optionally asks for manual
+confirmation, opens paper positions through `PaperBroker`, and checks open
+positions on a separate price loop for stop-loss/take-profit exits.
+
+Dry run:
+
+```powershell
+python -m polymarket_signal_bot live-paper --dry-run --poll-interval 60 --price-interval 15
+```
+
+Manual confirmation:
+
+```powershell
+python -m polymarket_signal_bot live-paper --manual-confirm --poll-interval 60 --price-interval 15
+```
+
+Useful environment variables:
+
+```powershell
+$env:POLYSIGNAL_DB="data/polysignal.db"
+$env:POLYSIGNAL_LOG_FILE="data/live_paper_runner.log"
+$env:POLYSIGNAL_STATE_FILE="data/live_paper_state.json"
+$env:POLYMARKET_API_KEY=""
+$env:POLYMARKET_API_SECRET=""
+$env:POLYMARKET_API_PASSPHRASE=""
+```
+
+The current client uses public data only. The private API variables are reserved
+for any future authenticated integration and should never be written into code.
 
 ## Bulk ingestion
 
@@ -277,6 +312,9 @@ Done:
   per-scan, daily-loss, and worst-stop caps before opening paper positions.
 - Paper exit engine v1: close reasons, max-hold exits, stale-price exits,
   and risk-trim exits that gradually unload an over-limit paper portfolio.
+- Live paper runner v1: `live-paper` runs async signal polling and price
+  monitoring, supports manual confirmation, dry-run mode, JSON state snapshots,
+  logging, and graceful `manual_stop` shutdown closes.
 - Paper decision journal v1: `paper_events` logs signal/open/block/close
   decisions and is exported into DuckDB for the three-level learning loop.
 - Order-book history v1: `order_books_history` stores historical spread, depth,

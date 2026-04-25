@@ -27,6 +27,7 @@ from .dashboard import serve_dashboard
 from .demo import demo_trades, demo_wallets
 from .features import build_decision_features, format_feature_summary
 from .learning import format_wallet_outcome_summary, wallet_outcome_lookup, wallet_outcome_report
+from .live_paper_runner import LivePaperConfig, LivePaperRunner
 from .market_flow import MarketFlowConfig, format_market_flow_summary, sync_market_flow
 from .monitor import Monitor, MonitorConfig
 from .models import OrderBookSnapshot, Trade, Wallet
@@ -248,6 +249,33 @@ def build_parser() -> argparse.ArgumentParser:
     open_approved = sub.add_parser("open-approved", help="Open paper positions for approved signals.")
     open_approved.add_argument("--limit", type=int, default=25)
     open_approved.set_defaults(func=cmd_open_approved)
+
+    live_paper = sub.add_parser("live-paper", help="Run async live paper signal and position management.")
+    live_paper.add_argument("--poll-interval", type=int, default=60)
+    live_paper.add_argument("--price-interval", type=int, default=15)
+    live_paper.add_argument("--manual-confirm", action="store_true")
+    live_paper.add_argument("--dry-run", action="store_true")
+    live_paper.add_argument("--no-close-on-stop", action="store_true")
+    live_paper.add_argument("--state-path", default="data/live_paper_state.json")
+    live_paper.add_argument("--log-path", default="data/live_paper_runner.log")
+    live_paper.add_argument("--leaderboard-limit", type=int, default=0)
+    live_paper.add_argument("--wallet-limit", type=int, default=100)
+    live_paper.add_argument("--days", type=int, default=7)
+    live_paper.add_argument("--per-wallet-limit", type=int, default=150)
+    live_paper.add_argument("--bankroll", type=float, default=200.0)
+    live_paper.add_argument("--min-wallet-score", type=float, default=0.55)
+    live_paper.add_argument("--min-trade-usdc", type=float, default=50.0)
+    live_paper.add_argument("--lookback-minutes", type=int, default=120)
+    live_paper.add_argument("--max-signals", type=int, default=20)
+    live_paper.add_argument("--book-asset-limit", type=int, default=40)
+    live_paper.add_argument("--max-spread", type=float, default=0.08)
+    live_paper.add_argument("--min-liquidity-score", type=float, default=0.10)
+    live_paper.add_argument("--min-depth-usdc", type=float, default=25.0)
+    live_paper.add_argument("--stop-loss-pct", type=float, default=0.28)
+    live_paper.add_argument("--take-profit-pct", type=float, default=0.40)
+    live_paper.add_argument("--no-cohort-policy", action="store_true")
+    live_paper.add_argument("--no-learning-policy", action="store_true")
+    live_paper.set_defaults(func=cmd_live_paper)
 
     dashboard = sub.add_parser("dashboard", help="Run the local browser dashboard.")
     dashboard.add_argument("--host", default="127.0.0.1")
@@ -1163,6 +1191,43 @@ def cmd_open_approved(args: argparse.Namespace) -> int:
     print(f"Paper positions opened from approved signals: {len(opened)}")
     if risk_summary:
         print(f"Risk: {risk_summary}")
+    return 0
+
+
+def cmd_live_paper(args: argparse.Namespace) -> int:
+    import asyncio
+
+    config = LivePaperConfig(
+        db_path=args.db,
+        poll_interval_seconds=args.poll_interval,
+        price_interval_seconds=args.price_interval,
+        manual_confirm=args.manual_confirm,
+        dry_run=args.dry_run,
+        close_on_stop=not args.no_close_on_stop,
+        state_path=args.state_path,
+        log_path=args.log_path,
+        leaderboard_limit=args.leaderboard_limit,
+        wallet_limit=args.wallet_limit,
+        days=args.days,
+        per_wallet_limit=args.per_wallet_limit,
+        bankroll=args.bankroll,
+        min_wallet_score=args.min_wallet_score,
+        min_trade_usdc=args.min_trade_usdc,
+        lookback_minutes=args.lookback_minutes,
+        max_signals=args.max_signals,
+        book_asset_limit=args.book_asset_limit,
+        max_spread=args.max_spread,
+        min_liquidity_score=args.min_liquidity_score,
+        min_depth_usdc=args.min_depth_usdc,
+        stop_loss_pct=args.stop_loss_pct,
+        take_profit_pct=args.take_profit_pct,
+        use_cohort_policy=not args.no_cohort_policy,
+        use_learning_policy=not args.no_learning_policy,
+    )
+    try:
+        asyncio.run(LivePaperRunner(config).run())
+    except KeyboardInterrupt:
+        return 130
     return 0
 
 
