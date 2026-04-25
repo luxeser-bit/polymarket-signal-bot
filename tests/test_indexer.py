@@ -2,18 +2,26 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+import os
 from pathlib import Path
+from unittest.mock import patch
 
 from polymarket_signal_bot.indexer import (
     BlockInfo,
     CTF_EXCHANGE_ADDRESS,
+    ContractSpec,
+    IndexerConfig,
     IndexerStore,
     ORDER_FILLED_TOPIC,
+    PolygonEventIndexer,
+    RpcLogRangeTooLarge,
     TRANSFER_SINGLE_TOPIC,
+    build_arg_parser,
     chunk_ranges,
     condition_id_from_tx_input,
     decode_log,
     default_contract_specs,
+    topics_for_contract,
     topic_to_address,
 )
 
@@ -168,6 +176,19 @@ class IndexerTests(unittest.TestCase):
         self.assertIn("0xe2222d279d744050d28e00520010520000310f59", addresses)
         self.assertNotIn("0x4bfb41d5b3570defd03c39a9a4d8de6bd8b8982e", addresses)
 
+    def test_contract_topics_are_explicit(self) -> None:
+        for contract in default_contract_specs():
+            topics = topics_for_contract(contract)
+            self.assertGreaterEqual(len(topics), len(contract.event_names))
+            self.assertTrue(all(topic.startswith("0x") and len(topic) == 66 for topic in topics))
+
+    def test_cli_defaults_are_rpc_friendly(self) -> None:
+        with patch.dict(os.environ, {}, clear=True):
+            args = build_arg_parser().parse_args([])
+        self.assertEqual(args.chunk_size, 100)
+        self.assertEqual(args.max_workers, 2)
+        self.assertEqual(args.min_log_chunk_size, 10)
+
     def test_topic_to_address(self) -> None:
         address = "0xabcdefabcdefabcdefabcdefabcdefabcdefabcd"
         self.assertEqual(topic_to_address(_topic_address(address)), address)
@@ -176,6 +197,45 @@ class IndexerTests(unittest.TestCase):
         import src.indexer as indexer
 
         self.assertTrue(callable(indexer.main))
+
+
+class AdaptiveLogFetchTests(unittest.IsolatedAsyncioTestCase):
+    async def test_fetch_logs_splits_rejected_ranges(self) -> None:
+        class FakeRpc:
+            def __init__(self) -> None:
+                self.calls: list[tuple[int, int, tuple[str, ...]]] = []
+
+            async def get_logs(
+                self,
+                *,
+                address: str,
+                from_block: int,
+                to_block: int,
+                topics: list[str] | None = None,
+            ) -> list[dict[str, object]]:
+                self.calls.append((from_block, to_block, tuple(topics or [])))
+                if to_block - from_block + 1 > 10:
+                    raise RpcLogRangeTooLarge("too many logs")
+                return [{"address": address, "blockNumber": hex(from_block), "topics": topics or []}]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            rpc = FakeRpc()
+            contract = ContractSpec("Test", CTF_EXCHANGE_ADDRESS, ("OrderFilledV2",))
+            with IndexerStore(Path(tmp) / "state.db") as store:
+                indexer = PolygonEventIndexer(
+                    IndexerConfig(rpc_url="http://rpc", min_log_chunk_size=10),
+                    store=store,
+                    contracts=[contract],
+                )
+
+                with self.assertLogs("polymarket_signal_bot.indexer", level="WARNING"):
+                    logs = await indexer._fetch_logs_for_contract(
+                        rpc, contract, 1, 25, topics_for_contract(contract)
+                    )
+
+        self.assertEqual(len(logs), 4)
+        self.assertIn((1, 25, tuple(topics_for_contract(contract))), rpc.calls)
+        self.assertTrue(all(call[2] for call in rpc.calls))
 
 
 if __name__ == "__main__":

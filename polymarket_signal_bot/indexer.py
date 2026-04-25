@@ -39,20 +39,34 @@ CONDITIONAL_TOKENS_ADDRESS = "0x4d97dcd97ec945f40cf65f87097ace5ea0476045"
 CTF_EXCHANGE_ADDRESS = "0xe111180000d2663c0091e4f400237545b87b996b"
 NEG_RISK_CTF_EXCHANGE_ADDRESS = "0xe2222d279d744050d28e00520010520000310f59"
 
-# Hard-coded high-volume topics avoid requiring web3/eth-hash for the normal
-# trade path. Other event signatures are computed lazily when eth-hash,
-# pycryptodome, or web3 is installed.
+# Hard-coded topics keep every eth_getLogs call narrowly filtered, even when
+# optional keccak helpers are not installed.
 TRANSFER_SINGLE_TOPIC = (
     "0xc3d58168c5ae7397731d063d5bbf3d657854427343f4c083240f7aacaa2d0f62"
 )
 TRANSFER_BATCH_TOPIC = (
     "0x4a39dc06d4c0dbc64b70af90fd698a233a518aa5d07e595d983b8c0526c8f7fb"
 )
+CONDITION_PREPARATION_TOPIC = (
+    "0xab3760c3bd2bb38b5bcf54dc79802ed67338b4cf29f3054ded67ed24661e4177"
+)
+PAYOUT_REDEMPTION_TOPIC = (
+    "0x2682012a4a4f1973119f1c9b90745d1bd91fa2bab387344f044cb3586864d18d"
+)
 ORDER_FILLED_V1_TOPIC = (
     "0xd0a08e8c493f9c94f29311604c9de1b4e8c8d4c06bd0c789af57f2d65bfec0f6"
 )
+ORDER_FILLED_V2_TOPIC = (
+    "0xd543adfd945773f1a62f74f0ee55a5e3b9b1a28262980ba90b1a89f2ea84d8ee"
+)
+ORDERS_MATCHED_V2_TOPIC = (
+    "0x174b3811690657c217184f89418266767c87e4805d09680c39fc9c031c0cab7c"
+)
 ORDER_CANCELLED_TOPIC = (
     "0x5152abf959f6564662358c2e52b702259b78bac5ee7842a0f01937e670efcc7d"
+)
+ORDER_PLACED_TOPIC = (
+    "0xb087bc729ec5e16d080749aa735677ed7a580ff3f3e04fcd376155d6a89d6a9a"
 )
 ORDER_FILLED_TOPIC = ORDER_FILLED_V1_TOPIC
 OWNER_SELECTOR = "0x8da5cb5b"
@@ -70,8 +84,13 @@ EVENT_SIGNATURES: dict[str, str] = {
 EVENT_TOPIC_FALLBACKS: dict[str, str] = {
     "TransferSingle": TRANSFER_SINGLE_TOPIC,
     "TransferBatch": TRANSFER_BATCH_TOPIC,
+    "ConditionPreparation": CONDITION_PREPARATION_TOPIC,
+    "PayoutRedemption": PAYOUT_REDEMPTION_TOPIC,
     "OrderFilledV1": ORDER_FILLED_V1_TOPIC,
+    "OrderFilledV2": ORDER_FILLED_V2_TOPIC,
+    "OrdersMatchedV2": ORDERS_MATCHED_V2_TOPIC,
     "OrderCancelled": ORDER_CANCELLED_TOPIC,
+    "OrderPlaced": ORDER_PLACED_TOPIC,
 }
 
 
@@ -83,6 +102,10 @@ class RpcExecutionReverted(RuntimeError):
     """Raised for non-retryable eth_call execution reverts."""
 
 
+class RpcLogRangeTooLarge(RuntimeError):
+    """Raised when a log query range is too large for the RPC provider."""
+
+
 @dataclass(frozen=True)
 class IndexerConfig:
     rpc_url: str
@@ -92,8 +115,9 @@ class IndexerConfig:
     sync: bool = False
     dry_run: bool = False
     batch_size: int = 1_000
-    max_workers: int = 6
-    block_chunk_size: int = 1_000
+    max_workers: int = 2
+    block_chunk_size: int = 100
+    min_log_chunk_size: int = 10
     poll_seconds: float = 12.0
     log_every: int = 1_000
     reorg_depth: int = 1_000
@@ -385,15 +409,21 @@ class PolygonRpcClient:
             try:
                 await self._rate_limiter.acquire()
                 response = await self._client.post(self.rpc_url, json=payload)
+                if method == "eth_getLogs" and response.status_code == 400:
+                    raise RpcLogRangeTooLarge(summarize_rpc_response(response))
                 response.raise_for_status()
                 body = response.json()
                 if "error" in body:
                     error = body["error"]
                     if method == "eth_call" and isinstance(error, dict) and error.get("code") == 3:
                         raise RpcExecutionReverted(f"RPC error for {method}: {error}")
+                    if method == "eth_getLogs" and is_log_range_error(error):
+                        raise RpcLogRangeTooLarge(f"RPC error for {method}: {error}")
                     raise RuntimeError(f"RPC error for {method}: {error}")
                 return body.get("result")
             except RpcExecutionReverted:
+                raise
+            except RpcLogRangeTooLarge:
                 raise
             except Exception as exc:  # noqa: BLE001 - transient RPC failures are retried.
                 last_error = exc
@@ -623,11 +653,18 @@ class PolygonEventIndexer:
         logs: list[dict[str, Any]] = []
         for contract in self.contracts:
             topics = topics_for_contract(contract)
-            contract_logs = await rpc.get_logs(
-                address=contract.normalized_address,
-                from_block=start_block,
-                to_block=end_block,
-                topics=topics,
+            if not topics:
+                LOGGER.warning(
+                    "Skipping %s log query because no event topics are available",
+                    contract.name,
+                )
+                continue
+            contract_logs = await self._fetch_logs_for_contract(
+                rpc,
+                contract,
+                start_block,
+                end_block,
+                topics,
             )
             logs.extend(contract_logs)
 
@@ -648,6 +685,42 @@ class PolygonEventIndexer:
             rows.extend(decoded)
         rows.sort(key=lambda row: (row.block_number, row.log_index, row.hash))
         return start_block, end_block, rows, blocks
+
+    async def _fetch_logs_for_contract(
+        self,
+        rpc: PolygonRpcClient,
+        contract: ContractSpec,
+        start_block: int,
+        end_block: int,
+        topics: Sequence[str],
+    ) -> list[dict[str, Any]]:
+        try:
+            return await rpc.get_logs(
+                address=contract.normalized_address,
+                from_block=start_block,
+                to_block=end_block,
+                topics=list(topics),
+            )
+        except RpcLogRangeTooLarge as exc:
+            if end_block - start_block + 1 <= self.config.min_log_chunk_size:
+                raise
+            mid = (start_block + end_block) // 2
+            LOGGER.warning(
+                "RPC rejected logs for %s blocks %s..%s; splitting to %s..%s and %s..%s: %s",
+                contract.name,
+                start_block,
+                end_block,
+                start_block,
+                mid,
+                mid + 1,
+                end_block,
+                exc,
+            )
+            left, right = await asyncio.gather(
+                self._fetch_logs_for_contract(rpc, contract, start_block, mid, topics),
+                self._fetch_logs_for_contract(rpc, contract, mid + 1, end_block, topics),
+            )
+            return [*left, *right]
 
     async def _load_tx_condition_ids(
         self, rpc: PolygonRpcClient, logs: Sequence[dict[str, Any]]
@@ -1237,6 +1310,31 @@ def first_topic(log: dict[str, Any]) -> str:
     return str(topics[0]).lower()
 
 
+def is_log_range_error(error: Any) -> bool:
+    text = json.dumps(error, sort_keys=True).lower() if isinstance(error, dict) else str(error).lower()
+    markers = (
+        "too many",
+        "response size",
+        "block range",
+        "more than",
+        "limit exceeded",
+        "query returned more",
+        "log response size",
+    )
+    return any(marker in text for marker in markers)
+
+
+def summarize_rpc_response(response: Any) -> str:
+    try:
+        body = response.json()
+    except Exception:  # noqa: BLE001 - response body is best-effort context.
+        body = getattr(response, "text", "")
+    if isinstance(body, dict):
+        error = body.get("error", body)
+        return json.dumps(error, sort_keys=True)[:500]
+    return str(body)[:500]
+
+
 def hex_to_int(value: Any) -> int:
     if value is None:
         return 0
@@ -1392,7 +1490,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--max-workers",
         type=int,
-        default=int(os.getenv("MAX_WORKERS", "6")),
+        default=int(os.getenv("MAX_WORKERS", "2")),
     )
     parser.add_argument(
         "--rpc-rps",
@@ -1403,9 +1501,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--chunk-size",
         type=int,
-        default=int(os.getenv("BLOCK_CHUNK_SIZE", "1000")),
+        default=int(os.getenv("CHUNK_SIZE", os.getenv("BLOCK_CHUNK_SIZE", "100"))),
     )
     parser.add_argument("--poll-seconds", type=float, default=12.0)
+    parser.add_argument(
+        "--min-log-chunk-size",
+        type=int,
+        default=int(os.getenv("MIN_LOG_CHUNK_SIZE", "10")),
+        help="Smallest block range after adaptive eth_getLogs splitting.",
+    )
     parser.add_argument(
         "--default-start-block",
         type=int,
@@ -1438,6 +1542,7 @@ def config_from_args(args: argparse.Namespace) -> IndexerConfig:
         batch_size=int(args.batch_size),
         max_workers=max(1, int(args.max_workers)),
         block_chunk_size=max(1, int(args.chunk_size)),
+        min_log_chunk_size=max(1, int(args.min_log_chunk_size)),
         poll_seconds=float(args.poll_seconds),
         default_start_block=max(0, int(args.default_start_block)),
         rpc_rps=max(0.0, float(args.rpc_rps)),
