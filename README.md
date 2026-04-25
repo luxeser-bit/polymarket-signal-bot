@@ -44,6 +44,8 @@ python -m polymarket_signal_bot wallets-export --out data/watchlist.txt
 python -m polymarket_signal_bot bulk-sync --wallet-limit 100 --max-pages-per-wallet 2
 python -m polymarket_signal_bot sync-books --asset-limit 40 --lookback-minutes 1440
 python -m polymarket_signal_bot history-backfill
+python -m pip install websockets
+python -m polymarket_signal_bot stream --asset-limit 40 --reconcile-min-notional 50 --scan-every-events 25
 python -m polymarket_signal_bot analytics-export --duckdb data/polysignal.duckdb
 python -m polymarket_signal_bot analytics-report --duckdb data/polysignal.duckdb
 python -m polymarket_signal_bot scan --bankroll 200 --min-wallet-score 0.55 --min-trade-usdc 50
@@ -152,6 +154,39 @@ python -m polymarket_signal_bot bulk-sync --wallet-limit 500 --max-pages-per-wal
 python -m polymarket_signal_bot monitor --analytics-export-every 10
 ```
 
+## CLOB stream mode
+
+`stream` adds a producer/consumer path for public Polymarket CLOB WebSocket
+events. The producer subscribes to recent asset ids, sends the required
+heartbeat, and puts raw events into an in-process queue. The consumer stores
+`stream_events`, updates full-book snapshots from `book` messages, reconciles
+large `last_trade_price` events through the Data API, and can trigger paper
+scans after a chosen number of stream events.
+
+Install the optional dependency first:
+
+```powershell
+python -m pip install websockets
+```
+
+Start with a finite smoke run:
+
+```powershell
+python -m polymarket_signal_bot stream --asset-limit 20 --max-events 100 --reconcile-min-notional 50
+```
+
+Then run continuously:
+
+```powershell
+python -m polymarket_signal_bot stream --asset-limit 80 --reconcile-min-notional 100 --scan-every-events 25
+```
+
+Important limitation: the public market WebSocket does not include whale wallet
+addresses in the event itself. It gives instant market/asset executions and book
+changes. Wallet attribution comes from the reconciliation step against public
+Data API trades, so this is faster than the 60-second monitor loop but still not
+a private wallet order feed.
+
 Market-flow discovery can be enabled in monitor mode:
 
 ```powershell
@@ -254,6 +289,9 @@ Done:
 - Decision feature table v1: `features-build` converts paper decisions into
   ML-ready rows with signal, cohort, liquidity, learning-adjustment, and outcome
   labels, then exports them into DuckDB.
+- CLOB stream v1: `stream` listens to public WebSocket market events, stores
+  `stream_events`, updates order-book history from live `book` messages, and
+  reconciles large executions into wallet-attributed trade rows for paper scans.
 
 Partial:
 

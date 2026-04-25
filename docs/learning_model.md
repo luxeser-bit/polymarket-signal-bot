@@ -115,6 +115,13 @@ and `order_books_history` appends historical spread, depth, and liquidity
 snapshots from each book sync. The DuckDB view `v_order_book_history_daily`
 summarizes this history by day.
 
+Current implementation: `stream` can subscribe to the public Polymarket CLOB
+market WebSocket. Raw events are stored in `stream_events`; full `book` messages
+update the order-book tables; large `last_trade_price` executions are reconciled
+through the Data API so wallet-attributed trades can feed paper scans faster
+than the periodic monitor loop. Public market stream events do not include whale
+wallet addresses directly, so wallet attribution remains a reconciliation step.
+
 ### Paper Decisions
 
 The system must log its own behavior, not only public market behavior:

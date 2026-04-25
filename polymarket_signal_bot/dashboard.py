@@ -117,6 +117,7 @@ def build_dashboard_state(store: Store, *, bankroll: float = DEFAULT_BANKROLL) -
     open_positions = store.fetch_open_positions()
     closed_positions = store.fetch_recent_closed_positions(limit=8)
     journal_summary = store.paper_event_summary(limit=8)
+    stream_summary = store.stream_event_summary(limit=8)
     summary = store.paper_summary()
     stats = _db_stats(store)
     sync_progress = store.sync_progress()
@@ -144,6 +145,10 @@ def build_dashboard_state(store: Store, *, bankroll: float = DEFAULT_BANKROLL) -
             "monitorStatus": _runtime_value(runtime, "monitor_status", "offline"),
             "monitorSummary": _runtime_value(runtime, "monitor_last_summary", ""),
             "monitorLastSeen": _runtime_updated(runtime, "monitor_last_seen"),
+            "streamStatus": _runtime_value(runtime, "stream_status", "offline"),
+            "streamSummary": _stream_summary_label(stream_summary),
+            "streamLastSummary": _runtime_value(runtime, "stream_last_summary", ""),
+            "streamLastSeen": _runtime_updated(runtime, "stream_last_seen"),
             "bulkSummary": _runtime_value(runtime, "bulk_last_summary", ""),
             "marketFlowSummary": _runtime_value(runtime, "market_flow_last_summary", ""),
             "marketFlowLastSeen": _runtime_updated(runtime, "market_flow_last_seen"),
@@ -172,6 +177,8 @@ def build_dashboard_state(store: Store, *, bankroll: float = DEFAULT_BANKROLL) -
             "signals": int(stats["signals"]),
             "paperEvents": int(journal_summary["total_events"]),
             "decisionFeatures": int(feature_summary["features"]),
+            "streamEvents": int(stream_summary["events"]),
+            "streamTrades": int(stream_summary["trades"]),
             "winRate": _estimated_win_rate(marked_positions, summary),
             "openPositions": int(summary["open_positions"]),
             "openCost": round(summary["open_cost"], 2),
@@ -545,6 +552,16 @@ def _book_history_label(summary: dict[str, float]) -> str:
         f"{snapshots} snapshots / {assets} assets; "
         f"avg_spread={float(summary.get('avg_spread') or 0):.4f} "
         f"liq={float(summary.get('avg_liquidity') or 0):.3f}"
+    )
+
+
+def _stream_summary_label(summary: dict[str, object]) -> str:
+    events = int(summary.get("events") or 0)
+    if events <= 0:
+        return "no stream events"
+    return (
+        f"events={events} trades={int(summary.get('trades') or 0)} "
+        f"notional=${float(summary.get('notional') or 0.0):.2f}"
     )
 
 

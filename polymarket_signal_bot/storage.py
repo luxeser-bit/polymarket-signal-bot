@@ -215,6 +215,30 @@ class Store:
             CREATE INDEX IF NOT EXISTS idx_decision_features_label
                 ON decision_features(label, category);
 
+            CREATE TABLE IF NOT EXISTS stream_events (
+                event_id TEXT PRIMARY KEY,
+                received_at INTEGER NOT NULL,
+                event_ts INTEGER NOT NULL DEFAULT 0,
+                event_type TEXT NOT NULL,
+                source TEXT NOT NULL DEFAULT 'clob-market-ws',
+                market TEXT NOT NULL DEFAULT '',
+                asset TEXT NOT NULL DEFAULT '',
+                side TEXT NOT NULL DEFAULT '',
+                price REAL NOT NULL DEFAULT 0,
+                size REAL NOT NULL DEFAULT 0,
+                notional REAL NOT NULL DEFAULT 0,
+                raw_json TEXT NOT NULL DEFAULT '',
+                processed_at INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE INDEX IF NOT EXISTS idx_stream_events_received
+                ON stream_events(received_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_stream_events_type
+                ON stream_events(event_type, received_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_stream_events_asset
+                ON stream_events(asset, received_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_stream_events_market
+                ON stream_events(market, received_at DESC);
+
             CREATE TABLE IF NOT EXISTS runtime_state (
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL,
@@ -1271,6 +1295,73 @@ class Store:
             "avg_liquidity_score": float(total["avg_liquidity_score"] or 0.0),
             "label_pnl": float(total["label_pnl"] or 0.0),
             "labels": [dict(row) for row in labels],
+        }
+
+    def insert_stream_events(self, events: Iterable[dict[str, object]]) -> int:
+        count = 0
+        now = int(time.time())
+        for event in events:
+            cursor = self.conn.execute(
+                """
+                INSERT OR IGNORE INTO stream_events(
+                    event_id, received_at, event_ts, event_type, source, market,
+                    asset, side, price, size, notional, raw_json, processed_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    event.get("event_id", ""),
+                    int(event.get("received_at") or now),
+                    int(event.get("event_ts") or 0),
+                    str(event.get("event_type") or ""),
+                    str(event.get("source") or "clob-market-ws"),
+                    str(event.get("market") or ""),
+                    str(event.get("asset") or ""),
+                    str(event.get("side") or ""),
+                    float(event.get("price") or 0.0),
+                    float(event.get("size") or 0.0),
+                    float(event.get("notional") or 0.0),
+                    str(event.get("raw_json") or ""),
+                    int(event.get("processed_at") or now),
+                ),
+            )
+            count += cursor.rowcount
+        self.conn.commit()
+        return count
+
+    def stream_event_summary(self, *, limit: int = 10) -> dict[str, object]:
+        total = self.conn.execute(
+            """
+            SELECT
+                COUNT(*) AS events,
+                COALESCE(SUM(CASE WHEN event_type = 'last_trade_price' THEN 1 ELSE 0 END), 0) AS trades,
+                COALESCE(SUM(CASE WHEN event_type = 'book' THEN 1 ELSE 0 END), 0) AS books,
+                COALESCE(SUM(CASE WHEN event_type = 'price_change' THEN 1 ELSE 0 END), 0) AS price_changes,
+                COALESCE(SUM(notional), 0) AS notional,
+                COALESCE(MIN(received_at), 0) AS first_seen,
+                COALESCE(MAX(received_at), 0) AS last_seen
+            FROM stream_events
+            """
+        ).fetchone()
+        by_type = self.conn.execute(
+            """
+            SELECT event_type, COUNT(*) AS events, COALESCE(SUM(notional), 0) AS notional
+            FROM stream_events
+            GROUP BY event_type
+            ORDER BY events DESC, event_type ASC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+        return {
+            "events": int(total["events"] or 0),
+            "trades": int(total["trades"] or 0),
+            "books": int(total["books"] or 0),
+            "price_changes": int(total["price_changes"] or 0),
+            "notional": float(total["notional"] or 0.0),
+            "first_seen": int(total["first_seen"] or 0),
+            "last_seen": int(total["last_seen"] or 0),
+            "by_type": [dict(row) for row in by_type],
         }
 
     def fetch_recent_paper_events(

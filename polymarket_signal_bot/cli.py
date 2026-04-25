@@ -35,6 +35,7 @@ from .policy_optimizer import OptimizerConfig, policy_settings_from_recommendati
 from .scoring import score_wallets
 from .signals import SignalConfig, generate_signals
 from .storage import DEFAULT_DB_PATH, Store
+from .streaming import MissingWebsocketError, StreamConfig, StreamProcessor, missing_websocket_message
 from .taxonomy import market_category, market_category_label
 
 
@@ -252,6 +253,25 @@ def build_parser() -> argparse.ArgumentParser:
     dashboard.add_argument("--host", default="127.0.0.1")
     dashboard.add_argument("--port", type=int, default=8765)
     dashboard.set_defaults(func=cmd_dashboard)
+
+    stream = sub.add_parser("stream", help="Listen to public Polymarket CLOB WebSocket events.")
+    stream.add_argument("--asset", action="append", default=[], help="CLOB token id. Repeat as needed.")
+    stream.add_argument("--asset-limit", type=int, default=40)
+    stream.add_argument("--lookback-minutes", type=int, default=24 * 60)
+    stream.add_argument("--max-events", type=int, default=0, help="0 means stream forever.")
+    stream.add_argument("--batch-size", type=int, default=50)
+    stream.add_argument("--flush-interval-seconds", type=float, default=1.0)
+    stream.add_argument("--reconcile-min-notional", type=float, default=50.0)
+    stream.add_argument("--reconcile-limit", type=int, default=30)
+    stream.add_argument("--reconcile-window-seconds", type=int, default=45)
+    stream.add_argument("--no-reconcile", action="store_true")
+    stream.add_argument("--scan-every-events", type=int, default=0, help="Run paper scan after N stream events. 0 disables.")
+    stream.add_argument("--wallet-limit", type=int, default=100)
+    stream.add_argument("--bankroll", type=float, default=200.0)
+    stream.add_argument("--min-wallet-score", type=float, default=0.55)
+    stream.add_argument("--min-trade-usdc", type=float, default=50.0)
+    stream.add_argument("--max-signals", type=int, default=20)
+    stream.set_defaults(func=cmd_stream)
 
     monitor = sub.add_parser("monitor", help="Continuously update data, signals, paper positions, and alerts.")
     monitor.add_argument("--interval-seconds", type=int, default=60)
@@ -941,6 +961,12 @@ def cmd_analytics_report(args: argparse.Namespace) -> int:
             f"pnl={money(row['pnl'])} conf={row['avg_confidence']:.3f} "
             f"learn={row['avg_learning_score']:.3f} liq={row['avg_liquidity_score']:.3f}"
         )
+    print("\nStream events")
+    for row in report["stream_events"]:
+        print(
+            f"  {str(row['event_type']):<18} events={row['events']} "
+            f"assets={row['assets']} markets={row['markets']} notional={money(row['notional'])}"
+        )
     print("\nOrder-book history")
     for row in report["book_history"]:
         print(
@@ -1142,6 +1168,43 @@ def cmd_open_approved(args: argparse.Namespace) -> int:
 
 def cmd_dashboard(args: argparse.Namespace) -> int:
     serve_dashboard(args.db, host=args.host, port=args.port)
+    return 0
+
+
+def cmd_stream(args: argparse.Namespace) -> int:
+    config = StreamConfig(
+        assets=tuple(args.asset or ()),
+        asset_limit=args.asset_limit,
+        lookback_minutes=args.lookback_minutes,
+        max_events=args.max_events,
+        batch_size=args.batch_size,
+        flush_interval_seconds=args.flush_interval_seconds,
+        reconcile_trades=not args.no_reconcile,
+        reconcile_min_notional=args.reconcile_min_notional,
+        reconcile_limit=args.reconcile_limit,
+        reconcile_window_seconds=args.reconcile_window_seconds,
+        scan_every_events=args.scan_every_events,
+        wallet_limit=args.wallet_limit,
+        bankroll=args.bankroll,
+        min_wallet_score=args.min_wallet_score,
+        min_trade_usdc=args.min_trade_usdc,
+        max_signals=args.max_signals,
+    )
+    try:
+        with open_store(args.db) as store:
+            store.init_schema()
+            assets = list(config.assets) or store.recent_assets(
+                limit=config.asset_limit,
+                since_ts=int(time.time()) - config.lookback_minutes * 60,
+            )
+            print(
+                f"CLOB stream starting: assets={len(assets)} "
+                f"reconcile={int(config.reconcile_trades)} scan_every={config.scan_every_events}"
+            )
+            StreamProcessor(store, config=config).run()
+    except MissingWebsocketError:
+        print(missing_websocket_message(), file=sys.stderr)
+        return 2
     return 0
 
 

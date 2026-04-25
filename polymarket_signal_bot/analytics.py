@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+import importlib.util
 import os
 import sqlite3
 import time
@@ -23,6 +24,7 @@ EXPORT_TABLES = [
     "paper_positions",
     "paper_events",
     "decision_features",
+    "stream_events",
     "order_books_latest",
     "order_books_history",
     "signal_reviews",
@@ -223,6 +225,16 @@ def analytics_report(duckdb_path: str | Path = DEFAULT_DUCKDB_PATH, *, limit: in
                        avg_liquidity_score
                 FROM v_decision_feature_summary
                 ORDER BY rows DESC, pnl DESC, label ASC
+                LIMIT ?
+                """,
+                (limit,),
+            ),
+            "stream_events": _fetch_all(
+                conn,
+                """
+                SELECT event_type, events, notional, assets, markets
+                FROM v_stream_event_summary
+                ORDER BY events DESC, event_type ASC
                 LIMIT ?
                 """,
                 (limit,),
@@ -599,6 +611,21 @@ def _create_views(conn: Any) -> None:
             COALESCE(AVG(book_age_seconds), 0) AS avg_book_age_seconds
         FROM decision_features
         GROUP BY label, category
+        """
+    )
+    conn.execute(
+        """
+        CREATE OR REPLACE VIEW v_stream_event_summary AS
+        SELECT
+            event_type,
+            COUNT(*) AS events,
+            COALESCE(SUM(notional), 0) AS notional,
+            COUNT(DISTINCT asset) AS assets,
+            COUNT(DISTINCT market) AS markets,
+            MIN(received_at) AS first_seen,
+            MAX(received_at) AS last_seen
+        FROM stream_events
+        GROUP BY event_type
         """
     )
     conn.execute(
