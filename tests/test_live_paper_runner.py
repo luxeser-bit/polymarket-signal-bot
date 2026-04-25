@@ -6,7 +6,7 @@ import time
 import unittest
 
 from polymarket_signal_bot.demo import demo_trades, demo_wallets
-from polymarket_signal_bot.live_paper_runner import LivePaperConfig, LivePaperRunner
+from polymarket_signal_bot.live_paper_runner import LivePaperConfig, LivePaperRunner, _portfolio_snapshot
 from polymarket_signal_bot.models import PaperPosition, Signal
 from polymarket_signal_bot.storage import Store
 
@@ -144,6 +144,123 @@ class LivePaperRunnerTests(unittest.TestCase):
         self.assertEqual(open_positions, [])
         self.assertEqual(events["total_events"], 1)
         self.assertEqual(events["recent"][0].reason, "take_profit")
+
+    def test_portfolio_metrics_include_pnl_trades_and_win_rate(self) -> None:
+        now = int(time.time())
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with Store(f"{tmpdir}/metrics.db") as store:
+                store.init_schema()
+                store.insert_paper_positions(
+                    [
+                        PaperPosition(
+                            position_id="pos-win",
+                            signal_id="sig-win",
+                            opened_at=now - 60,
+                            wallet="0xabc",
+                            condition_id="cond-1",
+                            asset="asset-1",
+                            outcome="Yes",
+                            title="Market",
+                            entry_price=0.50,
+                            size_usdc=10,
+                            shares=20,
+                            stop_loss=0.40,
+                            take_profit=0.60,
+                            status="CLOSED",
+                            closed_at=now,
+                            exit_price=0.60,
+                            realized_pnl=2.0,
+                            close_reason="take_profit",
+                        ),
+                        PaperPosition(
+                            position_id="pos-loss",
+                            signal_id="sig-loss",
+                            opened_at=now - 60,
+                            wallet="0xdef",
+                            condition_id="cond-2",
+                            asset="asset-2",
+                            outcome="No",
+                            title="Market 2",
+                            entry_price=0.50,
+                            size_usdc=10,
+                            shares=20,
+                            stop_loss=0.40,
+                            take_profit=0.60,
+                            status="CLOSED",
+                            closed_at=now,
+                            exit_price=0.45,
+                            realized_pnl=-1.0,
+                            close_reason="stop_loss",
+                        ),
+                    ]
+                )
+                metrics = _portfolio_snapshot(store, 200)
+
+        self.assertEqual(metrics["trade_count"], 2)
+        self.assertEqual(metrics["closed_trades"], 2)
+        self.assertEqual(metrics["winning_trades"], 1)
+        self.assertEqual(metrics["win_rate"], 0.5)
+        self.assertEqual(metrics["total_pnl"], 1.0)
+
+    def test_stream_tick_consumes_stream_queue_without_api_polling(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = f"{tmpdir}/stream-live.db"
+            with Store(db_path) as store:
+                store.init_schema()
+                store.upsert_wallets(demo_wallets())
+                store.insert_trades(demo_trades())
+                store.insert_stream_events(
+                    [
+                        {
+                            "event_id": "stream-1",
+                            "received_at": int(time.time()),
+                            "event_ts": int(time.time()),
+                            "event_type": "last_trade_price",
+                            "market": "market-1",
+                            "asset": "asset-1",
+                            "side": "BUY",
+                            "price": 0.5,
+                            "size": 100,
+                            "notional": 50,
+                            "raw_json": "{}",
+                        }
+                    ]
+                )
+
+            runner = LivePaperRunner(
+                LivePaperConfig(
+                    db_path=db_path,
+                    use_stream_queue=True,
+                    wallet_limit=3,
+                    min_wallet_score=0.2,
+                    min_trade_usdc=5,
+                    lookback_minutes=24 * 60,
+                    max_book_price_deviation=10.0,
+                    use_cohort_policy=False,
+                    use_learning_policy=False,
+                ),
+                client=FakeLiveClient(),
+            )
+            signals, summary = runner.stream_tick()
+
+            with Store(db_path) as store:
+                store.init_schema()
+                cursor = store.runtime_state()["live_paper_stream_cursor"]["value"]
+
+        self.assertIn("stream_events=1", summary)
+        self.assertTrue(signals)
+        self.assertEqual(cursor, "1")
+
+    def test_policy_optimizer_recommendation_is_reloaded_each_tick(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = f"{tmpdir}/policy.db"
+            runner = LivePaperRunner(LivePaperConfig(db_path=db_path))
+            with Store(db_path) as store:
+                store.init_schema()
+                store.set_runtime_state("policy_optimizer_recommended", "balanced_cohort")
+                self.assertEqual(runner._active_signal_policy(store), (True, "balanced"))
+                store.set_runtime_state("policy_optimizer_recommended", "baseline")
+                self.assertEqual(runner._active_signal_policy(store), (False, "strict"))
 
 
 if __name__ == "__main__":

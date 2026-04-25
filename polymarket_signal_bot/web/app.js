@@ -226,6 +226,7 @@ function renderScale(state) {
     { status: "ANALYTICS", label: `${String(state.meta.analyticsStatus || "idle").toUpperCase()} ${state.meta.analyticsSummary || state.meta.analyticsError || ""}`, pct: state.meta.analyticsStatus === "ready" ? 1 : 0 },
     { status: "POLICY", label: state.meta.signalPolicyActive || state.meta.policySummary || `recommended=${state.meta.policyRecommended}`, pct: state.meta.policySummary ? 1 : 0 },
     { status: "JOURNAL", label: state.meta.journalSummary || "no decisions logged yet", pct: state.stats.paperEvents ? 1 : 0 },
+    { status: "LIVE PAPER", label: state.meta.livePaperMetrics || state.meta.livePaperSummary || String(state.meta.livePaperStatus || "offline"), pct: state.meta.livePaperStatus === "running" || state.meta.livePaperStatus === "running_stream" ? 1 : 0 },
     { status: "BOOK HIST", label: state.meta.bookHistorySummary || "no historical order books yet", pct: state.stats.bookHistorySnapshots ? 1 : 0 },
     { status: "LEARNING", label: state.meta.learningSummary || "no outcome rows yet", pct: state.learning && state.learning.length ? 1 : 0 },
     { status: "FEATURES", label: state.meta.featuresSummary || "not built yet", pct: state.stats.decisionFeatures ? 1 : 0 },

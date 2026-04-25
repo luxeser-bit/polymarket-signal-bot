@@ -253,6 +253,10 @@ def build_parser() -> argparse.ArgumentParser:
     live_paper = sub.add_parser("live-paper", help="Run async live paper signal and position management.")
     live_paper.add_argument("--poll-interval", type=int, default=60)
     live_paper.add_argument("--price-interval", type=int, default=15)
+    live_paper.add_argument("--use-stream-queue", action="store_true", help="Consume stream_events instead of polling APIs for signal ticks.")
+    live_paper.add_argument("--stream-queue-interval", type=float, default=1.0)
+    live_paper.add_argument("--stream-batch-limit", type=int, default=500)
+    live_paper.add_argument("--stream-min-events", type=int, default=1)
     live_paper.add_argument("--manual-confirm", action="store_true")
     live_paper.add_argument("--dry-run", action="store_true")
     live_paper.add_argument("--no-close-on-stop", action="store_true")
@@ -1201,6 +1205,10 @@ def cmd_live_paper(args: argparse.Namespace) -> int:
         db_path=args.db,
         poll_interval_seconds=args.poll_interval,
         price_interval_seconds=args.price_interval,
+        use_stream_queue=args.use_stream_queue,
+        stream_queue_interval_seconds=args.stream_queue_interval,
+        stream_batch_limit=args.stream_batch_limit,
+        stream_min_events=args.stream_min_events,
         manual_confirm=args.manual_confirm,
         dry_run=args.dry_run,
         close_on_stop=not args.no_close_on_stop,

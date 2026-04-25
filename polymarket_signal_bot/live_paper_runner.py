@@ -19,6 +19,11 @@ Dry run:
 
     python -m polymarket_signal_bot live-paper --dry-run
 
+Stream queue mode:
+
+    python -m polymarket_signal_bot stream --asset-limit 80 --reconcile-min-notional 100
+    python -m polymarket_signal_bot live-paper --use-stream-queue --dry-run
+
 Confidential values, if a future authenticated API client is added, should come
 from environment variables such as ``POLYMARKET_API_KEY``,
 ``POLYMARKET_API_SECRET`` and ``POLYMARKET_API_PASSPHRASE``. The current runner
@@ -58,6 +63,10 @@ class LivePaperConfig:
     db_path: str = str(DEFAULT_DB_PATH)
     poll_interval_seconds: int = 60
     price_interval_seconds: int = 15
+    use_stream_queue: bool = False
+    stream_queue_interval_seconds: float = 1.0
+    stream_batch_limit: int = 500
+    stream_min_events: int = 1
     manual_confirm: bool = False
     dry_run: bool = False
     close_on_stop: bool = True
@@ -111,6 +120,8 @@ class LivePaperRunner:
         self.client = client or PolymarketClient()
         self._stop = asyncio.Event()
         self._seen_signal_ids: set[str] = set()
+        self._stream_cursor = 0
+        self._last_policy_label = ""
 
     async def run(self) -> None:
         configure_logging(self.config.log_path)
@@ -118,11 +129,20 @@ class LivePaperRunner:
         with Store(self.config.db_path) as store:
             store.init_schema()
             self._seen_signal_ids = {signal.signal_id for signal in store.fetch_recent_signals(limit=500)}
+            self._stream_cursor = _int_runtime(store, "live_paper_stream_cursor", 0)
             store.set_runtime_state("live_paper_status", "starting")
             self._write_state(store)
 
-        LOGGER.info("live paper runner started dry_run=%s manual_confirm=%s", self.config.dry_run, self.config.manual_confirm)
-        signal_task = asyncio.create_task(self._signal_loop(), name="live-paper-signals")
+        LOGGER.info(
+            "live paper runner started dry_run=%s manual_confirm=%s stream_queue=%s",
+            self.config.dry_run,
+            self.config.manual_confirm,
+            self.config.use_stream_queue,
+        )
+        signal_task = asyncio.create_task(
+            self._stream_signal_loop() if self.config.use_stream_queue else self._signal_loop(),
+            name="live-paper-signals",
+        )
         price_task = asyncio.create_task(self._position_loop(), name="live-paper-positions")
         try:
             await self._stop.wait()
@@ -152,14 +172,38 @@ class LivePaperRunner:
                     self._log_portfolio_state(store, "signal_tick_start")
                 signals, summary = await asyncio.to_thread(self.tick, iteration)
                 LOGGER.info("tick=%s %s fresh_signals=%s", iteration, summary, len(signals))
-                for signal_item in signals:
-                    await self._handle_signal(signal_item)
+                await self._handle_signals(signals)
+                with Store(self.config.db_path) as store:
+                    store.init_schema()
+                    self._log_portfolio_state(store, "signal_tick_end")
             except ApiError as exc:
                 LOGGER.warning("api error in signal loop: %s", str(exc)[:300])
             except Exception:
                 LOGGER.exception("unexpected error in signal loop")
             elapsed = time.monotonic() - started
             await _sleep_until_stop(self._stop, max(1.0, self.config.poll_interval_seconds - elapsed))
+
+    async def _stream_signal_loop(self) -> None:
+        iteration = 0
+        while not self._stop.is_set():
+            iteration += 1
+            started = time.monotonic()
+            summary = "stream_events=0 signals=0"
+            try:
+                with Store(self.config.db_path) as store:
+                    store.init_schema()
+                    self._log_portfolio_state(store, "stream_tick_start")
+                signals, summary = await asyncio.to_thread(self.stream_tick)
+                LOGGER.info("stream_tick=%s %s fresh_signals=%s", iteration, summary, len(signals))
+                await self._handle_signals(signals)
+                with Store(self.config.db_path) as store:
+                    store.init_schema()
+                    self._log_portfolio_state(store, "stream_tick_end")
+            except Exception:
+                LOGGER.exception("unexpected error in stream signal loop")
+            elapsed = time.monotonic() - started
+            interval = self.config.stream_queue_interval_seconds if "stream_events=0" in summary else 0.1
+            await _sleep_until_stop(self._stop, max(0.1, interval - elapsed))
 
     async def _position_loop(self) -> None:
         while not self._stop.is_set():
@@ -172,6 +216,7 @@ class LivePaperRunner:
                         if closed:
                             LOGGER.info("closed_positions=%s", len(closed))
                     self._write_state(store)
+                    self._log_portfolio_state(store, "position_tick_end")
             except Exception:
                 LOGGER.exception("unexpected error in position loop")
             await _sleep_until_stop(self._stop, max(1, self.config.price_interval_seconds))
@@ -205,6 +250,36 @@ class LivePaperRunner:
             fresh = [signal for signal in signals if signal.signal_id not in self._seen_signal_ids]
             self._seen_signal_ids.update(signal.signal_id for signal in signals)
             summary = f"wallets={wallets_added} trades={trades_added} books={books_synced} signals={created}"
+            return fresh, summary
+
+    def stream_tick(self) -> tuple[list[Signal], str]:
+        """Consume new WebSocket events from the SQLite stream queue."""
+
+        with Store(self.config.db_path) as store:
+            store.init_schema()
+            events = store.fetch_stream_events_after_rowid(self._stream_cursor, limit=self.config.stream_batch_limit)
+            if not events:
+                store.set_runtime_state("live_paper_status", "waiting_stream")
+                self._write_state(store)
+                return [], "stream_events=0 signals=0"
+            self._stream_cursor = max(int(event["queue_id"] or 0) for event in events)
+            store.set_runtime_state("live_paper_stream_cursor", str(self._stream_cursor))
+            if len(events) < max(1, self.config.stream_min_events):
+                summary = f"stream_events={len(events)} below_min={self.config.stream_min_events} signals=0"
+                store.set_runtime_state("live_paper_last_summary", summary)
+                self._write_state(store)
+                return [], summary
+            signals = self._generate_signals(store)
+            created = store.insert_signals(signals)
+            PaperBroker(store, self._risk_config(), self._exit_config()).record_signal_created(signals)
+            store.set_runtime_state("live_paper_status", "running_stream")
+            store.set_runtime_state("live_paper_last_seen", str(int(time.time())))
+            policy = self._policy_label(store)
+            summary = f"stream_events={len(events)} cursor={self._stream_cursor} signals={created} policy={policy}"
+            store.set_runtime_state("live_paper_last_summary", summary)
+            self._write_state(store)
+            fresh = [signal for signal in signals if signal.signal_id not in self._seen_signal_ids]
+            self._seen_signal_ids.update(signal.signal_id for signal in signals)
             return fresh, summary
 
     def _generate_signals(self, store: Store) -> list[Signal]:
@@ -276,6 +351,10 @@ class LivePaperRunner:
             wallet_cohorts=wallet_cohorts,
             wallet_outcomes=wallet_outcomes,
         )
+
+    async def _handle_signals(self, signals: list[Signal]) -> None:
+        for signal_item in signals:
+            await self._handle_signal(signal_item)
 
     async def _handle_signal(self, signal_item: Signal) -> None:
         if not _is_active_signal(signal_item):
@@ -420,13 +499,22 @@ class LivePaperRunner:
     def _log_portfolio_state(self, store: Store, label: str) -> None:
         summary = _portfolio_snapshot(store, self.config.bankroll)
         LOGGER.info(
-            "%s balance=%.2f realized_pnl=%.2f unrealized_pnl=%.2f open_positions=%s",
+            (
+                "%s balance=%.2f total_pnl=%.2f realized_pnl=%.2f unrealized_pnl=%.2f "
+                "open_positions=%s trades=%s closed=%s win_rate=%.1f%% policy=%s"
+            ),
             label,
             summary["balance"],
+            summary["total_pnl"],
             summary["realized_pnl"],
             summary["unrealized_pnl"],
             summary["open_positions"],
+            summary["trade_count"],
+            summary["closed_trades"],
+            summary["win_rate"] * 100,
+            self._policy_label(store),
         )
+        store.set_runtime_state("live_paper_metrics", _metrics_summary(summary))
 
     def _write_state(self, store: Store) -> None:
         path = Path(self.config.state_path)
@@ -437,6 +525,9 @@ class LivePaperRunner:
             "dbPath": str(store.path),
             "dryRun": self.config.dry_run,
             "manualConfirm": self.config.manual_confirm,
+            "useStreamQueue": self.config.use_stream_queue,
+            "streamCursor": self._stream_cursor,
+            "activePolicy": self._policy_label(store),
             "summary": summary,
             "openPositions": [_position_payload(position, store) for position in store.fetch_open_positions()],
         }
@@ -444,12 +535,26 @@ class LivePaperRunner:
 
     def _active_signal_policy(self, store: Store) -> tuple[bool, str]:
         if not self.config.use_cohort_policy:
-            return False, "baseline"
+            enabled, mode = False, "baseline"
+            label = f"enabled={int(enabled)} mode={mode}"
+            store.set_runtime_state("live_paper_policy_active", label)
+            return enabled, mode
         runtime = store.runtime_state()
         recommended = runtime.get("policy_optimizer_recommended")
         if not recommended:
-            return True, "strict"
-        return policy_settings_from_recommendation(str(recommended.get("value") or ""), default_enabled=True)
+            enabled, mode = True, "strict"
+        else:
+            enabled, mode = policy_settings_from_recommendation(str(recommended.get("value") or ""), default_enabled=True)
+        label = f"enabled={int(enabled)} mode={mode}"
+        if label != self._last_policy_label:
+            LOGGER.info("policy_optimizer_reload %s", label)
+            self._last_policy_label = label
+        store.set_runtime_state("live_paper_policy_active", label)
+        return enabled, mode
+
+    def _policy_label(self, store: Store) -> str:
+        enabled, mode = self._active_signal_policy(store)
+        return f"enabled={int(enabled)} mode={mode}"
 
     def _monitor_config(self) -> MonitorConfig:
         return MonitorConfig(
@@ -532,6 +637,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--db", default=os.environ.get("POLYSIGNAL_DB", str(DEFAULT_DB_PATH)))
     parser.add_argument("--poll-interval", type=int, default=int(os.environ.get("POLYSIGNAL_POLL_INTERVAL", "60")))
     parser.add_argument("--price-interval", type=int, default=int(os.environ.get("POLYSIGNAL_PRICE_INTERVAL", "15")))
+    parser.add_argument("--use-stream-queue", action="store_true")
+    parser.add_argument("--stream-queue-interval", type=float, default=1.0)
+    parser.add_argument("--stream-batch-limit", type=int, default=500)
+    parser.add_argument("--stream-min-events", type=int, default=1)
     parser.add_argument("--manual-confirm", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--no-close-on-stop", action="store_true")
@@ -562,6 +671,10 @@ def config_from_args(args: argparse.Namespace) -> LivePaperConfig:
         db_path=args.db,
         poll_interval_seconds=args.poll_interval,
         price_interval_seconds=args.price_interval,
+        use_stream_queue=args.use_stream_queue,
+        stream_queue_interval_seconds=args.stream_queue_interval,
+        stream_batch_limit=args.stream_batch_limit,
+        stream_min_events=args.stream_min_events,
         manual_confirm=args.manual_confirm,
         dry_run=args.dry_run,
         close_on_stop=not args.no_close_on_stop,
@@ -657,6 +770,14 @@ def _event_id(*parts: object) -> str:
     return hashlib.sha256("|".join(str(part) for part in parts).encode("utf-8")).hexdigest()[:32]
 
 
+def _int_runtime(store: Store, key: str, default: int = 0) -> int:
+    value = store.runtime_state().get(key, {}).get("value", default)
+    try:
+        return int(value or default)
+    except (TypeError, ValueError):
+        return default
+
+
 def _portfolio_snapshot(store: Store, bankroll: float) -> dict[str, Any]:
     paper_summary = store.paper_summary()
     unrealized = 0.0
@@ -664,16 +785,45 @@ def _portfolio_snapshot(store: Store, bankroll: float) -> dict[str, Any]:
         mark = store.latest_trade_mark(position.asset)
         price = float(mark["price"]) if mark else position.entry_price
         unrealized += position.shares * price - position.size_usdc
+    closed = store.conn.execute(
+        """
+        SELECT
+            COUNT(*) AS closed_trades,
+            COALESCE(SUM(CASE WHEN realized_pnl > 0 THEN 1 ELSE 0 END), 0) AS winning_trades,
+            COALESCE(SUM(CASE WHEN realized_pnl < 0 THEN 1 ELSE 0 END), 0) AS losing_trades
+        FROM paper_positions
+        WHERE status = 'CLOSED'
+        """
+    ).fetchone()
+    closed_trades = int(closed["closed_trades"] or 0)
+    winning_trades = int(closed["winning_trades"] or 0)
+    losing_trades = int(closed["losing_trades"] or 0)
+    realized_pnl = float(paper_summary["realized_pnl"])
+    total_pnl = realized_pnl + unrealized
     balance = bankroll + float(paper_summary["realized_pnl"]) + unrealized
     return {
         "seed": round(bankroll, 2),
         "balance": round(balance, 2),
-        "realized_pnl": round(float(paper_summary["realized_pnl"]), 4),
+        "total_pnl": round(total_pnl, 4),
+        "realized_pnl": round(realized_pnl, 4),
         "unrealized_pnl": round(unrealized, 4),
         "open_positions": int(paper_summary["open_positions"]),
         "open_cost": round(float(paper_summary["open_cost"]), 2),
         "total_positions": int(paper_summary["total_positions"]),
+        "trade_count": int(paper_summary["total_positions"]),
+        "closed_trades": closed_trades,
+        "winning_trades": winning_trades,
+        "losing_trades": losing_trades,
+        "win_rate": round(winning_trades / closed_trades, 4) if closed_trades else 0.0,
     }
+
+
+def _metrics_summary(summary: dict[str, Any]) -> str:
+    return (
+        f"total_pnl=${float(summary['total_pnl']):.2f} "
+        f"trades={int(summary['trade_count'])} closed={int(summary['closed_trades'])} "
+        f"win_rate={float(summary['win_rate']):.1%} open={int(summary['open_positions'])}"
+    )
 
 
 def _position_payload(position: PaperPosition, store: Store) -> dict[str, Any]:

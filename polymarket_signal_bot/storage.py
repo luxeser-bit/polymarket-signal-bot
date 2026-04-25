@@ -1364,6 +1364,19 @@ class Store:
             "by_type": [dict(row) for row in by_type],
         }
 
+    def fetch_stream_events_after_rowid(self, rowid: int, *, limit: int = 500) -> list[dict[str, object]]:
+        rows = self.conn.execute(
+            """
+            SELECT rowid AS queue_id, *
+            FROM stream_events
+            WHERE rowid > ?
+            ORDER BY rowid ASC
+            LIMIT ?
+            """,
+            (max(0, rowid), max(1, limit)),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
     def fetch_recent_paper_events(
         self,
         limit: int = 20,

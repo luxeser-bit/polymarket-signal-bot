@@ -111,6 +111,18 @@ Manual confirmation:
 python -m polymarket_signal_bot live-paper --manual-confirm --poll-interval 60 --price-interval 15
 ```
 
+Stream queue mode, when `stream` is running in another process:
+
+```powershell
+python -m polymarket_signal_bot stream --asset-limit 80 --reconcile-min-notional 100
+python -m polymarket_signal_bot live-paper --use-stream-queue --stream-queue-interval 1 --dry-run
+```
+
+In stream queue mode the runner does not poll wallet/API activity on every
+signal tick. It consumes new rows from `stream_events`, uses the reconciled
+trades and updated books already written by `stream`, and then runs the same
+paper-only signal/open/exit path.
+
 Useful environment variables:
 
 ```powershell
@@ -124,6 +136,12 @@ $env:POLYMARKET_API_PASSPHRASE=""
 
 The current client uses public data only. The private API variables are reserved
 for any future authenticated integration and should never be written into code.
+
+Every live-paper cycle logs balance, total PnL, realized/unrealized PnL, total
+paper trades, closed trades, win rate, open positions, and the currently active
+cohort policy. The policy is reloaded from `policy_optimizer_recommended` on
+each signal cycle, so `policy-optimizer` can change paper behavior without
+restarting the runner.
 
 ## Bulk ingestion
 
@@ -314,6 +332,7 @@ Done:
   and risk-trim exits that gradually unload an over-limit paper portfolio.
 - Live paper runner v1: `live-paper` runs async signal polling and price
   monitoring, supports manual confirmation, dry-run mode, JSON state snapshots,
+  live metrics, stream-queue consumption, dynamic optimizer-policy reload,
   logging, and graceful `manual_stop` shutdown closes.
 - Paper decision journal v1: `paper_events` logs signal/open/block/close
   decisions and is exported into DuckDB for the three-level learning loop.

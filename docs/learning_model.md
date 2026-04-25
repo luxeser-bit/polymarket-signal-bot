@@ -122,6 +122,12 @@ through the Data API so wallet-attributed trades can feed paper scans faster
 than the periodic monitor loop. Public market stream events do not include whale
 wallet addresses directly, so wallet attribution remains a reconciliation step.
 
+Current implementation: `live-paper --use-stream-queue` consumes new
+`stream_events` rows as a durable queue instead of polling wallet activity on
+each signal tick. The live paper runner also reloads
+`policy_optimizer_recommended` on every signal cycle and logs total PnL, trade
+count, closed trade count, win rate, open positions, and active policy.
+
 ### Paper Decisions
 
 The system must log its own behavior, not only public market behavior:
