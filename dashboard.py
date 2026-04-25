@@ -49,6 +49,7 @@ def main() -> None:
     _render_terminal_actions(main_db, state_db)
     state = _terminal_state(main_db, state_db)
     _render_terminal_shell(state)
+    _render_equity_chart(state_db)
 
     if _paper_process_running():
         time.sleep(2)
@@ -89,7 +90,7 @@ def _render_terminal_header(state: dict[str, Any]) -> None:
 
 
 def _render_terminal_actions(main_db: Path, state_db: Path) -> None:
-    cols = st.columns([1, 1, 1, 5])
+    cols = st.columns([1, 1, 1.15, 1.15, 4])
     with cols[0]:
         if st.button("DEMO", width="stretch"):
             try:
@@ -111,18 +112,28 @@ def _render_terminal_actions(main_db: Path, state_db: Path) -> None:
             except Exception as exc:  # noqa: BLE001 - show action errors.
                 st.error(f"Scan failed: {exc}")
     with cols[2]:
+        st.session_state.paper_dry_run = st.checkbox(
+            "Dry-run mode",
+            value=bool(st.session_state.get("paper_dry_run", True)),
+            key="paper_dry_run_checkbox",
+        )
+    with cols[3]:
         label = "STOP PAPER" if _paper_process_running() else "START PAPER"
         if st.button(label, width="stretch", type="primary"):
             if _paper_process_running():
                 _stop_paper_process()
             else:
                 try:
-                    _start_paper_process(main_db=main_db, state_db=state_db)
+                    _start_paper_process(
+                        main_db=main_db,
+                        state_db=state_db,
+                        dry_run=bool(st.session_state.get("paper_dry_run", True)),
+                    )
                 except Exception as exc:  # noqa: BLE001 - show action errors.
                     st.error(f"Paper trading failed to start: {exc}")
                     return
             st.rerun()
-    with cols[3]:
+    with cols[4]:
         st.markdown(
             "<div class='action-note'>Demo / Overview, Scan and Paper Trade are sections on this same terminal screen.</div>",
             unsafe_allow_html=True,
@@ -169,6 +180,18 @@ def _render_terminal_shell(state: dict[str, Any]) -> None:
     </div>
     """
     st.markdown(html_payload, unsafe_allow_html=True)
+
+
+def _render_equity_chart(state_db: Path) -> None:
+    st.markdown("<div class='equity-title'>OVERVIEW // EQUITY CURVE</div>", unsafe_allow_html=True)
+    history = _balance_history(state_db, limit=500)
+    if history.empty:
+        st.info("Нет данных для графика")
+        return
+    chart = history[["timestamp", "balance"]].copy()
+    chart["time"] = pd.to_datetime(chart["timestamp"], unit="s")
+    chart = chart.set_index("time")[["balance"]]
+    st.line_chart(chart, height=220)
 
 
 def _terminal_state(main_db: Path, state_db: Path) -> dict[str, Any]:
@@ -443,7 +466,7 @@ def _run_manual_scan(db_path: Path) -> dict[str, int]:
     return {"signals": signals, "opened": opened, "closed": closed}
 
 
-def _start_paper_process(*, main_db: Path, state_db: Path) -> None:
+def _start_paper_process(*, main_db: Path, state_db: Path, dry_run: bool) -> None:
     runner_path = ROOT / "polymarket_signal_bot" / "live_paper_runner.py"
     if not runner_path.exists():
         raise FileNotFoundError(f"live_paper_runner.py not found: {runner_path}")
@@ -461,8 +484,9 @@ def _start_paper_process(*, main_db: Path, state_db: Path) -> None:
         "60",
         "--price-interval",
         "15",
-        "--dry-run",
     ]
+    if dry_run:
+        command.append("--dry-run")
     env = os.environ.copy()
     env.setdefault("PYTHONUTF8", "1")
     process = subprocess.Popen(
@@ -573,13 +597,29 @@ def _read_sql_df(db_path: Path, query: str, params: tuple[Any, ...] = ()) -> Any
         raise RuntimeError("pandas is required. Install: python -m pip install -r requirements-streamlit.txt")
     if not db_path.exists():
         return pd.DataFrame()
-    uri = f"{db_path.resolve().as_uri()}?mode=ro"
+    conn: sqlite3.Connection | None = None
     try:
-        with sqlite3.connect(uri, uri=True) as conn:
-            conn.row_factory = sqlite3.Row
-            return pd.read_sql_query(query, conn, params=params)
+        if _is_state_db(db_path):
+            conn = sqlite3.connect(db_path, timeout=30)
+            conn.execute("PRAGMA journal_mode=WAL;")
+            conn.execute("PRAGMA busy_timeout=30000;")
+        else:
+            uri = f"{db_path.resolve().as_uri()}?mode=ro"
+            conn = sqlite3.connect(uri, uri=True, timeout=30)
+        conn.row_factory = sqlite3.Row
+        return pd.read_sql_query(query, conn, params=params)
     except Exception:  # noqa: BLE001 - missing DB/tables should not break the dashboard.
         return pd.DataFrame()
+    finally:
+        if conn is not None:
+            conn.close()
+
+
+def _is_state_db(db_path: Path) -> bool:
+    try:
+        return db_path.resolve() == DEFAULT_STATE_DB.resolve()
+    except OSError:
+        return db_path.name == DEFAULT_STATE_DB.name
 
 
 def _uptime_label() -> str:
@@ -594,6 +634,7 @@ def _init_session_state() -> None:
     st.session_state.setdefault("paper_pid", None)
     st.session_state.setdefault("paper_started_at", None)
     st.session_state.setdefault("paper_command", "")
+    st.session_state.setdefault("paper_dry_run", True)
 
 
 def _require_dashboard_dependencies() -> None:
@@ -650,6 +691,9 @@ def _inject_style() -> None:
         }
         div[data-testid="stButton"] button:hover {background:#0a2b34; color:var(--hot); border:1px solid var(--line); box-shadow:0 0 14px rgba(53,230,242,.2);}
         .action-note {height:38px; display:flex; align-items:center; color:var(--muted); border:1px solid var(--line-soft); background:rgba(3,13,17,.88); padding:0 10px;}
+        .stCheckbox {height:38px; display:flex; align-items:center; border:1px solid var(--line-soft); background:rgba(3,13,17,.88); padding:0 10px;}
+        .stCheckbox label, .stCheckbox span {color:var(--hot) !important; font-family:"Cascadia Mono",Consolas,"Courier New",monospace; font-weight:800;}
+        .equity-title {margin-top:10px; height:28px; padding:7px 10px 6px; border:1px solid var(--line-soft); background:rgba(3,13,17,.88); color:var(--hot); font-size:12px; font-weight:800;}
         .metrics {display:grid; grid-template-columns:repeat(10,minmax(90px,1fr)); margin-top:10px; border:1px solid var(--line-soft);}
         .metric {min-height:72px; padding:13px 12px; border-right:1px solid var(--line-soft); background:rgba(4,17,22,.88);}
         .metric:last-child {border-right:0;}
