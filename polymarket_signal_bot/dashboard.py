@@ -13,6 +13,7 @@ from .analytics import DEFAULT_DUCKDB_PATH
 from .bulk_sync import TARGET_TRADES, TARGET_WALLETS
 from .cohorts import CohortConfig, wallet_cohort_report
 from .demo import demo_trades, demo_wallets
+from .features import format_feature_summary
 from .learning import format_wallet_outcome_summary, wallet_outcome_lookup, wallet_outcome_report
 from .paper import PaperBroker
 from .policy_optimizer import policy_settings_from_recommendation
@@ -127,6 +128,7 @@ def build_dashboard_state(store: Store, *, bankroll: float = DEFAULT_BANKROLL) -
     reviews = store.fetch_review_queue("PENDING", limit=8)
     cohort_report = wallet_cohort_report(store, CohortConfig(history_days=30, min_trades=2, min_notional=100, limit=12))
     learning_report = wallet_outcome_report(store, since_days=90, min_events=1, limit=8)
+    feature_summary = store.decision_feature_summary()
     marked_positions = [_position_payload(store, position, books) for position in open_positions]
     unrealized = sum(item["unrealizedPnl"] for item in marked_positions)
     current_bankroll = bankroll + summary["realized_pnl"] + unrealized
@@ -159,6 +161,7 @@ def build_dashboard_state(store: Store, *, bankroll: float = DEFAULT_BANKROLL) -
             "exitReasons": _runtime_value(runtime, "exit_last_reasons", ""),
             "journalSummary": _journal_summary_label(journal_summary),
             "learningSummary": format_wallet_outcome_summary(learning_report),
+            "featuresSummary": format_feature_summary(feature_summary),
             "bookHistorySummary": _book_history_label(book_history),
         },
         "stats": {
@@ -168,6 +171,7 @@ def build_dashboard_state(store: Store, *, bankroll: float = DEFAULT_BANKROLL) -
             "trades": int(stats["trades"]),
             "signals": int(stats["signals"]),
             "paperEvents": int(journal_summary["total_events"]),
+            "decisionFeatures": int(feature_summary["features"]),
             "winRate": _estimated_win_rate(marked_positions, summary),
             "openPositions": int(summary["open_positions"]),
             "openCost": round(summary["open_cost"], 2),

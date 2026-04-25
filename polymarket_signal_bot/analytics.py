@@ -22,6 +22,7 @@ EXPORT_TABLES = [
     "signals",
     "paper_positions",
     "paper_events",
+    "decision_features",
     "order_books_latest",
     "order_books_history",
     "signal_reviews",
@@ -211,6 +212,17 @@ def analytics_report(duckdb_path: str | Path = DEFAULT_DUCKDB_PATH, *, limit: in
                        pnl, hit_rate, blocked_rate, learning_score
                 FROM v_wallet_outcome
                 ORDER BY learning_score DESC, pnl DESC, events DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ),
+            "decision_features": _fetch_all(
+                conn,
+                """
+                SELECT label, category, rows, pnl, avg_confidence, avg_learning_score,
+                       avg_liquidity_score
+                FROM v_decision_feature_summary
+                ORDER BY rows DESC, pnl DESC, label ASC
                 LIMIT ?
                 """,
                 (limit,),
@@ -571,6 +583,22 @@ def _create_views(conn: Any) -> None:
                 ))
             END AS learning_score
         FROM grouped
+        """
+    )
+    conn.execute(
+        """
+        CREATE OR REPLACE VIEW v_decision_feature_summary AS
+        SELECT
+            label,
+            category,
+            COUNT(*) AS rows,
+            COALESCE(SUM(label_pnl), 0) AS pnl,
+            COALESCE(AVG(signal_confidence), 0) AS avg_confidence,
+            COALESCE(AVG(learning_score), 0) AS avg_learning_score,
+            COALESCE(AVG(liquidity_score), 0) AS avg_liquidity_score,
+            COALESCE(AVG(book_age_seconds), 0) AS avg_book_age_seconds
+        FROM decision_features
+        GROUP BY label, category
         """
     )
     conn.execute(

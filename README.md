@@ -53,6 +53,7 @@ python -m polymarket_signal_bot cohort-report --history-days 30 --min-trades 2 -
 python -m polymarket_signal_bot wallet-learning --since-days 90 --limit 20
 python -m polymarket_signal_bot report
 python -m polymarket_signal_bot paper-journal --since-days 30 --limit 20
+python -m polymarket_signal_bot features-build
 python -m polymarket_signal_bot reviews --status PENDING
 ```
 
@@ -136,7 +137,8 @@ python -m polymarket_signal_bot analytics-report --duckdb data/polysignal.duckdb
 ```
 
 The export creates aggregate views for wallet flow, market flow, category flow,
-daily flow, wallet cohort stability, and latest liquidity.
+daily flow, wallet cohort stability, latest liquidity, wallet outcomes, and
+decision features.
 
 `bulk-sync` can refresh the snapshot automatically:
 
@@ -249,6 +251,9 @@ Done:
 - Learning-adjusted signals v1: `scan`, dashboard scan, and monitor feed
   wallet/category paper outcomes back into signal confidence, position size, and
   auto-open gating.
+- Decision feature table v1: `features-build` converts paper decisions into
+  ML-ready rows with signal, cohort, liquidity, learning-adjustment, and outcome
+  labels, then exports them into DuckDB.
 
 Partial:
 
@@ -263,8 +268,6 @@ Partial:
 
 Next:
 
-- Build a feature table for future ML labels using signal, liquidity, cohort,
-  learning-adjustment, and paper-outcome fields.
 - Accumulate deeper multi-day market-flow history before trusting cohort-policy
   backtest deltas.
 - Add an approval inbox action in the dashboard instead of CLI-only approval.

@@ -142,6 +142,12 @@ paper position size. Pairs with enough weak/risky paper history can set
 `learning_auto_open=0`, which keeps the signal in manual-review/paper-only flow
 instead of automatically opening.
 
+Current implementation: `features-build` creates the `decision_features` table.
+Each row joins a paper decision with the original signal, cohort/risk state,
+historical order-book liquidity, learning adjustment fields, and a label such as
+`created`, `opened`, `blocked`, `win`, `loss`, or `flat`. This is the dataset
+that future ML classifiers should train on after enough paper decisions exist.
+
 This decision journal is the bridge from rule-based paper trading to adaptive
 learning.
 

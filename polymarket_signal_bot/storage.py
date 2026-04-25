@@ -162,6 +162,59 @@ class Store:
             CREATE INDEX IF NOT EXISTS idx_paper_events_asset
                 ON paper_events(asset, event_at DESC);
 
+            CREATE TABLE IF NOT EXISTS decision_features (
+                feature_id TEXT PRIMARY KEY,
+                built_at INTEGER NOT NULL,
+                event_id TEXT NOT NULL,
+                event_at INTEGER NOT NULL,
+                event_type TEXT NOT NULL,
+                signal_id TEXT NOT NULL DEFAULT '',
+                position_id TEXT NOT NULL DEFAULT '',
+                wallet TEXT NOT NULL DEFAULT '',
+                asset TEXT NOT NULL DEFAULT '',
+                condition_id TEXT NOT NULL DEFAULT '',
+                category TEXT NOT NULL DEFAULT 'other',
+                outcome TEXT NOT NULL DEFAULT '',
+                title TEXT NOT NULL DEFAULT '',
+                policy_mode TEXT NOT NULL DEFAULT '',
+                cohort_status TEXT NOT NULL DEFAULT '',
+                risk_status TEXT NOT NULL DEFAULT '',
+                reason TEXT NOT NULL DEFAULT '',
+                wallet_score REAL NOT NULL DEFAULT 0,
+                signal_confidence REAL NOT NULL DEFAULT 0,
+                signal_size_usdc REAL NOT NULL DEFAULT 0,
+                event_price REAL NOT NULL DEFAULT 0,
+                observed_price REAL NOT NULL DEFAULT 0,
+                suggested_price REAL NOT NULL DEFAULT 0,
+                stop_loss REAL NOT NULL DEFAULT 0,
+                take_profit REAL NOT NULL DEFAULT 0,
+                learning_score REAL NOT NULL DEFAULT 0.5,
+                learning_events INTEGER NOT NULL DEFAULT 0,
+                learning_delta REAL NOT NULL DEFAULT 0,
+                learning_size_mult REAL NOT NULL DEFAULT 1,
+                learning_auto_open INTEGER NOT NULL DEFAULT 1,
+                spread REAL NOT NULL DEFAULT 1,
+                liquidity_score REAL NOT NULL DEFAULT 0,
+                bid_depth_usdc REAL NOT NULL DEFAULT 0,
+                ask_depth_usdc REAL NOT NULL DEFAULT 0,
+                book_age_seconds INTEGER NOT NULL DEFAULT 0,
+                label TEXT NOT NULL DEFAULT '',
+                label_pnl REAL NOT NULL DEFAULT 0,
+                label_win INTEGER NOT NULL DEFAULT 0,
+                close_reason TEXT NOT NULL DEFAULT '',
+                blocked_reason TEXT NOT NULL DEFAULT '',
+                hold_seconds INTEGER NOT NULL DEFAULT 0,
+                metadata_json TEXT NOT NULL DEFAULT ''
+            );
+            CREATE INDEX IF NOT EXISTS idx_decision_features_event_at
+                ON decision_features(event_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_decision_features_wallet
+                ON decision_features(wallet, event_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_decision_features_asset
+                ON decision_features(asset, event_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_decision_features_label
+                ON decision_features(label, category);
+
             CREATE TABLE IF NOT EXISTS runtime_state (
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL,
@@ -1124,6 +1177,101 @@ class Store:
             count += cursor.rowcount
         self.conn.commit()
         return count
+
+    def replace_decision_features(self, rows: Iterable[dict[str, object]]) -> int:
+        values = list(rows)
+        self.conn.execute("DELETE FROM decision_features")
+        if not values:
+            self.conn.commit()
+            return 0
+        columns = [
+            "feature_id",
+            "built_at",
+            "event_id",
+            "event_at",
+            "event_type",
+            "signal_id",
+            "position_id",
+            "wallet",
+            "asset",
+            "condition_id",
+            "category",
+            "outcome",
+            "title",
+            "policy_mode",
+            "cohort_status",
+            "risk_status",
+            "reason",
+            "wallet_score",
+            "signal_confidence",
+            "signal_size_usdc",
+            "event_price",
+            "observed_price",
+            "suggested_price",
+            "stop_loss",
+            "take_profit",
+            "learning_score",
+            "learning_events",
+            "learning_delta",
+            "learning_size_mult",
+            "learning_auto_open",
+            "spread",
+            "liquidity_score",
+            "bid_depth_usdc",
+            "ask_depth_usdc",
+            "book_age_seconds",
+            "label",
+            "label_pnl",
+            "label_win",
+            "close_reason",
+            "blocked_reason",
+            "hold_seconds",
+            "metadata_json",
+        ]
+        placeholders = ", ".join("?" for _ in columns)
+        self.conn.executemany(
+            f"""
+            INSERT INTO decision_features({", ".join(columns)})
+            VALUES ({placeholders})
+            """,
+            [tuple(row.get(column) for column in columns) for row in values],
+        )
+        self.conn.commit()
+        return len(values)
+
+    def decision_feature_summary(self) -> dict[str, object]:
+        total = self.conn.execute(
+            """
+            SELECT
+                COUNT(*) AS features,
+                COALESCE(MIN(event_at), 0) AS first_event_at,
+                COALESCE(MAX(event_at), 0) AS last_event_at,
+                COALESCE(AVG(signal_confidence), 0) AS avg_confidence,
+                COALESCE(AVG(learning_score), 0) AS avg_learning_score,
+                COALESCE(AVG(liquidity_score), 0) AS avg_liquidity_score,
+                COALESCE(SUM(label_pnl), 0) AS label_pnl
+            FROM decision_features
+            """
+        ).fetchone()
+        labels = self.conn.execute(
+            """
+            SELECT label, category, COUNT(*) AS rows, COALESCE(SUM(label_pnl), 0) AS pnl
+            FROM decision_features
+            GROUP BY label, category
+            ORDER BY rows DESC, pnl DESC, label ASC
+            LIMIT 20
+            """
+        ).fetchall()
+        return {
+            "features": int(total["features"] or 0),
+            "first_event_at": int(total["first_event_at"] or 0),
+            "last_event_at": int(total["last_event_at"] or 0),
+            "avg_confidence": float(total["avg_confidence"] or 0.0),
+            "avg_learning_score": float(total["avg_learning_score"] or 0.0),
+            "avg_liquidity_score": float(total["avg_liquidity_score"] or 0.0),
+            "label_pnl": float(total["label_pnl"] or 0.0),
+            "labels": [dict(row) for row in labels],
+        }
 
     def fetch_recent_paper_events(
         self,

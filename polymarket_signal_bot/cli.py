@@ -25,6 +25,7 @@ from .bulk_sync import BulkSync, BulkSyncConfig
 from .cohorts import CohortConfig, format_cohort_summary, wallet_cohort_report
 from .dashboard import serve_dashboard
 from .demo import demo_trades, demo_wallets
+from .features import build_decision_features, format_feature_summary
 from .learning import format_wallet_outcome_summary, wallet_outcome_lookup, wallet_outcome_report
 from .market_flow import MarketFlowConfig, format_market_flow_summary, sync_market_flow
 from .monitor import Monitor, MonitorConfig
@@ -192,6 +193,11 @@ def build_parser() -> argparse.ArgumentParser:
     wallet_learning.add_argument("--min-events", type=int, default=1)
     wallet_learning.add_argument("--limit", type=int, default=20)
     wallet_learning.set_defaults(func=cmd_wallet_learning)
+
+    features_build = sub.add_parser("features-build", help="Build ML-ready feature rows from paper decisions.")
+    features_build.add_argument("--since-days", type=int, default=None)
+    features_build.add_argument("--limit", type=int, default=None)
+    features_build.set_defaults(func=cmd_features_build)
 
     analytics_export = sub.add_parser("analytics-export", help="Export SQLite data into a DuckDB analytics snapshot.")
     analytics_export.add_argument("--duckdb", default=str(DEFAULT_DUCKDB_PATH))
@@ -835,6 +841,22 @@ def cmd_wallet_learning(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_features_build(args: argparse.Namespace) -> int:
+    with open_store(args.db) as store:
+        store.init_schema()
+        result = build_decision_features(store, since_days=args.since_days, limit=args.limit)
+    summary = result["summary"]
+    print(f"Decision features built: {result['inserted']}")
+    print(f"Summary: {format_feature_summary(summary)}")
+    print("Labels")
+    for row in summary["labels"][:10]:
+        print(
+            f"  {str(row['label']):<8} {str(row['category']):<9} "
+            f"rows={row['rows']} pnl={money(row['pnl'])}"
+        )
+    return 0
+
+
 def cmd_analytics_export(args: argparse.Namespace) -> int:
     try:
         with Store(args.db) as store:
@@ -911,6 +933,13 @@ def cmd_analytics_report(args: argparse.Namespace) -> int:
             f"  {row['learning_score']:.3f} {str(row['category']).upper():<8} "
             f"{short_wallet(row['wallet'])} events={row['events']} closed={row['closed']} "
             f"pnl={money(row['pnl'])} hit={row['hit_rate']:.0%} blocked={row['blocked_rate']:.0%}"
+        )
+    print("\nDecision features")
+    for row in report["decision_features"]:
+        print(
+            f"  {str(row['label']):<8} {str(row['category']):<9} rows={row['rows']} "
+            f"pnl={money(row['pnl'])} conf={row['avg_confidence']:.3f} "
+            f"learn={row['avg_learning_score']:.3f} liq={row['avg_liquidity_score']:.3f}"
         )
     print("\nOrder-book history")
     for row in report["book_history"]:
