@@ -11,7 +11,14 @@ dependencies = []
 [project.optional-dependencies]
 analytics = ["duckdb>=1.0"]
 stream = ["websockets>=12.0"]
-all = ["duckdb>=1.0", "websockets>=12.0"]
+indexer = ["httpx>=0.27", "eth-hash[pycryptodome]>=0.7", "clickhouse-driver>=0.2"]
+all = [
+    "duckdb>=1.0",
+    "websockets>=12.0",
+    "httpx>=0.27",
+    "eth-hash[pycryptodome]>=0.7",
+    "clickhouse-driver>=0.2",
+]
 
 [project.scripts]
 polysignal = "polymarket_signal_bot.cli:main"

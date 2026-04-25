@@ -224,6 +224,25 @@ python -m polymarket_signal_bot analytics-export --duckdb data/polysignal.duckdb
 python -m polymarket_signal_bot analytics-report --duckdb data/polysignal.duckdb
 ```
 
+## Polygon indexer
+
+For the 86M+ trade target, the direct-chain indexer reads Polygon logs from the
+Polymarket ConditionalTokens and CLOB exchange contracts into
+`raw_transactions`. It resumes from `indexer_state` and uses SQLite WAL so the
+dashboard and analytics can read while ingestion writes.
+
+```powershell
+python -m pip install ".[indexer]"
+$env:POLYGON_RPC_URL="https://polygon-mainnet.g.alchemy.com/v2/YOUR_KEY"
+
+python -m src.indexer --start-block 50000000 --end-block 50001000 --dry-run
+python -m src.indexer --sync --batch-size 2000 --max-workers 8
+```
+
+Without explicit blocks, the indexer continues from the last saved block to the
+current Polygon head. `--dry-run` prints decoded events and does not write to the
+database.
+
 The export creates aggregate views for wallet flow, market flow, category flow,
 daily flow, wallet cohort stability, latest liquidity, wallet outcomes, and
 decision features.
