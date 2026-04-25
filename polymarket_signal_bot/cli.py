@@ -36,7 +36,7 @@ from .policy_optimizer import OptimizerConfig, policy_settings_from_recommendati
 from .scoring import score_wallets
 from .signals import SignalConfig, generate_signals
 from .storage import DEFAULT_DB_PATH, Store
-from .streaming import MissingWebsocketError, StreamConfig, StreamProcessor, missing_websocket_message
+from .streaming import MARKET_WS_URL, MissingWebsocketError, StreamConfig, StreamProcessor, missing_websocket_message
 from .taxonomy import market_category, market_category_label
 
 
@@ -253,6 +253,14 @@ def build_parser() -> argparse.ArgumentParser:
     live_paper = sub.add_parser("live-paper", help="Run async live paper signal and position management.")
     live_paper.add_argument("--poll-interval", type=int, default=60)
     live_paper.add_argument("--price-interval", type=int, default=15)
+    live_paper.add_argument("--monitor-standalone", action="store_true", help="Wait for external signals instead of polling monitor data.")
+    live_paper.add_argument("--external-signal-channel", default="polysignal:signals")
+    live_paper.add_argument("--use-websocket", action="store_true", help="Listen to the CLOB WebSocket directly for stream events.")
+    live_paper.add_argument("--websocket-url", default=MARKET_WS_URL)
+    live_paper.add_argument("--websocket-asset", action="append", default=[], help="CLOB token id. Repeat as needed.")
+    live_paper.add_argument("--websocket-asset-limit", type=int, default=40)
+    live_paper.add_argument("--websocket-timeout", type=float, default=30.0)
+    live_paper.add_argument("--websocket-reconnect", type=float, default=5.0)
     live_paper.add_argument("--use-stream-queue", action="store_true", help="Consume stream_events instead of polling APIs for signal ticks.")
     live_paper.add_argument("--stream-queue-interval", type=float, default=1.0)
     live_paper.add_argument("--stream-batch-limit", type=int, default=500)
@@ -260,6 +268,8 @@ def build_parser() -> argparse.ArgumentParser:
     live_paper.add_argument("--manual-confirm", action="store_true")
     live_paper.add_argument("--dry-run", action="store_true")
     live_paper.add_argument("--no-close-on-stop", action="store_true")
+    live_paper.add_argument("--state-db", default="data/paper_state.db")
+    live_paper.add_argument("--export-json-state", action="store_true")
     live_paper.add_argument("--state-path", default="data/live_paper_state.json")
     live_paper.add_argument("--log-path", default="data/live_paper_runner.log")
     live_paper.add_argument("--leaderboard-limit", type=int, default=0)
@@ -1205,6 +1215,14 @@ def cmd_live_paper(args: argparse.Namespace) -> int:
         db_path=args.db,
         poll_interval_seconds=args.poll_interval,
         price_interval_seconds=args.price_interval,
+        monitor_standalone=args.monitor_standalone,
+        external_signal_channel=args.external_signal_channel,
+        use_websocket=args.use_websocket,
+        websocket_url=args.websocket_url,
+        websocket_assets=tuple(args.websocket_asset or ()),
+        websocket_asset_limit=args.websocket_asset_limit,
+        websocket_timeout_seconds=args.websocket_timeout,
+        websocket_reconnect_seconds=args.websocket_reconnect,
         use_stream_queue=args.use_stream_queue,
         stream_queue_interval_seconds=args.stream_queue_interval,
         stream_batch_limit=args.stream_batch_limit,
@@ -1212,6 +1230,8 @@ def cmd_live_paper(args: argparse.Namespace) -> int:
         manual_confirm=args.manual_confirm,
         dry_run=args.dry_run,
         close_on_stop=not args.no_close_on_stop,
+        state_db_path=args.state_db,
+        export_json_state=args.export_json_state,
         state_path=args.state_path,
         log_path=args.log_path,
         leaderboard_limit=args.leaderboard_limit,

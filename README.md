@@ -94,10 +94,10 @@ Use `--telegram-dry-run` to record what would be sent without sending messages.
 ## Live paper runner
 
 `live-paper` is the async runner that combines monitoring with paper position
-management. It polls public APIs for fresh wallet activity and order books,
-generates signals without immediately opening them, optionally asks for manual
-confirmation, opens paper positions through `PaperBroker`, and checks open
-positions on a separate price loop for stop-loss/take-profit exits.
+management. By default it polls public APIs for fresh wallet activity and order
+books, generates signals without immediately opening them, optionally asks for
+manual confirmation, opens paper positions through `PaperBroker`, and checks
+open positions on a separate price loop for stop-loss/take-profit exits.
 
 Dry run:
 
@@ -123,12 +123,35 @@ signal tick. It consumes new rows from `stream_events`, uses the reconciled
 trades and updated books already written by `stream`, and then runs the same
 paper-only signal/open/exit path.
 
+Direct WebSocket mode:
+
+```powershell
+python -m polymarket_signal_bot live-paper --use-websocket --websocket-asset-limit 80 --dry-run
+```
+
+Standalone monitor mode:
+
+```powershell
+python -m polymarket_signal_bot live-paper --monitor-standalone --dry-run
+```
+
+In standalone mode the runner does not call the monitor sync loop. It waits for
+signals from an external source. The current Redis listener is an architecture
+stub with the same `connect()` / `get_signal()` contract and can already be fed
+by an in-process `asyncio.Queue`; real Redis pub/sub can be added behind that
+class later.
+
 Useful environment variables:
 
 ```powershell
 $env:POLYSIGNAL_DB="data/polysignal.db"
 $env:POLYSIGNAL_LOG_FILE="data/live_paper_runner.log"
+$env:POLYSIGNAL_PAPER_STATE_DB="data/paper_state.db"
+$env:POLYSIGNAL_EXPORT_JSON_STATE="0"
 $env:POLYSIGNAL_STATE_FILE="data/live_paper_state.json"
+$env:MONITOR_STANDALONE="0"
+$env:POLYSIGNAL_USE_WEBSOCKET="0"
+$env:POLYSIGNAL_WEBSOCKET_URL="wss://ws-subscriptions-clob.polymarket.com/ws/market"
 $env:POLYMARKET_API_KEY=""
 $env:POLYMARKET_API_SECRET=""
 $env:POLYMARKET_API_PASSPHRASE=""
@@ -142,6 +165,10 @@ paper trades, closed trades, win rate, open positions, and the currently active
 cohort policy. The policy is reloaded from `policy_optimizer_recommended` on
 each signal cycle, so `policy-optimizer` can change paper behavior without
 restarting the runner.
+
+Runner state is persisted in `data/paper_state.db` with `positions` and
+`balance_history` tables. JSON state is now optional debug export via
+`--export-json-state`.
 
 ## Bulk ingestion
 
@@ -331,8 +358,9 @@ Done:
 - Paper exit engine v1: close reasons, max-hold exits, stale-price exits,
   and risk-trim exits that gradually unload an over-limit paper portfolio.
 - Live paper runner v1: `live-paper` runs async signal polling and price
-  monitoring, supports manual confirmation, dry-run mode, JSON state snapshots,
-  live metrics, stream-queue consumption, dynamic optimizer-policy reload,
+  monitoring, supports manual confirmation, dry-run mode, SQLite runner state,
+  optional JSON debug snapshots, live metrics, stream-queue and direct WebSocket
+  sources, standalone external-signal mode, dynamic optimizer-policy reload,
   logging, and graceful `manual_stop` shutdown closes.
 - Paper decision journal v1: `paper_events` logs signal/open/block/close
   decisions and is exported into DuckDB for the three-level learning loop.
@@ -352,8 +380,9 @@ Done:
 
 Partial:
 
-- Market/order-book data: live CLOB depth exists for recent assets; websocket
-  streaming and longer depth history are still missing.
+- Market/order-book data: live CLOB depth exists for recent assets; direct
+  WebSocket and durable stream queue paths are available, while longer depth
+  history still needs to be expanded.
 - Backtest: replay exists with baseline-vs-cohort-policy comparison and
   auto-ranking of cohort-policy regimes; deeper market-flow history is still
   needed before trusting deltas.

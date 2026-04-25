@@ -24,6 +24,17 @@ Stream queue mode:
     python -m polymarket_signal_bot stream --asset-limit 80 --reconcile-min-notional 100
     python -m polymarket_signal_bot live-paper --use-stream-queue --dry-run
 
+Direct WebSocket mode:
+
+    python -m polymarket_signal_bot live-paper --use-websocket --dry-run
+
+Standalone external-signal mode:
+
+    python -m polymarket_signal_bot live-paper --monitor-standalone --dry-run
+
+Runner state is mirrored into ``data/paper_state.db``. JSON state is an optional
+debug export that can be enabled with ``--export-json-state``.
+
 Confidential values, if a future authenticated API client is added, should come
 from environment variables such as ``POLYMARKET_API_KEY``,
 ``POLYMARKET_API_SECRET`` and ``POLYMARKET_API_PASSPHRASE``. The current runner
@@ -32,16 +43,19 @@ uses public market data only and never stores private keys.
 
 import argparse
 import asyncio
+import contextlib
 import hashlib
+import importlib
 import json
 import logging
 import os
 import signal
+import sqlite3
 import sys
 import time
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 from .api import ApiError, PolymarketClient
 from .cohorts import CohortConfig, wallet_cohort_report
@@ -53,6 +67,14 @@ from .policy_optimizer import policy_settings_from_recommendation
 from .scoring import score_wallets
 from .signals import SignalConfig, generate_signals
 from .storage import DEFAULT_DB_PATH, Store
+from .streaming import (
+    MARKET_WS_URL,
+    MissingWebsocketError,
+    StreamConfig,
+    StreamProcessor,
+    missing_websocket_message,
+    normalize_market_payload,
+)
 
 
 LOGGER = logging.getLogger("polymarket_signal_bot.live_paper")
@@ -63,6 +85,14 @@ class LivePaperConfig:
     db_path: str = str(DEFAULT_DB_PATH)
     poll_interval_seconds: int = 60
     price_interval_seconds: int = 15
+    monitor_standalone: bool = False
+    external_signal_channel: str = "polysignal:signals"
+    use_websocket: bool = False
+    websocket_url: str = MARKET_WS_URL
+    websocket_assets: tuple[str, ...] = ()
+    websocket_asset_limit: int = 40
+    websocket_timeout_seconds: float = 30.0
+    websocket_reconnect_seconds: float = 5.0
     use_stream_queue: bool = False
     stream_queue_interval_seconds: float = 1.0
     stream_batch_limit: int = 500
@@ -70,6 +100,8 @@ class LivePaperConfig:
     manual_confirm: bool = False
     dry_run: bool = False
     close_on_stop: bool = True
+    state_db_path: str = "data/paper_state.db"
+    export_json_state: bool = False
     state_path: str = "data/live_paper_state.json"
     log_path: str = "data/live_paper_runner.log"
     leaderboard_limit: int = 0
@@ -107,6 +139,253 @@ class LivePaperConfig:
     risk_trim_enabled: bool = True
 
 
+class PaperStateStore:
+    """Small SQLite state mirror for the live paper runner.
+
+    The main application database remains the source of market data, signals,
+    and the full paper journal. This store is a runner-local recovery surface:
+    open/closed position rows plus balance history after each cycle.
+    """
+
+    def __init__(self, path: str | Path) -> None:
+        self.path = Path(path)
+
+    def init_schema(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with self._connect() as conn:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS positions (
+                    id TEXT PRIMARY KEY,
+                    market_id TEXT NOT NULL,
+                    side TEXT NOT NULL,
+                    size REAL NOT NULL,
+                    entry_price REAL NOT NULL,
+                    tp_pct REAL NOT NULL,
+                    sl_pct REAL NOT NULL,
+                    status TEXT NOT NULL,
+                    opened_at INTEGER NOT NULL,
+                    closed_at INTEGER,
+                    pnl REAL NOT NULL DEFAULT 0
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS balance_history (
+                    timestamp INTEGER NOT NULL,
+                    balance REAL NOT NULL,
+                    pnl REAL NOT NULL
+                )
+                """
+            )
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_positions_status ON positions(status, opened_at DESC)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_balance_timestamp ON balance_history(timestamp DESC)")
+
+    def load_latest_state(self) -> dict[str, Any]:
+        self.init_schema()
+        with self._connect() as conn:
+            open_positions = conn.execute(
+                "SELECT * FROM positions WHERE status = 'OPEN' ORDER BY opened_at DESC"
+            ).fetchall()
+            latest_balance = conn.execute(
+                """
+                SELECT timestamp, balance, pnl
+                FROM balance_history
+                ORDER BY timestamp DESC
+                LIMIT 1
+                """
+            ).fetchone()
+            total_positions = conn.execute("SELECT COUNT(*) AS count FROM positions").fetchone()
+        return {
+            "open_positions": [dict(row) for row in open_positions],
+            "latest_balance": dict(latest_balance) if latest_balance else None,
+            "total_positions": int(total_positions["count"] or 0) if total_positions else 0,
+        }
+
+    def upsert_open_position(self, position: PaperPosition) -> None:
+        self.init_schema()
+        row = _state_position_row(position)
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO positions(
+                    id, market_id, side, size, entry_price, tp_pct, sl_pct,
+                    status, opened_at, closed_at, pnl
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    market_id = excluded.market_id,
+                    side = excluded.side,
+                    size = excluded.size,
+                    entry_price = excluded.entry_price,
+                    tp_pct = excluded.tp_pct,
+                    sl_pct = excluded.sl_pct,
+                    status = excluded.status,
+                    opened_at = excluded.opened_at,
+                    closed_at = excluded.closed_at,
+                    pnl = excluded.pnl
+                """,
+                row,
+            )
+
+    def close_position(self, position: PaperPosition, *, closed_at: int, exit_price: float) -> None:
+        self.init_schema()
+        pnl = round(position.shares * exit_price - position.size_usdc, 4)
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO positions(
+                    id, market_id, side, size, entry_price, tp_pct, sl_pct,
+                    status, opened_at, closed_at, pnl
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                _state_position_row(position),
+            )
+            conn.execute(
+                """
+                UPDATE positions
+                SET status = 'CLOSED', closed_at = ?, pnl = ?
+                WHERE id = ?
+                """,
+                (closed_at, pnl, position.position_id),
+            )
+
+    def record_balance(self, *, timestamp: int, balance: float, pnl: float) -> None:
+        self.init_schema()
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT INTO balance_history(timestamp, balance, pnl) VALUES (?, ?, ?)",
+                (timestamp, round(float(balance), 4), round(float(pnl), 4)),
+            )
+
+    @contextlib.contextmanager
+    def _connect(self) -> Iterator[sqlite3.Connection]:
+        conn = sqlite3.connect(self.path)
+        conn.row_factory = sqlite3.Row
+        try:
+            yield conn
+            conn.commit()
+        finally:
+            conn.close()
+
+
+class RedisSignalListener:
+    """Future Redis pub/sub bridge for standalone monitor mode.
+
+    ``connect`` is intentionally a stub until Redis is introduced. Tests and
+    local integrations can pass an ``asyncio.Queue`` now, which gives the runner
+    the same external-signal contract without adding infrastructure yet.
+    """
+
+    def __init__(
+        self,
+        channel: str,
+        *,
+        queue: asyncio.Queue[Any] | None = None,
+        timeout_seconds: float = 1.0,
+    ) -> None:
+        self.channel = channel
+        self.queue = queue or asyncio.Queue()
+        self.timeout_seconds = timeout_seconds
+
+    async def connect(self) -> None:
+        pass
+
+    async def get_signal(self) -> Any | None:
+        try:
+            return await asyncio.wait_for(self.queue.get(), timeout=max(0.1, self.timeout_seconds))
+        except asyncio.TimeoutError:
+            return None
+
+
+class WebSocketSignalListener:
+    """Listen to the public Polymarket CLOB WebSocket and enqueue stream events."""
+
+    def __init__(
+        self,
+        *,
+        url: str,
+        assets: list[str],
+        queue: asyncio.Queue[dict[str, object]] | None = None,
+        timeout_seconds: float = 30.0,
+        reconnect_seconds: float = 5.0,
+    ) -> None:
+        self.url = url
+        self.assets = list(dict.fromkeys(asset for asset in assets if asset))
+        self.queue = queue or asyncio.Queue()
+        self.timeout_seconds = timeout_seconds
+        self.reconnect_seconds = reconnect_seconds
+        self._closed = asyncio.Event()
+        self._task: asyncio.Task[None] | None = None
+        self._websockets: Any | None = None
+
+    async def __aenter__(self) -> "WebSocketSignalListener":
+        await self.connect()
+        return self
+
+    async def __aexit__(self, exc_type: object, exc: object, tb: object) -> None:
+        await self.close()
+
+    async def connect(self) -> None:
+        if not self.assets:
+            raise RuntimeError("No assets available for live-paper WebSocket subscription.")
+        self._websockets = _load_websockets()
+        self._closed.clear()
+        self._task = asyncio.create_task(self._listen_forever(), name="live-paper-websocket-listener")
+
+    async def close(self) -> None:
+        self._closed.set()
+        if self._task:
+            self._task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._task
+
+    async def get_signal(self) -> dict[str, object] | None:
+        try:
+            return await asyncio.wait_for(self.queue.get(), timeout=max(0.1, self.timeout_seconds))
+        except asyncio.TimeoutError:
+            return None
+
+    async def _listen_forever(self) -> None:
+        websockets = self._websockets or _load_websockets()
+        while not self._closed.is_set():
+            try:
+                await self._listen_once(websockets)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - live stream should reconnect.
+                LOGGER.warning("websocket reconnecting error=%s", str(exc)[:300])
+                await _sleep_until_stop(self._closed, max(1.0, self.reconnect_seconds))
+
+    async def _listen_once(self, websockets: Any) -> None:
+        subscription = {
+            "assets_ids": self.assets,
+            "type": "market",
+            "custom_feature_enabled": True,
+        }
+        async with websockets.connect(self.url, ping_interval=None) as ws:
+            await ws.send(json.dumps(subscription, separators=(",", ":")))
+            heartbeat = asyncio.create_task(self._heartbeat(ws), name="live-paper-websocket-heartbeat")
+            try:
+                async for raw in ws:
+                    if self._closed.is_set():
+                        return
+                    for event in normalize_market_payload(raw):
+                        await self.queue.put(event)
+            finally:
+                heartbeat.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await heartbeat
+
+    async def _heartbeat(self, ws: Any) -> None:
+        while not self._closed.is_set():
+            await _sleep_until_stop(self._closed, 10)
+            if not self._closed.is_set():
+                await ws.send("PING")
+
+
 class LivePaperRunner:
     """Combine periodic monitoring with real-time paper position management."""
 
@@ -115,9 +394,12 @@ class LivePaperRunner:
         config: LivePaperConfig | None = None,
         *,
         client: PolymarketClient | None = None,
+        signal_queue: asyncio.Queue[Any] | None = None,
     ) -> None:
         self.config = config or LivePaperConfig()
         self.client = client or PolymarketClient()
+        self.signal_queue = signal_queue
+        self.paper_state = PaperStateStore(self.config.state_db_path)
         self._stop = asyncio.Event()
         self._seen_signal_ids: set[str] = set()
         self._stream_cursor = 0
@@ -126,6 +408,8 @@ class LivePaperRunner:
     async def run(self) -> None:
         configure_logging(self.config.log_path)
         _load_secret_env()
+        self.paper_state.init_schema()
+        state = self.paper_state.load_latest_state()
         with Store(self.config.db_path) as store:
             store.init_schema()
             self._seen_signal_ids = {signal.signal_id for signal in store.fetch_recent_signals(limit=500)}
@@ -134,15 +418,19 @@ class LivePaperRunner:
             self._write_state(store)
 
         LOGGER.info(
-            "live paper runner started dry_run=%s manual_confirm=%s stream_queue=%s",
+            (
+                "live paper runner started dry_run=%s manual_confirm=%s standalone=%s "
+                "websocket=%s stream_queue=%s state_open=%s state_positions=%s"
+            ),
             self.config.dry_run,
             self.config.manual_confirm,
+            self.config.monitor_standalone,
+            self.config.use_websocket,
             self.config.use_stream_queue,
+            len(state["open_positions"]),
+            state["total_positions"],
         )
-        signal_task = asyncio.create_task(
-            self._stream_signal_loop() if self.config.use_stream_queue else self._signal_loop(),
-            name="live-paper-signals",
-        )
+        signal_task = asyncio.create_task(self._selected_signal_loop(), name="live-paper-signals")
         price_task = asyncio.create_task(self._position_loop(), name="live-paper-positions")
         try:
             await self._stop.wait()
@@ -160,6 +448,24 @@ class LivePaperRunner:
 
     def request_stop(self) -> None:
         self._stop.set()
+
+    async def _selected_signal_loop(self) -> None:
+        if self.config.monitor_standalone:
+            listener = RedisSignalListener(
+                self.config.external_signal_channel,
+                queue=self.signal_queue,
+                timeout_seconds=min(1.0, max(0.1, self.config.poll_interval_seconds)),
+            )
+            await listener.connect()
+            await self._external_signal_loop(listener, "standalone")
+            return
+        if self.config.use_websocket:
+            await self._websocket_signal_loop()
+            return
+        if self.config.use_stream_queue:
+            await self._stream_signal_loop()
+            return
+        await self._signal_loop()
 
     async def _signal_loop(self) -> None:
         iteration = 0
@@ -204,6 +510,52 @@ class LivePaperRunner:
             elapsed = time.monotonic() - started
             interval = self.config.stream_queue_interval_seconds if "stream_events=0" in summary else 0.1
             await _sleep_until_stop(self._stop, max(0.1, interval - elapsed))
+
+    async def _websocket_signal_loop(self) -> None:
+        assets = self._websocket_assets()
+        if not assets:
+            LOGGER.warning("websocket mode has no recent assets; waiting without polling")
+            while not self._stop.is_set():
+                await _sleep_until_stop(self._stop, max(1.0, self.config.websocket_reconnect_seconds))
+                assets = self._websocket_assets()
+                if assets:
+                    break
+        if not assets or self._stop.is_set():
+            return
+        try:
+            async with WebSocketSignalListener(
+                url=self.config.websocket_url,
+                assets=assets,
+                timeout_seconds=self.config.websocket_timeout_seconds,
+                reconnect_seconds=self.config.websocket_reconnect_seconds,
+            ) as listener:
+                await self._external_signal_loop(listener, "websocket")
+        except MissingWebsocketError:
+            LOGGER.error(missing_websocket_message())
+            self.request_stop()
+
+    async def _external_signal_loop(self, listener: Any, source_name: str) -> None:
+        iteration = 0
+        while not self._stop.is_set():
+            iteration += 1
+            try:
+                with Store(self.config.db_path) as store:
+                    store.init_schema()
+                    store.set_runtime_state("live_paper_status", f"waiting_{source_name}")
+                    self._log_portfolio_state(store, f"{source_name}_tick_start")
+                payload = await listener.get_signal()
+                if payload is None:
+                    await _sleep_until_stop(self._stop, 0.1)
+                    continue
+                signals, summary = await asyncio.to_thread(self._consume_external_payload, payload, source_name)
+                LOGGER.info("%s_tick=%s %s fresh_signals=%s", source_name, iteration, summary, len(signals))
+                await self._handle_signals(signals)
+                with Store(self.config.db_path) as store:
+                    store.init_schema()
+                    self._log_portfolio_state(store, f"{source_name}_tick_end")
+            except Exception:
+                LOGGER.exception("unexpected error in %s signal loop", source_name)
+                await _sleep_until_stop(self._stop, max(1.0, self.config.websocket_reconnect_seconds))
 
     async def _position_loop(self) -> None:
         while not self._stop.is_set():
@@ -281,6 +633,40 @@ class LivePaperRunner:
             fresh = [signal for signal in signals if signal.signal_id not in self._seen_signal_ids]
             self._seen_signal_ids.update(signal.signal_id for signal in signals)
             return fresh, summary
+
+    def _consume_external_payload(self, payload: Any, source_name: str) -> tuple[list[Signal], str]:
+        direct = _signal_from_payload(payload)
+        if direct is not None:
+            if direct.signal_id in self._seen_signal_ids:
+                return [], f"{source_name}_direct_signal=duplicate"
+            self._seen_signal_ids.add(direct.signal_id)
+            return [direct], f"{source_name}_direct_signal=1"
+
+        events = _stream_events_from_payload(payload)
+        if not events:
+            return [], f"{source_name}_events=0 signals=0"
+        with Store(self.config.db_path) as store:
+            store.init_schema()
+            flush = StreamProcessor(store, client=self.client, config=self._stream_flush_config())._flush(events)
+        signals, summary = self.stream_tick()
+        return (
+            signals,
+            (
+                f"{source_name}_events={len(events)} inserted={flush.stream_events} "
+                f"books={flush.books} reconciled={flush.reconciled_trades} {summary}"
+            ),
+        )
+
+    def _websocket_assets(self) -> list[str]:
+        explicit = [asset for asset in self.config.websocket_assets if asset]
+        if explicit:
+            return list(dict.fromkeys(explicit))
+        with Store(self.config.db_path) as store:
+            store.init_schema()
+            return store.recent_assets(
+                limit=max(1, self.config.websocket_asset_limit),
+                since_ts=int(time.time()) - max(1, self.config.lookback_minutes) * 60,
+            )
 
     def _generate_signals(self, store: Store) -> list[Signal]:
         wallets = store.fetch_wallets(limit=self.config.wallet_limit)
@@ -386,6 +772,7 @@ class LivePaperRunner:
             opened = PaperBroker(store, self._risk_config(), self._exit_config()).open_from_signals([priced_signal])
             if opened:
                 LOGGER.info("opened position=%s asset=%s entry=%.4f", opened[0].position_id, opened[0].asset, opened[0].entry_price)
+                self.paper_state.upsert_open_position(opened[0])
             else:
                 LOGGER.info("signal did not open position=%s", priced_signal.signal_id)
             self._write_state(store)
@@ -447,6 +834,7 @@ class LivePaperRunner:
         pnl = position.shares * price - position.size_usdc
         store.close_position(position.position_id, now, price, round(pnl, 4), reason)
         store.insert_paper_events([_position_close_event(position, now, price, reason)])
+        self.paper_state.close_position(position, closed_at=now, exit_price=price)
         LOGGER.info(
             "closed position=%s asset=%s price=%.4f pnl=%.4f reason=%s",
             position.position_id,
@@ -494,7 +882,7 @@ class LivePaperRunner:
             f"confidence={signal_item.confidence:.2%} [y/N]: "
         )
         answer = await asyncio.to_thread(input, prompt)
-        return answer.strip().lower() in {"y", "yes", "д", "да"}
+        return answer.strip().lower() in {"y", "yes", "\u0434", "\u0434\u0430"}
 
     def _log_portfolio_state(self, store: Store, label: str) -> None:
         summary = _portfolio_snapshot(store, self.config.bankroll)
@@ -517,15 +905,22 @@ class LivePaperRunner:
         store.set_runtime_state("live_paper_metrics", _metrics_summary(summary))
 
     def _write_state(self, store: Store) -> None:
+        summary = _portfolio_snapshot(store, self.config.bankroll)
+        now = int(time.time())
+        self.paper_state.record_balance(timestamp=now, balance=summary["balance"], pnl=summary["total_pnl"])
+        if not self.config.export_json_state:
+            return
         path = Path(self.config.state_path)
         path.parent.mkdir(parents=True, exist_ok=True)
-        summary = _portfolio_snapshot(store, self.config.bankroll)
         payload = {
-            "updatedAt": int(time.time()),
+            "updatedAt": now,
             "dbPath": str(store.path),
             "dryRun": self.config.dry_run,
             "manualConfirm": self.config.manual_confirm,
+            "monitorStandalone": self.config.monitor_standalone,
+            "useWebSocket": self.config.use_websocket,
             "useStreamQueue": self.config.use_stream_queue,
+            "stateDbPath": self.config.state_db_path,
             "streamCursor": self._stream_cursor,
             "activePolicy": self._policy_label(store),
             "summary": summary,
@@ -615,6 +1010,141 @@ class LivePaperRunner:
             max_risk_trim_positions_per_run=self.config.max_risk_trim_per_run,
         )
 
+    def _stream_flush_config(self) -> StreamConfig:
+        return StreamConfig(
+            assets=self.config.websocket_assets,
+            asset_limit=self.config.websocket_asset_limit,
+            market_ws_url=self.config.websocket_url,
+            reconcile_trades=True,
+            reconcile_min_notional=self.config.min_trade_usdc,
+            reconcile_limit=30,
+            reconcile_window_seconds=45,
+            scan_every_events=0,
+            wallet_limit=self.config.wallet_limit,
+            bankroll=self.config.bankroll,
+            min_wallet_score=self.config.min_wallet_score,
+            min_trade_usdc=self.config.min_trade_usdc,
+            max_signals=self.config.max_signals,
+        )
+
+
+def _state_position_row(position: PaperPosition) -> tuple[object, ...]:
+    entry = float(position.entry_price or 0.0)
+    tp_pct = (float(position.take_profit) - entry) / entry if entry > 0 else 0.0
+    sl_pct = (entry - float(position.stop_loss)) / entry if entry > 0 else 0.0
+    return (
+        position.position_id,
+        position.condition_id or position.asset,
+        "BUY",
+        round(float(position.size_usdc), 4),
+        round(entry, 6),
+        round(max(0.0, tp_pct), 6),
+        round(max(0.0, sl_pct), 6),
+        position.status or "OPEN",
+        int(position.opened_at),
+        position.closed_at,
+        round(float(position.realized_pnl or 0.0), 4),
+    )
+
+
+def _signal_from_payload(payload: Any) -> Signal | None:
+    if isinstance(payload, Signal):
+        return payload
+    data = _payload_dict(payload)
+    if not data:
+        return None
+    if "signal_id" not in data and "signalId" not in data:
+        return None
+    if "action" not in data or "asset" not in data:
+        return None
+    now = int(time.time())
+    return Signal(
+        signal_id=str(data.get("signal_id") or data.get("signalId") or ""),
+        generated_at=_as_int(data.get("generated_at") or data.get("generatedAt"), now),
+        action=str(data.get("action") or "").upper(),
+        wallet=str(data.get("wallet") or ""),
+        wallet_score=_as_float(data.get("wallet_score") or data.get("walletScore")),
+        condition_id=str(data.get("condition_id") or data.get("conditionId") or data.get("market_id") or ""),
+        asset=str(data.get("asset") or ""),
+        outcome=str(data.get("outcome") or ""),
+        title=str(data.get("title") or ""),
+        observed_price=_as_float(data.get("observed_price") or data.get("observedPrice")),
+        suggested_price=_as_float(data.get("suggested_price") or data.get("suggestedPrice")),
+        size_usdc=_as_float(data.get("size_usdc") or data.get("sizeUsdc") or data.get("size")),
+        confidence=_as_float(data.get("confidence")),
+        stop_loss=_as_float(data.get("stop_loss") or data.get("stopLoss")),
+        take_profit=_as_float(data.get("take_profit") or data.get("takeProfit")),
+        expires_at=_as_int(data.get("expires_at") or data.get("expiresAt"), now + 300),
+        source_trade_id=str(data.get("source_trade_id") or data.get("sourceTradeId") or ""),
+        reason=str(data.get("reason") or ""),
+    )
+
+
+def _stream_events_from_payload(payload: Any) -> list[dict[str, object]]:
+    if isinstance(payload, Signal):
+        return []
+    if isinstance(payload, list):
+        events: list[dict[str, object]] = []
+        for item in payload:
+            events.extend(_stream_events_from_payload(item))
+        return events
+    data = _payload_dict(payload)
+    if data and _looks_like_signal_payload(data):
+        return []
+    if data and _looks_like_stream_event(data):
+        return [data]
+    try:
+        return normalize_market_payload(payload)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return []
+
+
+def _payload_dict(payload: Any) -> dict[str, Any]:
+    if isinstance(payload, dict):
+        return payload
+    if isinstance(payload, bytes):
+        payload = payload.decode("utf-8", errors="replace")
+    if isinstance(payload, str):
+        try:
+            decoded = json.loads(payload)
+        except json.JSONDecodeError:
+            return {}
+        return decoded if isinstance(decoded, dict) else {}
+    return {}
+
+
+def _looks_like_signal_payload(data: dict[str, Any]) -> bool:
+    return ("signal_id" in data or "signalId" in data) and "action" in data and "asset" in data
+
+
+def _looks_like_stream_event(data: dict[str, Any]) -> bool:
+    return "event_type" in data and "event_id" in data
+
+
+def _as_int(value: Any, default: int = 0) -> int:
+    try:
+        if value is None or value == "":
+            return default
+        return int(float(value))
+    except (TypeError, ValueError):
+        return default
+
+
+def _as_float(value: Any, default: float = 0.0) -> float:
+    try:
+        if value is None or value == "":
+            return default
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _load_websockets() -> Any:
+    try:
+        return importlib.import_module("websockets")
+    except ImportError as exc:
+        raise MissingWebsocketError(missing_websocket_message()) from exc
+
 
 def configure_logging(log_path: str, *, level: int = logging.INFO) -> None:
     path = Path(log_path)
@@ -637,6 +1167,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--db", default=os.environ.get("POLYSIGNAL_DB", str(DEFAULT_DB_PATH)))
     parser.add_argument("--poll-interval", type=int, default=int(os.environ.get("POLYSIGNAL_POLL_INTERVAL", "60")))
     parser.add_argument("--price-interval", type=int, default=int(os.environ.get("POLYSIGNAL_PRICE_INTERVAL", "15")))
+    parser.add_argument("--monitor-standalone", action="store_true", default=_env_bool("MONITOR_STANDALONE", False))
+    parser.add_argument("--external-signal-channel", default=os.environ.get("POLYSIGNAL_SIGNAL_CHANNEL", "polysignal:signals"))
+    parser.add_argument("--use-websocket", action="store_true", default=_env_bool("POLYSIGNAL_USE_WEBSOCKET", False))
+    parser.add_argument("--websocket-url", default=os.environ.get("POLYSIGNAL_WEBSOCKET_URL", MARKET_WS_URL))
+    parser.add_argument("--websocket-asset", action="append", default=[], help="CLOB token id. Repeat as needed.")
+    parser.add_argument("--websocket-asset-limit", type=int, default=40)
+    parser.add_argument("--websocket-timeout", type=float, default=30.0)
+    parser.add_argument("--websocket-reconnect", type=float, default=5.0)
     parser.add_argument("--use-stream-queue", action="store_true")
     parser.add_argument("--stream-queue-interval", type=float, default=1.0)
     parser.add_argument("--stream-batch-limit", type=int, default=500)
@@ -644,6 +1182,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--manual-confirm", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--no-close-on-stop", action="store_true")
+    parser.add_argument("--state-db", default=os.environ.get("POLYSIGNAL_PAPER_STATE_DB", "data/paper_state.db"))
+    parser.add_argument("--export-json-state", action="store_true", default=_env_bool("POLYSIGNAL_EXPORT_JSON_STATE", False))
     parser.add_argument("--state-path", default=os.environ.get("POLYSIGNAL_STATE_FILE", "data/live_paper_state.json"))
     parser.add_argument("--log-path", default=os.environ.get("POLYSIGNAL_LOG_FILE", "data/live_paper_runner.log"))
     parser.add_argument("--leaderboard-limit", type=int, default=0)
@@ -671,6 +1211,14 @@ def config_from_args(args: argparse.Namespace) -> LivePaperConfig:
         db_path=args.db,
         poll_interval_seconds=args.poll_interval,
         price_interval_seconds=args.price_interval,
+        monitor_standalone=args.monitor_standalone,
+        external_signal_channel=args.external_signal_channel,
+        use_websocket=args.use_websocket,
+        websocket_url=args.websocket_url,
+        websocket_assets=tuple(args.websocket_asset or ()),
+        websocket_asset_limit=args.websocket_asset_limit,
+        websocket_timeout_seconds=args.websocket_timeout,
+        websocket_reconnect_seconds=args.websocket_reconnect,
         use_stream_queue=args.use_stream_queue,
         stream_queue_interval_seconds=args.stream_queue_interval,
         stream_batch_limit=args.stream_batch_limit,
@@ -678,6 +1226,8 @@ def config_from_args(args: argparse.Namespace) -> LivePaperConfig:
         manual_confirm=args.manual_confirm,
         dry_run=args.dry_run,
         close_on_stop=not args.no_close_on_stop,
+        state_db_path=args.state_db,
+        export_json_state=args.export_json_state,
         state_path=args.state_path,
         log_path=args.log_path,
         leaderboard_limit=args.leaderboard_limit,
@@ -854,6 +1404,13 @@ def _load_secret_env() -> dict[str, str]:
         "api_passphrase": os.environ.get("POLYMARKET_API_PASSPHRASE", ""),
     }
     return {key: value for key, value in keys.items() if value}
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
 async def async_main(argv: list[str] | None = None) -> int:

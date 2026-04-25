@@ -128,6 +128,16 @@ each signal tick. The live paper runner also reloads
 `policy_optimizer_recommended` on every signal cycle and logs total PnL, trade
 count, closed trade count, win rate, open positions, and active policy.
 
+Current implementation: `live-paper --use-websocket` can subscribe directly to
+the public CLOB WebSocket and feed normalized events into the same signal path.
+`live-paper --monitor-standalone` disables internal monitor polling and waits for
+external signals through the listener contract; the Redis listener is currently a
+stub with `connect()` and `get_signal()` ready for future pub/sub wiring.
+
+Current implementation: runner recovery state lives in `data/paper_state.db`.
+The `positions` table mirrors paper opens/closes, and `balance_history` records
+balance plus PnL after cycles. JSON state output is now an optional debug export.
+
 ### Paper Decisions
 
 The system must log its own behavior, not only public market behavior:
