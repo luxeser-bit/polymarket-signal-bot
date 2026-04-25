@@ -21,14 +21,17 @@ only after legal review, exchange access review, and a long paper-trading run.
 ```powershell
 python -m polymarket_signal_bot demo
 python -m polymarket_signal_bot report
-python -m polymarket_signal_bot dashboard
+python -m pip install -r requirements-streamlit.txt
+streamlit run dashboard.py
 ```
 
 The demo command creates `data/polysignal.db`, loads synthetic trades, scores
 wallets, creates signals, and opens paper positions.
 
-Open the dashboard at `http://127.0.0.1:8765`. It uses the same SQLite database
-and shows the paper portfolio in a terminal-style control room.
+Open the Streamlit dashboard URL printed by Streamlit, usually
+`http://localhost:8501`. It reads the same SQLite data plus
+`data/paper_state.db`, and replaces the old HTML/JS control room as the primary
+dashboard.
 
 ## Live public-data run
 
@@ -63,8 +66,11 @@ python -m polymarket_signal_bot reviews --status PENDING
 Then start the local interface:
 
 ```powershell
-python -m polymarket_signal_bot dashboard
+streamlit run dashboard.py
 ```
+
+The older `python -m polymarket_signal_bot dashboard` command is retained as a
+legacy compatibility path, but new UI work should target the Streamlit dashboard.
 
 ## Monitor mode
 
@@ -317,12 +323,12 @@ This is the working checklist for the project.
 Done:
 
 - MVP without real trades: public leaderboard/activity collection, local SQLite,
-  wallet scoring, signal generation, paper positions, local dashboard.
+  wallet scoring, signal generation, paper positions, Streamlit local dashboard.
 - Signal engine v1: scored wallets, recent trade filters, minimum trade size,
   suggested entry price, position size, confidence, stop loss, take profit,
   duplicate-position protection.
 - Paper trading v1: simulated entries, conservative slippage, open/closed paper
-  positions, realized/unrealized PnL in the dashboard.
+  positions, realized/unrealized PnL in the Streamlit dashboard.
 - Monitor v1: recurring scan loop, dashboard heartbeat, Telegram alert router
   with duplicate protection and dry-run mode.
 - Market/order-book v1: public CLOB `/books` sync, best bid/ask, spread, depth,
