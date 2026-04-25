@@ -6,11 +6,14 @@ from pathlib import Path
 
 from polymarket_signal_bot.indexer import (
     BlockInfo,
+    CTF_EXCHANGE_ADDRESS,
     IndexerStore,
     ORDER_FILLED_TOPIC,
     TRANSFER_SINGLE_TOPIC,
     chunk_ranges,
+    condition_id_from_tx_input,
     decode_log,
+    default_contract_specs,
     topic_to_address,
 )
 
@@ -68,13 +71,60 @@ class IndexerTests(unittest.TestCase):
             + _word(0),
         }
 
-        rows = decode_log(log, block_map={100: BlockInfo(100, "0xabc", 1710000000)})
+        rows = decode_log(
+            log,
+            block_map={100: BlockInfo(100, "0xabc", 1710000000)},
+            topic_to_event={ORDER_FILLED_TOPIC: "OrderFilledV1"},
+        )
 
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0].event_type, "OrderFilled")
         self.assertEqual(rows[0].user_address, maker)
         self.assertEqual(rows[0].market_id, str(token_id))
         self.assertEqual(rows[0].side, "BUY")
+        self.assertAlmostEqual(rows[0].price, 0.45)
+        self.assertAlmostEqual(rows[0].amount, 1.0)
+
+    def test_decode_order_filled_v2_uses_condition_id_market(self) -> None:
+        maker = "0x1111111111111111111111111111111111111111"
+        taker = "0x2222222222222222222222222222222222222222"
+        token_id = 12345
+        condition_id = "0x" + ("c" * 64)
+        v2_topic = "0x" + ("9" * 64)
+        log = {
+            "address": CTF_EXCHANGE_ADDRESS,
+            "blockNumber": "0x64",
+            "blockHash": "0xabc",
+            "transactionHash": "0xtxv2",
+            "logIndex": "0x9",
+            "topics": [
+                v2_topic,
+                "0x" + ("a" * 64),
+                _topic_address(maker),
+                _topic_address(taker),
+            ],
+            "data": "0x"
+            + _word(1)
+            + _word(token_id)
+            + _word(1_000_000)
+            + _word(450_000)
+            + _word(0)
+            + _word(0)
+            + _word(0),
+        }
+
+        rows = decode_log(
+            log,
+            block_map={100: BlockInfo(100, "0xabc", 1710000000)},
+            topic_to_event={v2_topic: "OrderFilledV2"},
+            tx_condition_ids={"0xtxv2": condition_id},
+        )
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].event_type, "OrderFilled")
+        self.assertEqual(rows[0].user_address, maker)
+        self.assertEqual(rows[0].market_id, condition_id)
+        self.assertEqual(rows[0].side, "SELL")
         self.assertAlmostEqual(rows[0].price, 0.45)
         self.assertAlmostEqual(rows[0].amount, 1.0)
 
@@ -107,6 +157,16 @@ class IndexerTests(unittest.TestCase):
     def test_chunk_ranges(self) -> None:
         self.assertEqual(chunk_ranges(1, 5, 2), [(1, 2), (3, 4), (5, 5)])
         self.assertEqual(chunk_ranges(5, 1, 2), [])
+
+    def test_condition_id_from_tx_input(self) -> None:
+        condition_id = "0x" + ("b" * 64)
+        self.assertEqual(condition_id_from_tx_input("0x12345678" + condition_id[2:]), condition_id)
+
+    def test_default_contracts_use_current_exchange_addresses(self) -> None:
+        addresses = {spec.normalized_address for spec in default_contract_specs()}
+        self.assertIn("0xe111180000d2663c0091e4f400237545b87b996b", addresses)
+        self.assertIn("0xe2222d279d744050d28e00520010520000310f59", addresses)
+        self.assertNotIn("0x4bfb41d5b3570defd03c39a9a4d8de6bd8b8982e", addresses)
 
     def test_topic_to_address(self) -> None:
         address = "0xabcdefabcdefabcdefabcdefabcdefabcdefabcd"

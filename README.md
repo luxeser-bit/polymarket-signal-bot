@@ -234,14 +234,18 @@ dashboard and analytics can read while ingestion writes.
 ```powershell
 python -m pip install ".[indexer]"
 $env:POLYGON_RPC_URL="https://polygon-mainnet.g.alchemy.com/v2/YOUR_KEY"
+$env:RPC_RPS="5"
 
 python -m src.indexer --start-block 50000000 --end-block 50001000 --dry-run
+python -m src.indexer --start-block 50000000 --test
 python -m src.indexer --sync --batch-size 2000 --max-workers 8
 ```
 
 Without explicit blocks, the indexer continues from the last saved block to the
 current Polygon head. `--dry-run` prints decoded events and does not write to the
-database.
+database. The CLOB source uses the current CTF Exchange V2 deployed addresses
+from Polymarket contracts documentation: `0xE111180000d2663C0091e4f400237545B87B996B`
+and `0xe2222d279d744050d28e00520010520000310F59`.
 
 The export creates aggregate views for wallet flow, market flow, category flow,
 daily flow, wallet cohort stability, latest liquidity, wallet outcomes, and

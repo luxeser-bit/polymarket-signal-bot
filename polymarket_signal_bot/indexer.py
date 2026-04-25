@@ -17,6 +17,7 @@ import argparse
 import asyncio
 import json
 import logging
+import math
 import os
 import sqlite3
 import time
@@ -35,10 +36,8 @@ USDC_ASSET_ID = 0
 TOKEN_DECIMALS = 1_000_000
 
 CONDITIONAL_TOKENS_ADDRESS = "0x4d97dcd97ec945f40cf65f87097ace5ea0476045"
-CTF_EXCHANGE_ADDRESS = "0x4bfb41d5b3570defd03c39a9a4d8de6bd8b8982e"
-NEG_RISK_CTF_EXCHANGE_ADDRESS = "0xc5d563a36ae78145c45a50134d48a1215220f80a"
-CTF_EXCHANGE_V2_ADDRESS = "0xe111180000d2663c0091e4f400237545b87b996b"
-NEG_RISK_CTF_EXCHANGE_V2_ADDRESS = "0xe2222d279d744050d28e00520010520000310f59"
+CTF_EXCHANGE_ADDRESS = "0xe111180000d2663c0091e4f400237545b87b996b"
+NEG_RISK_CTF_EXCHANGE_ADDRESS = "0xe2222d279d744050d28e00520010520000310f59"
 
 # Hard-coded high-volume topics avoid requiring web3/eth-hash for the normal
 # trade path. Other event signatures are computed lazily when eth-hash,
@@ -49,23 +48,29 @@ TRANSFER_SINGLE_TOPIC = (
 TRANSFER_BATCH_TOPIC = (
     "0x4a39dc06d4c0dbc64b70af90fd698a233a518aa5d07e595d983b8c0526c8f7fb"
 )
-ORDER_FILLED_TOPIC = (
+ORDER_FILLED_V1_TOPIC = (
     "0xd0a08e8c493f9c94f29311604c9de1b4e8c8d4c06bd0c789af57f2d65bfec0f6"
 )
 ORDER_CANCELLED_TOPIC = (
     "0x5152abf959f6564662358c2e52b702259b78bac5ee7842a0f01937e670efcc7d"
 )
+ORDER_FILLED_TOPIC = ORDER_FILLED_V1_TOPIC
+OWNER_SELECTOR = "0x8da5cb5b"
+GET_CTF_FUNCTION = "getCtf()"
+GET_ORACLE_FUNCTION = "getOracle()"
 
 EVENT_SIGNATURES: dict[str, str] = {
     "ConditionPreparation": "ConditionPreparation(bytes32,address,bytes32,uint256)",
     "PayoutRedemption": "PayoutRedemption(address,address,bytes32,bytes32,uint256[],uint256)",
+    "OrderFilledV2": "OrderFilled(bytes32,address,address,uint8,uint256,uint256,uint256,uint256,bytes32,bytes32)",
+    "OrdersMatchedV2": "OrdersMatched(bytes32,address,uint8,uint256,uint256,uint256)",
     "OrderPlaced": "OrderPlaced(bytes32,address,uint256,uint256,uint256,uint256)",
 }
 
 EVENT_TOPIC_FALLBACKS: dict[str, str] = {
     "TransferSingle": TRANSFER_SINGLE_TOPIC,
     "TransferBatch": TRANSFER_BATCH_TOPIC,
-    "OrderFilled": ORDER_FILLED_TOPIC,
+    "OrderFilledV1": ORDER_FILLED_V1_TOPIC,
     "OrderCancelled": ORDER_CANCELLED_TOPIC,
 }
 
@@ -89,6 +94,11 @@ class IndexerConfig:
     log_every: int = 1_000
     reorg_depth: int = 1_000
     default_start_block: int = 0
+    rpc_rps: float = 5.0
+    verify_contracts: bool = True
+    test: bool = False
+    dry_run_print_limit: int | None = None
+    sample_log_limit: int = 5
     request_timeout: float = 30.0
     max_retries: int = 5
 
@@ -299,8 +309,38 @@ class IndexerStore:
             )
 
 
+class AsyncRateLimiter:
+    def __init__(self, rps: float) -> None:
+        self.rps = float(rps or 0)
+        self._capacity = max(1, int(math.ceil(self.rps))) if self.rps > 0 else 0
+        self._semaphore: asyncio.BoundedSemaphore | None = (
+            asyncio.BoundedSemaphore(self._capacity) if self._capacity else None
+        )
+
+    async def acquire(self) -> None:
+        if self._semaphore is None:
+            return
+        await self._semaphore.acquire()
+        asyncio.get_running_loop().call_later(1.0, self._release)
+
+    def _release(self) -> None:
+        if self._semaphore is None:
+            return
+        try:
+            self._semaphore.release()
+        except ValueError:
+            pass
+
+
 class PolygonRpcClient:
-    def __init__(self, rpc_url: str, *, timeout: float = 30.0, max_retries: int = 5) -> None:
+    def __init__(
+        self,
+        rpc_url: str,
+        *,
+        timeout: float = 30.0,
+        max_retries: int = 5,
+        rps: float = 5.0,
+    ) -> None:
         if not rpc_url:
             raise ValueError("POLYGON_RPC_URL is required")
         try:
@@ -314,6 +354,7 @@ class PolygonRpcClient:
         self.rpc_url = rpc_url
         self.timeout = timeout
         self.max_retries = max_retries
+        self._rate_limiter = AsyncRateLimiter(rps)
         self._client: Any | None = None
         self._next_id = 1
 
@@ -338,6 +379,7 @@ class PolygonRpcClient:
                 "params": params,
             }
             try:
+                await self._rate_limiter.acquire()
                 response = await self._client.post(self.rpc_url, json=payload)
                 response.raise_for_status()
                 body = response.json()
@@ -369,6 +411,21 @@ class PolygonRpcClient:
             hash=str(result.get("hash") or ""),
             timestamp=hex_to_int(result.get("timestamp", "0x0")),
         )
+
+    async def get_code(self, address: str) -> str:
+        result = await self.call("eth_getCode", [normalize_address(address), "latest"])
+        return str(result or "0x")
+
+    async def eth_call(self, address: str, data: str) -> str:
+        result = await self.call(
+            "eth_call",
+            [{"to": normalize_address(address), "data": data}, "latest"],
+        )
+        return str(result or "0x")
+
+    async def get_transaction(self, tx_hash: str) -> dict[str, Any] | None:
+        result = await self.call("eth_getTransactionByHash", [tx_hash])
+        return dict(result) if result else None
 
     async def get_logs(
         self,
@@ -408,6 +465,7 @@ class PolygonEventIndexer:
         self.store = store or IndexerStore(config.db_path)
         self.contracts = list(contracts or default_contract_specs())
         self._topic_to_event = build_topic_map(self.contracts)
+        self._order_fill_samples_logged = 0
 
     async def run(self) -> None:
         self.store.init_schema()
@@ -415,13 +473,27 @@ class PolygonEventIndexer:
             self.config.rpc_url,
             timeout=self.config.request_timeout,
             max_retries=self.config.max_retries,
+            rps=self.config.rpc_rps,
         ) as rpc:
+            if self.config.verify_contracts:
+                await self._verify_contracts(rpc)
+            if self.config.test:
+                await self._run_test(rpc)
+                return
             await self._handle_reorg(rpc)
             if self.config.sync:
                 await self._run_sync(rpc)
             else:
                 start_block, end_block = await self._resolve_range(rpc)
                 await self.index_range(rpc, start_block, end_block)
+
+    async def _run_test(self, rpc: PolygonRpcClient) -> None:
+        block_number = self.config.start_block or self.config.end_block or await rpc.current_block()
+        LOGGER.info("Running one-block indexer test for block %s", block_number)
+        _, _, rows, _ = await self._index_chunk(rpc, block_number, block_number)
+        for row in rows[:10]:
+            print(json.dumps(raw_transaction_to_dict(row), sort_keys=True))
+        LOGGER.info("Test block %s decoded %s events, printed %s", block_number, len(rows), len(rows[:10]))
 
     async def _run_sync(self, rpc: PolygonRpcClient) -> None:
         while True:
@@ -514,13 +586,17 @@ class PolygonEventIndexer:
     ) -> int:
         inserted = 0
         if self.config.dry_run:
-            for row in rows:
+            printable_rows = list(rows)
+            if self.config.dry_run_print_limit is not None:
+                printable_rows = printable_rows[: max(0, self.config.dry_run_print_limit)]
+            for row in printable_rows:
                 print(json.dumps(raw_transaction_to_dict(row), sort_keys=True))
             LOGGER.info(
-                "Dry-run chunk %s..%s decoded %s events",
+                "Dry-run chunk %s..%s decoded %s events, printed %s",
                 chunk_start,
                 chunk_end,
                 len(rows),
+                len(printable_rows),
             )
             return len(rows)
 
@@ -549,12 +625,60 @@ class PolygonEventIndexer:
         block_numbers = sorted({hex_to_int(log.get("blockNumber", "0x0")) for log in logs})
         blocks = [await rpc.get_block(block_number) for block_number in block_numbers]
         block_map = {block.number: block for block in blocks}
+        tx_condition_ids = await self._load_tx_condition_ids(rpc, logs)
         rows: list[RawTransaction] = []
         for log in logs:
-            decoded = decode_log(log, block_map=block_map, topic_to_event=self._topic_to_event)
+            decoded = decode_log(
+                log,
+                block_map=block_map,
+                topic_to_event=self._topic_to_event,
+                tx_condition_ids=tx_condition_ids,
+            )
+            for row in decoded:
+                self._log_order_fill_sample(row)
             rows.extend(decoded)
         rows.sort(key=lambda row: (row.block_number, row.log_index, row.hash))
         return start_block, end_block, rows, blocks
+
+    async def _load_tx_condition_ids(
+        self, rpc: PolygonRpcClient, logs: Sequence[dict[str, Any]]
+    ) -> dict[str, str]:
+        order_filled_events = {"OrderFilledV2", "OrdersMatchedV2"}
+        tx_hashes = sorted(
+            {
+                str(log.get("transactionHash") or "")
+                for log in logs
+                if self._topic_to_event.get(first_topic(log)) in order_filled_events
+            }
+        )
+        tx_hashes = [tx_hash for tx_hash in tx_hashes if tx_hash]
+        condition_ids: dict[str, str] = {}
+        for tx_hash in tx_hashes:
+            try:
+                tx = await rpc.get_transaction(tx_hash)
+            except Exception as exc:  # noqa: BLE001 - missing tx input falls back to tokenId.
+                LOGGER.debug("Failed to load transaction %s for conditionId: %s", tx_hash, exc)
+                continue
+            condition_id = condition_id_from_tx_input(str((tx or {}).get("input") or ""))
+            if condition_id:
+                condition_ids[tx_hash] = condition_id
+        return condition_ids
+
+    def _log_order_fill_sample(self, row: RawTransaction) -> None:
+        if row.event_type != "OrderFilled":
+            return
+        if self._order_fill_samples_logged >= self.config.sample_log_limit:
+            return
+        self._order_fill_samples_logged += 1
+        LOGGER.info(
+            "OrderFilled sample: side=%s market_id=%s user=%s price=%.6f amount=%.6f tx=%s",
+            row.side,
+            row.market_id,
+            row.user_address,
+            row.price,
+            row.amount,
+            row.hash,
+        )
 
     async def _handle_reorg(self, rpc: PolygonRpcClient) -> None:
         recent = self.store.recent_blocks(limit=self.config.reorg_depth)
@@ -573,12 +697,63 @@ class PolygonEventIndexer:
         self.store.delete_from_block(cutoff)
         self.store.set_last_block(max(0, cutoff - 1), "")
 
+    async def _verify_contracts(self, rpc: PolygonRpcClient) -> None:
+        for contract in self.contracts:
+            code = await rpc.get_code(contract.normalized_address)
+            if code in ("0x", "0x0", ""):
+                raise RuntimeError(
+                    f"{contract.name} has no bytecode at {contract.normalized_address}"
+                )
+
+            if "exchange" not in contract.name.lower():
+                continue
+
+            probes = await self._exchange_probe_results(rpc, contract)
+            if not any(result for result in probes.values()):
+                raise RuntimeError(
+                    f"{contract.name} at {contract.normalized_address} did not respond "
+                    "to exchange probes getCtf()/owner()/getOracle(). Use --skip-contract-check "
+                    "only if this is expected."
+                )
+            LOGGER.info(
+                "Verified %s at %s via %s",
+                contract.name,
+                contract.normalized_address,
+                ", ".join(name for name, result in probes.items() if result),
+            )
+
+    async def _exchange_probe_results(
+        self, rpc: PolygonRpcClient, contract: ContractSpec
+    ) -> dict[str, bool]:
+        probes = {
+            GET_CTF_FUNCTION: function_selector(GET_CTF_FUNCTION),
+            "owner()": OWNER_SELECTOR,
+            GET_ORACLE_FUNCTION: function_selector(GET_ORACLE_FUNCTION),
+        }
+        results: dict[str, bool] = {}
+        for name, selector in probes.items():
+            if not selector:
+                results[name] = False
+                continue
+            try:
+                result = await rpc.eth_call(contract.normalized_address, selector)
+            except Exception as exc:  # noqa: BLE001 - probes are best effort.
+                LOGGER.debug("Probe %s failed for %s: %s", name, contract.name, exc)
+                results[name] = False
+                continue
+            results[name] = is_nonzero_eth_call_result(result)
+            if name == GET_CTF_FUNCTION and results[name]:
+                returned = decode_address_return(result)
+                results[name] = returned == CONDITIONAL_TOKENS_ADDRESS
+        return results
+
 
 def decode_log(
     log: dict[str, Any],
     *,
     block_map: dict[int, BlockInfo],
     topic_to_event: dict[str, str] | None = None,
+    tx_condition_ids: dict[str, str] | None = None,
 ) -> list[RawTransaction]:
     topics = [str(topic).lower() for topic in log.get("topics", [])]
     if not topics:
@@ -605,10 +780,15 @@ def decode_log(
         base_log_index=hex_to_int(log.get("logIndex", "0x0")),
         contract=normalize_address(str(log.get("address") or "")),
         event_type=event_type,
+        tx_condition_id=(tx_condition_ids or {}).get(str(log.get("transactionHash") or ""), ""),
     )
 
-    if event_type == "OrderFilled":
-        return [_decode_order_filled(context)]
+    if event_type == "OrderFilledV2":
+        return [_decode_order_filled_v2(context)]
+    if event_type == "OrdersMatchedV2":
+        return [_decode_orders_matched_v2(context)]
+    if event_type == "OrderFilledV1":
+        return [_decode_order_filled_v1(context)]
     if event_type == "OrderCancelled":
         return [_decode_order_cancelled(context)]
     if event_type == "TransferSingle":
@@ -633,6 +813,7 @@ class _LogContext:
     base_log_index: int
     contract: str
     event_type: str
+    tx_condition_id: str = ""
 
     def row(
         self,
@@ -666,7 +847,86 @@ class _LogContext:
         )
 
 
-def _decode_order_filled(context: _LogContext) -> RawTransaction:
+def _decode_order_filled_v2(context: _LogContext) -> RawTransaction:
+    topics = context.topics
+    words = decode_uint_words(str(context.log.get("data") or "0x"))
+    order_hash = topics[1] if len(topics) > 1 else ""
+    maker = topic_to_address(topics[2]) if len(topics) > 2 else ""
+    taker = topic_to_address(topics[3]) if len(topics) > 3 else ""
+    side_value = words[0] if len(words) > 0 else -1
+    token_id = words[1] if len(words) > 1 else 0
+    maker_amount = words[2] if len(words) > 2 else 0
+    taker_amount = words[3] if len(words) > 3 else 0
+    fee = words[4] if len(words) > 4 else 0
+    builder = int_to_bytes32(words[5]) if len(words) > 5 else ""
+    metadata = int_to_bytes32(words[6]) if len(words) > 6 else ""
+    side = side_from_order_side(side_value)
+    if side == "BUY":
+        price = ratio(maker_amount, taker_amount)
+        amount = scale_token_amount(taker_amount)
+    elif side == "SELL":
+        price = ratio(taker_amount, maker_amount)
+        amount = scale_token_amount(maker_amount)
+    else:
+        price = 0.0
+        amount = scale_token_amount(max(maker_amount, taker_amount))
+
+    condition_id = context.tx_condition_id
+    return context.row(
+        user_address=maker,
+        market_id=condition_id or str(token_id),
+        side=side,
+        price=price,
+        amount=amount,
+        event_type="OrderFilled",
+        extra={
+            "event_version": "v2",
+            "order_hash": order_hash,
+            "maker": maker,
+            "taker": taker,
+            "order_side": side_value,
+            "condition_id": condition_id,
+            "token_id": str(token_id),
+            "maker_amount_filled": str(maker_amount),
+            "taker_amount_filled": str(taker_amount),
+            "fee": str(fee),
+            "builder": builder,
+            "metadata": metadata,
+        },
+    )
+
+
+def _decode_orders_matched_v2(context: _LogContext) -> RawTransaction:
+    topics = context.topics
+    words = decode_uint_words(str(context.log.get("data") or "0x"))
+    order_hash = topics[1] if len(topics) > 1 else ""
+    maker = topic_to_address(topics[2]) if len(topics) > 2 else ""
+    side_value = words[0] if len(words) > 0 else -1
+    token_id = words[1] if len(words) > 1 else 0
+    maker_amount = words[2] if len(words) > 2 else 0
+    taker_amount = words[3] if len(words) > 3 else 0
+    side = side_from_order_side(side_value)
+    return context.row(
+        user_address=maker,
+        market_id=context.tx_condition_id or str(token_id),
+        side=side,
+        price=ratio(maker_amount, taker_amount) if side == "BUY" else ratio(taker_amount, maker_amount),
+        amount=scale_token_amount(taker_amount if side == "BUY" else maker_amount),
+        event_type="OrdersMatched",
+        extra={
+            "event_version": "v2",
+            "order_hash": order_hash,
+            "maker": maker,
+            "order_side": side_value,
+            "condition_id": context.tx_condition_id,
+            "token_id": str(token_id),
+            "maker_amount_filled": str(maker_amount),
+            "taker_amount_filled": str(taker_amount),
+        },
+    )
+
+
+def _decode_order_filled_v1(context: _LogContext) -> RawTransaction:
     topics = context.topics
     words = decode_uint_words(str(context.log.get("data") or "0x"))
     order_hash = topics[1] if len(topics) > 1 else ""
@@ -700,7 +960,9 @@ def _decode_order_filled(context: _LogContext) -> RawTransaction:
         side=side,
         price=price,
         amount=amount,
+        event_type="OrderFilled",
         extra={
+            "event_version": "v1",
             "order_hash": order_hash,
             "maker": maker,
             "taker": taker,
@@ -849,7 +1111,7 @@ def _decode_generic_order_placed(context: _LogContext) -> RawTransaction:
 
 
 def default_contract_specs() -> list[ContractSpec]:
-    exchange_events = ("OrderFilled", "OrderCancelled", "OrderPlaced")
+    exchange_events = ("OrderFilledV2", "OrdersMatchedV2", "OrderCancelled", "OrderPlaced")
     return [
         ContractSpec(
             name="ConditionalTokens",
@@ -865,16 +1127,6 @@ def default_contract_specs() -> list[ContractSpec]:
         ContractSpec(
             name="NegRiskCLOBExchange",
             address=NEG_RISK_CTF_EXCHANGE_ADDRESS,
-            event_names=exchange_events,
-        ),
-        ContractSpec(
-            name="CTFExchangeV2",
-            address=CTF_EXCHANGE_V2_ADDRESS,
-            event_names=exchange_events,
-        ),
-        ContractSpec(
-            name="NegRiskCTFExchangeV2",
-            address=NEG_RISK_CTF_EXCHANGE_V2_ADDRESS,
             event_names=exchange_events,
         ),
     ]
@@ -913,6 +1165,13 @@ def topic_for_event(event_name: str) -> str | None:
             "Cannot compute topic for %s. Install eth-hash[pycryptodome] or web3.",
             event_name,
         )
+        return None
+
+
+def function_selector(signature: str) -> str | None:
+    try:
+        return keccak_topic(signature)[:10]
+    except MissingIndexerDependencyError:
         return None
 
 
@@ -962,6 +1221,13 @@ def batched(items: Sequence[RawTransaction], batch_size: int) -> list[Sequence[R
     return [items[index : index + batch_size] for index in range(0, len(items), batch_size)]
 
 
+def first_topic(log: dict[str, Any]) -> str:
+    topics = log.get("topics", [])
+    if not topics:
+        return ""
+    return str(topics[0]).lower()
+
+
 def hex_to_int(value: Any) -> int:
     if value is None:
         return 0
@@ -987,6 +1253,25 @@ def topic_to_address(topic: str) -> str:
     if len(topic) < 42:
         return ""
     return "0x" + topic[-40:]
+
+
+def decode_address_return(value: str) -> str:
+    value = normalize_address(value)
+    if len(value) < 42:
+        return ""
+    return "0x" + value[-40:]
+
+
+def is_nonzero_eth_call_result(value: str) -> bool:
+    value = str(value or "0x").lower()
+    return value not in ("0x", "0x0") and bool(value.replace("0x", "").strip("0"))
+
+
+def condition_id_from_tx_input(data: str) -> str:
+    data = str(data or "")
+    if not data.startswith("0x") or len(data) < 74:
+        return ""
+    return "0x" + data[10:74].lower()
 
 
 def decode_uint_words(data: str) -> list[int]:
@@ -1035,6 +1320,14 @@ def ratio(numerator: int, denominator: int) -> float:
     return float(numerator) / float(denominator)
 
 
+def side_from_order_side(value: int) -> str:
+    if value == 0:
+        return "BUY"
+    if value == 1:
+        return "SELL"
+    return "UNKNOWN"
+
+
 def min_nonzero(left: int, right: int) -> int:
     values = [value for value in (left, right) if value > 0]
     return min(values) if values else 0
@@ -1077,6 +1370,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--sync", action="store_true", help="Continuously index new blocks.")
     parser.add_argument("--dry-run", action="store_true", help="Print decoded rows without writing.")
     parser.add_argument(
+        "--test",
+        action="store_true",
+        help="Index one block in dry-run mode and print up to 10 decoded events.",
+    )
+    parser.add_argument(
         "--batch-size",
         type=int,
         default=int(os.getenv("BATCH_SIZE", "1000")),
@@ -1086,6 +1384,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--max-workers",
         type=int,
         default=int(os.getenv("MAX_WORKERS", "6")),
+    )
+    parser.add_argument(
+        "--rpc-rps",
+        type=float,
+        default=float(os.getenv("RPC_RPS", "5")),
+        help="Max JSON-RPC request starts per second. Use 0 to disable throttling.",
     )
     parser.add_argument(
         "--chunk-size",
@@ -1098,6 +1402,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=int,
         default=int(os.getenv("POLYGON_START_BLOCK", "0")),
         help="Start block used when the database has no checkpoint.",
+    )
+    parser.add_argument(
+        "--skip-contract-check",
+        action="store_true",
+        help="Skip startup bytecode/getCtf()/owner()/getOracle() contract probes.",
+    )
+    parser.add_argument(
+        "--sample-log-limit",
+        type=int,
+        default=int(os.getenv("ORDER_FILLED_SAMPLE_LIMIT", "5")),
+        help="Number of decoded OrderFilled samples to log for side/market debugging.",
     )
     parser.add_argument("--log-level", default=os.getenv("LOG_LEVEL", "INFO"))
     return parser
@@ -1116,6 +1431,11 @@ def config_from_args(args: argparse.Namespace) -> IndexerConfig:
         block_chunk_size=max(1, int(args.chunk_size)),
         poll_seconds=float(args.poll_seconds),
         default_start_block=max(0, int(args.default_start_block)),
+        rpc_rps=max(0.0, float(args.rpc_rps)),
+        verify_contracts=not bool(args.skip_contract_check),
+        test=bool(args.test),
+        dry_run_print_limit=10 if bool(args.test) else None,
+        sample_log_limit=max(0, int(args.sample_log_limit)),
     )
 
 
