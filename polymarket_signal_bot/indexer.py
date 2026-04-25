@@ -79,6 +79,10 @@ class MissingIndexerDependencyError(RuntimeError):
     """Raised when an optional runtime dependency is missing."""
 
 
+class RpcExecutionReverted(RuntimeError):
+    """Raised for non-retryable eth_call execution reverts."""
+
+
 @dataclass(frozen=True)
 class IndexerConfig:
     rpc_url: str
@@ -384,8 +388,13 @@ class PolygonRpcClient:
                 response.raise_for_status()
                 body = response.json()
                 if "error" in body:
-                    raise RuntimeError(f"RPC error for {method}: {body['error']}")
+                    error = body["error"]
+                    if method == "eth_call" and isinstance(error, dict) and error.get("code") == 3:
+                        raise RpcExecutionReverted(f"RPC error for {method}: {error}")
+                    raise RuntimeError(f"RPC error for {method}: {error}")
                 return body.get("result")
+            except RpcExecutionReverted:
+                raise
             except Exception as exc:  # noqa: BLE001 - transient RPC failures are retried.
                 last_error = exc
                 delay = min(30.0, 0.5 * (2**attempt))
@@ -1446,6 +1455,8 @@ async def async_main(argv: Sequence[str] | None = None) -> int:
         level=getattr(logging, str(args.log_level).upper(), logging.INFO),
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
     config = config_from_args(args)
     indexer = PolygonEventIndexer(config)
     try:
