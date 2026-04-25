@@ -417,9 +417,11 @@ def _json_meta(value: dict[str, object]) -> str:
 
 
 def _auto_open_allowed(signal: Signal) -> bool:
+    if _reason_value(signal.reason, "learning_auto_open") == "0":
+        return False
     if "cohort=" not in signal.reason:
         return True
-    return "auto_open=1" in signal.reason
+    return _reason_value(signal.reason, "auto_open") == "1"
 
 
 def _has_open_position_for_asset(positions: list[PaperPosition], asset: str) -> bool:

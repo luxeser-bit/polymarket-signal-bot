@@ -14,6 +14,7 @@ from .policy_optimizer import policy_settings_from_recommendation
 from .scoring import score_wallets
 from .signals import SignalConfig, generate_signals
 from .storage import Store
+from .learning import wallet_outcome_lookup, wallet_outcome_report
 
 
 @dataclass(frozen=True)
@@ -41,6 +42,7 @@ class MonitorConfig:
     max_wallet_trades_per_day: float = 60.0
     min_cluster_wallets: int = 1
     min_cluster_notional: float = 0.0
+    use_learning_policy: bool = True
     max_total_exposure_pct: float = 0.65
     max_open_positions: int = 20
     max_new_positions_per_run: int = 6
@@ -256,11 +258,25 @@ class Monitor:
                 min_cluster_notional=self.config.min_cluster_notional,
                 use_cohort_policy=policy_enabled,
                 cohort_policy_mode=policy_mode,
+                use_learning_policy=self.config.use_learning_policy,
             ),
             order_books=order_books,
             wallet_cohorts=wallet_cohorts,
+            wallet_outcomes=wallet_outcome_lookup(
+                wallet_outcome_report(
+                    self.store,
+                    since_days=max(30, self.config.days),
+                    min_events=1,
+                    limit=50000,
+                )
+            )
+            if self.config.use_learning_policy
+            else {},
         )
-        self.store.set_runtime_state("signal_policy_active", f"enabled={int(policy_enabled)} mode={policy_mode}")
+        self.store.set_runtime_state(
+            "signal_policy_active",
+            f"enabled={int(policy_enabled)} mode={policy_mode} learning={int(self.config.use_learning_policy)}",
+        )
         created = self.store.insert_signals(signals)
         broker = PaperBroker(self.store, risk_config=self.risk_config(), exit_config=self.exit_config())
         broker.record_signal_created(signals)

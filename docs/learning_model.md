@@ -136,6 +136,12 @@ Outcome-aware wallet learning is available through `wallet-learning` and the
 DuckDB `v_wallet_outcome` view. It ranks wallet/category pairs by paper events,
 open/block behavior, realized PnL, hit rate, and risk-exit rate.
 
+Current signal generation uses this outcome-aware layer as a live adjustment.
+For each wallet/category pair, learning score changes signal confidence and
+paper position size. Pairs with enough weak/risky paper history can set
+`learning_auto_open=0`, which keeps the signal in manual-review/paper-only flow
+instead of automatically opening.
+
 This decision journal is the bridge from rule-based paper trading to adaptive
 learning.
 

@@ -142,6 +142,73 @@ class ScoringSignalTests(unittest.TestCase):
         self.assertEqual([position.wallet for position in opened], [stable_wallet])
         self.assertEqual([position.wallet for position in approved_opened], [watch_wallet])
 
+    def test_learning_policy_adjusts_signal_confidence_and_auto_open(self) -> None:
+        now = int(time.time())
+        good_wallet = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        bad_wallet = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        trades = [
+            Trade(
+                trade_id="learning-good",
+                proxy_wallet=good_wallet,
+                side="BUY",
+                asset="learning-good-asset",
+                condition_id="learning-good-cond",
+                size=400,
+                price=0.4,
+                timestamp=now,
+                title="Knicks vs Celtics",
+                outcome="Knicks",
+            ),
+            Trade(
+                trade_id="learning-bad",
+                proxy_wallet=bad_wallet,
+                side="BUY",
+                asset="learning-bad-asset",
+                condition_id="learning-bad-cond",
+                size=400,
+                price=0.4,
+                timestamp=now,
+                title="Knicks vs Celtics",
+                outcome="Celtics",
+            ),
+        ]
+        scores = {
+            good_wallet: self.wallet_score(good_wallet, 0.7, now),
+            bad_wallet: self.wallet_score(bad_wallet, 0.7, now),
+        }
+        outcomes = {
+            (good_wallet, "sports"): {
+                "learningScore": 0.82,
+                "events": 10,
+                "closed": 4,
+                "pnl": 12.0,
+                "blockedRate": 0.0,
+                "riskExitRate": 0.0,
+            },
+            (bad_wallet, "sports"): {
+                "learningScore": 0.10,
+                "events": 10,
+                "closed": 3,
+                "pnl": -9.0,
+                "blockedRate": 0.2,
+                "riskExitRate": 0.8,
+            },
+        }
+
+        signals = generate_signals(
+            trades,
+            scores,
+            SignalConfig(bankroll=200, min_wallet_score=0.5, min_trade_usdc=50),
+            wallet_outcomes=outcomes,
+            now=now,
+        )
+        by_wallet = {signal.wallet: signal for signal in signals}
+
+        self.assertGreater(by_wallet[good_wallet].confidence, by_wallet[bad_wallet].confidence)
+        self.assertGreater(by_wallet[good_wallet].size_usdc, by_wallet[bad_wallet].size_usdc)
+        self.assertIn("learning_score=0.820", by_wallet[good_wallet].reason)
+        self.assertIn("learning_auto_open=0", by_wallet[bad_wallet].reason)
+
     def test_paper_broker_blocks_new_positions_when_exposure_cap_is_hit(self) -> None:
         now = int(time.time())
         wallet = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"

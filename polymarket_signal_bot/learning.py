@@ -55,6 +55,14 @@ def format_wallet_outcome_summary(report: dict[str, Any]) -> str:
     )
 
 
+def wallet_outcome_lookup(report: dict[str, Any]) -> dict[tuple[str, str], dict[str, Any]]:
+    return {
+        (str(row["wallet"]), str(row["category"])): row
+        for row in report.get("wallets", [])
+        if row.get("wallet") and row.get("category")
+    }
+
+
 def _empty_group(wallet: str, category: str) -> dict[str, Any]:
     return {
         "wallet": wallet,

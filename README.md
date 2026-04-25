@@ -189,6 +189,9 @@ python -m polymarket_signal_bot run-once --leaderboard-limit 50 --days 7 --bankr
   depth, and liquidity can be analyzed over time instead of only as latest state.
 - Outcome-aware wallet learning ranks wallet/category pairs by paper decisions,
   realized PnL, hit rate, blocked rate, and risk-exit rate.
+- Signal generation uses outcome-aware wallet learning as a live adjustment:
+  profitable wallet/category pairs get larger, higher-confidence paper signals,
+  while weak or risky pairs are reduced or routed to manual review.
 
 ## Roadmap status
 
@@ -243,6 +246,9 @@ Done:
   and liquidity snapshots from each book sync and exports them into DuckDB.
 - Wallet learning v1: `wallet-learning` ranks wallet/category outcomes from the
   paper decision journal for adaptive wallet scoring.
+- Learning-adjusted signals v1: `scan`, dashboard scan, and monitor feed
+  wallet/category paper outcomes back into signal confidence, position size, and
+  auto-open gating.
 
 Partial:
 
@@ -257,8 +263,8 @@ Partial:
 
 Next:
 
-- Feed outcome-aware wallet stats back into wallet scoring instead of only
-  reporting them.
+- Build a feature table for future ML labels using signal, liquidity, cohort,
+  learning-adjustment, and paper-outcome fields.
 - Accumulate deeper multi-day market-flow history before trusting cohort-policy
   backtest deltas.
 - Add an approval inbox action in the dashboard instead of CLI-only approval.

@@ -7,6 +7,7 @@ from collections import defaultdict
 from dataclasses import dataclass
 
 from .models import OrderBookSnapshot, Signal, Trade, WalletScore
+from .taxonomy import market_category
 
 
 @dataclass(frozen=True)
@@ -34,6 +35,7 @@ class SignalConfig:
     min_cluster_notional: float = 0.0
     use_cohort_policy: bool = True
     cohort_policy_mode: str = "strict"
+    use_learning_policy: bool = True
 
 
 def generate_signals(
@@ -43,11 +45,13 @@ def generate_signals(
     *,
     order_books: dict[str, OrderBookSnapshot] | None = None,
     wallet_cohorts: dict[str, dict[str, object]] | None = None,
+    wallet_outcomes: dict[tuple[str, str], dict[str, object]] | None = None,
     now: int | None = None,
 ) -> list[Signal]:
     now = now or int(time.time())
     order_books = order_books or {}
     wallet_cohorts = wallet_cohorts or {}
+    wallet_outcomes = wallet_outcomes or {}
     cutoff = now - config.lookback_minutes * 60
     candidates = []
     for trade in recent_trades:
@@ -70,6 +74,7 @@ def generate_signals(
             continue
         if total_notional < config.min_cluster_notional:
             continue
+        category = market_category(trade)
         book = order_books.get(trade.asset)
         liquidity_score = book.liquidity_score if book else 0.5
         reference_price = book.best_ask if book and book.best_ask > 0 else trade.price
@@ -88,7 +93,14 @@ def generate_signals(
             mode=config.cohort_policy_mode,
             book=book,
         )
-        confidence = max(0.0, min(1.0, confidence + cohort_policy["confidence_delta"]))
+        learning_policy = _learning_policy(
+            wallet_outcomes.get((trade.proxy_wallet, category)),
+            enabled=config.use_learning_policy and bool(wallet_outcomes),
+        )
+        confidence = max(
+            0.0,
+            min(1.0, confidence + cohort_policy["confidence_delta"] + learning_policy["confidence_delta"]),
+        )
         suggested_price = min(
             config.max_entry_price,
             reference_price * (1 + config.slippage_bps / 10000),
@@ -101,6 +113,7 @@ def generate_signals(
             config.bankroll * config.risk_per_signal * (0.55 + confidence / 2),
         )
         size_usdc *= cohort_policy["size_multiplier"]
+        size_usdc *= learning_policy["size_multiplier"]
         if size_usdc < config.min_position_usdc:
             continue
 
@@ -113,7 +126,11 @@ def generate_signals(
             f"policy={cohort_policy['mode']}; "
             f"cohort={cohort_policy['status']}; stability={cohort_policy['stability']:.3f}; "
             f"priority={cohort_policy['priority']}; auto_open={cohort_policy['auto_open']}; "
-            f"size_mult={cohort_policy['size_multiplier']:.2f}"
+            f"size_mult={cohort_policy['size_multiplier']:.2f}; "
+            f"learning_category={category}; learning_score={learning_policy['score']:.3f}; "
+            f"learning_events={learning_policy['events']}; learning_delta={learning_policy['confidence_delta']:.3f}; "
+            f"learning_size_mult={learning_policy['size_multiplier']:.2f}; "
+            f"learning_auto_open={learning_policy['auto_open']}"
         )
         signal = Signal(
             signal_id=_signal_id(trade.trade_id, now, suggested_price),
@@ -316,6 +333,55 @@ def _cohort_policy(
         "priority": 90,
         "auto_open": 0,
     }
+
+
+def _learning_policy(outcome: dict[str, object] | None, *, enabled: bool) -> dict[str, object]:
+    if not enabled or not outcome:
+        return {
+            "score": 0.5,
+            "events": 0,
+            "size_multiplier": 1.0,
+            "confidence_delta": 0.0,
+            "auto_open": 1,
+        }
+    score = _float_value(outcome.get("learningScore"), 0.5)
+    events = int(_float_value(outcome.get("events"), 0.0))
+    closed = int(_float_value(outcome.get("closed"), 0.0))
+    pnl = _float_value(outcome.get("pnl"), 0.0)
+    blocked_rate = _float_value(outcome.get("blockedRate"), 0.0)
+    risk_exit_rate = _float_value(outcome.get("riskExitRate"), 0.0)
+    credibility = min(1.0, max(0.0, events / 8.0))
+    confidence_delta = (score - 0.5) * 0.18 * credibility
+    size_multiplier = 1.0 + (score - 0.5) * 0.55 * credibility
+    auto_open = 1
+    if events >= 4 and blocked_rate >= 0.80:
+        confidence_delta -= 0.03
+        size_multiplier *= 0.92
+    if closed >= 2 and risk_exit_rate >= 0.65:
+        confidence_delta -= 0.05
+        size_multiplier *= 0.82
+        auto_open = 0
+    if closed >= 2 and pnl < 0:
+        confidence_delta -= 0.03
+        size_multiplier *= 0.90
+    if events >= 6 and score < 0.20:
+        auto_open = 0
+    return {
+        "score": max(0.0, min(1.0, score)),
+        "events": events,
+        "size_multiplier": max(0.55, min(1.20, size_multiplier)),
+        "confidence_delta": max(-0.12, min(0.09, confidence_delta)),
+        "auto_open": auto_open,
+    }
+
+
+def _float_value(value: object, default: float = 0.0) -> float:
+    try:
+        if value is None or value == "":
+            return default
+        return float(value)
+    except (TypeError, ValueError):
+        return default
 
 
 def _normalize_policy_mode(value: str) -> str:

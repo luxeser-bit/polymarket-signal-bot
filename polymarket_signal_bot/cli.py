@@ -25,7 +25,7 @@ from .bulk_sync import BulkSync, BulkSyncConfig
 from .cohorts import CohortConfig, format_cohort_summary, wallet_cohort_report
 from .dashboard import serve_dashboard
 from .demo import demo_trades, demo_wallets
-from .learning import format_wallet_outcome_summary, wallet_outcome_report
+from .learning import format_wallet_outcome_summary, wallet_outcome_lookup, wallet_outcome_report
 from .market_flow import MarketFlowConfig, format_market_flow_summary, sync_market_flow
 from .monitor import Monitor, MonitorConfig
 from .models import OrderBookSnapshot, Trade, Wallet
@@ -267,6 +267,7 @@ def build_parser() -> argparse.ArgumentParser:
     monitor.add_argument("--max-wallet-trades-per-day", type=float, default=60.0)
     monitor.add_argument("--min-cluster-wallets", type=int, default=1)
     monitor.add_argument("--min-cluster-notional", type=float, default=0.0)
+    monitor.add_argument("--no-learning-policy", action="store_true")
     monitor.add_argument("--max-total-exposure-pct", type=float, default=0.65)
     monitor.add_argument("--max-open-positions", type=int, default=20)
     monitor.add_argument("--max-new-positions-per-run", type=int, default=6)
@@ -315,6 +316,7 @@ def add_signal_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--max-wallet-trades-per-day", type=float, default=60.0)
     parser.add_argument("--min-cluster-wallets", type=int, default=1)
     parser.add_argument("--min-cluster-notional", type=float, default=0.0)
+    parser.add_argument("--no-learning-policy", action="store_true")
     parser.add_argument("--max-total-exposure-pct", type=float, default=0.65)
     parser.add_argument("--max-open-positions", type=int, default=20)
     parser.add_argument("--max-new-positions-per-run", type=int, default=6)
@@ -1139,6 +1141,7 @@ def cmd_monitor(args: argparse.Namespace) -> int:
         max_wallet_trades_per_day=args.max_wallet_trades_per_day,
         min_cluster_wallets=args.min_cluster_wallets,
         min_cluster_notional=args.min_cluster_notional,
+        use_learning_policy=not args.no_learning_policy,
         max_total_exposure_pct=args.max_total_exposure_pct,
         max_open_positions=args.max_open_positions,
         max_new_positions_per_run=args.max_new_positions_per_run,
@@ -1207,6 +1210,7 @@ def run_scan(args: argparse.Namespace, store: Store):
         min_cluster_notional=args.min_cluster_notional,
         use_cohort_policy=policy_enabled,
         cohort_policy_mode=policy_mode,
+        use_learning_policy=not bool(getattr(args, "no_learning_policy", False)),
     )
     wallet_cohorts = {}
     if policy_enabled:
@@ -1220,9 +1224,19 @@ def run_scan(args: argparse.Namespace, store: Store):
             ),
         )
         wallet_cohorts = {str(item["wallet"]): item for item in cohort_report["wallets"]}
+    learning_enabled = not bool(getattr(args, "no_learning_policy", False))
+    wallet_outcomes = {}
+    if learning_enabled:
+        outcome_report = wallet_outcome_report(
+            store,
+            since_days=max(30, getattr(args, "history_days", 14)),
+            min_events=1,
+            limit=50000,
+        )
+        wallet_outcomes = wallet_outcome_lookup(outcome_report)
     store.set_runtime_state(
         "signal_policy_active",
-        f"enabled={int(policy_enabled)} mode={policy_mode}",
+        f"enabled={int(policy_enabled)} mode={policy_mode} learning={int(learning_enabled)}",
     )
     signals = generate_signals(
         recent_trades,
@@ -1230,6 +1244,7 @@ def run_scan(args: argparse.Namespace, store: Store):
         config,
         order_books=order_books,
         wallet_cohorts=wallet_cohorts,
+        wallet_outcomes=wallet_outcomes,
     )
     store.insert_signals(signals)
     broker = PaperBroker(store, risk_config=_risk_config_from_args(args), exit_config=_exit_config_from_args(args))

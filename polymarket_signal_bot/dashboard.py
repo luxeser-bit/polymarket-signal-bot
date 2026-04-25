@@ -13,7 +13,7 @@ from .analytics import DEFAULT_DUCKDB_PATH
 from .bulk_sync import TARGET_TRADES, TARGET_WALLETS
 from .cohorts import CohortConfig, wallet_cohort_report
 from .demo import demo_trades, demo_wallets
-from .learning import format_wallet_outcome_summary, wallet_outcome_report
+from .learning import format_wallet_outcome_summary, wallet_outcome_lookup, wallet_outcome_report
 from .paper import PaperBroker
 from .policy_optimizer import policy_settings_from_recommendation
 from .scoring import score_wallets
@@ -227,6 +227,7 @@ def _run_default_scan(store: Store) -> int:
             CohortConfig(history_days=14, min_trades=1, min_notional=1, limit=max(100, len(wallets))),
         )
         wallet_cohorts = {str(item["wallet"]): item for item in cohort_report["wallets"]}
+    outcome_report = wallet_outcome_report(store, since_days=90, min_events=1, limit=50000)
     signals = generate_signals(
         recent_trades,
         score_map,
@@ -240,8 +241,9 @@ def _run_default_scan(store: Store) -> int:
             cohort_policy_mode=policy_mode,
         ),
         wallet_cohorts=wallet_cohorts,
+        wallet_outcomes=wallet_outcome_lookup(outcome_report),
     )
-    store.set_runtime_state("signal_policy_active", f"enabled={int(policy_enabled)} mode={policy_mode}")
+    store.set_runtime_state("signal_policy_active", f"enabled={int(policy_enabled)} mode={policy_mode} learning=1")
     store.insert_signals(signals)
     broker = PaperBroker(store)
     broker.record_signal_created(signals)
