@@ -36,8 +36,9 @@ DEFAULT_LOG_PATH = ROOT / "data" / "streamlit_live_paper.log"
 DEFAULT_TRAINER_LOG_PATH = ROOT / "data" / "auto_trainer_dashboard.log"
 DEFAULT_BANKROLL = 200.0
 INDEXER_TARGET_RECORDS = 86_000_000
-INDEXER_REFRESH_SECONDS = 3.0
+INDEXER_REFRESH_SECONDS = 1.0
 INDEXER_STALE_SECONDS = 120.0
+TAB_KEYS = ("overview", "scan", "paper", "indexer")
 
 
 def main() -> None:
@@ -52,26 +53,21 @@ def main() -> None:
     state = _terminal_state(main_db, state_db)
 
     _render_terminal_header(state)
-    overview_tab, scan_tab, paper_tab, indexer_tab = st.tabs(
-        ["Overview", "Scan", "Paper Trading", "Indexer"]
-    )
+    active_tab = _render_dashboard_tabs(indexer_db)
 
-    with overview_tab:
+    if active_tab == "overview":
         _render_terminal_actions(main_db, state_db)
         state = _terminal_state(main_db, state_db)
         _render_terminal_shell(state)
         _render_equity_chart(state_db)
-
-    with scan_tab:
+    elif active_tab == "scan":
         _render_scan_tab(main_db, state)
-
-    with paper_tab:
+    elif active_tab == "paper":
         _render_paper_tab(main_db, state_db, state)
-
-    with indexer_tab:
+    elif active_tab == "indexer":
         _render_indexer_tab(indexer_db)
 
-    if _paper_process_running() or _retrain_process_running(show_error=False):
+    if active_tab != "indexer" and _paper_process_running():
         time.sleep(2)
         st.rerun()
 
@@ -107,6 +103,45 @@ def _render_terminal_header(state: dict[str, Any]) -> None:
         """,
         unsafe_allow_html=True,
     )
+
+
+def _render_dashboard_tabs(indexer_db: Path) -> str:
+    active = _active_tab_from_query()
+    live = _indexer_update_active(indexer_db)
+    labels = _dashboard_tab_labels(indexer_live=live)
+    items = []
+    for key in TAB_KEYS:
+        active_class = " active" if key == active else ""
+        items.append(
+            f"<a class='dashboard-tab{active_class}' href='?tab={key}'>{labels[key]}</a>"
+        )
+    st.markdown(
+        "<nav class='dashboard-tabs'>" + "".join(items) + "</nav>",
+        unsafe_allow_html=True,
+    )
+    return active
+
+
+def _dashboard_tab_labels(*, indexer_live: bool) -> dict[str, str]:
+    live = " <span class='live-dot'>● Live</span>" if indexer_live else ""
+    return {
+        "overview": "Overview",
+        "scan": "Scan",
+        "paper": "Paper Trading",
+        "indexer": f"Indexer{live}",
+    }
+
+
+def _active_tab_from_query() -> str:
+    try:
+        raw_value = st.query_params.get("tab", "overview")
+    except Exception:  # noqa: BLE001 - compatibility with older Streamlit.
+        raw_params = st.experimental_get_query_params()
+        raw_value = raw_params.get("tab", ["overview"])
+    if isinstance(raw_value, list):
+        raw_value = raw_value[0] if raw_value else "overview"
+    value = str(raw_value or "overview").lower()
+    return value if value in TAB_KEYS else "overview"
 
 
 def _render_terminal_actions(main_db: Path, state_db: Path) -> None:
@@ -273,13 +308,17 @@ def _render_indexer_tab(indexer_db: Path) -> None:
 
     if manual_refresh:
         st.rerun()
-    if snapshot["running"] or snapshot["has_data"] or _retrain_process_running(show_error=False):
+    if snapshot["update_active"] or snapshot["retrain_running"]:
         time.sleep(INDEXER_REFRESH_SECONDS)
         st.rerun()
 
 
 def _render_indexer_snapshot(indexer_db: Path, snapshot: dict[str, Any], speed: float) -> None:
-    st.markdown("<div class='equity-title'>INDEXER // POLYGON RAW TRANSACTIONS</div>", unsafe_allow_html=True)
+    live = " <span class='live-dot'>● Live</span>" if snapshot["update_active"] or snapshot["retrain_running"] else ""
+    st.markdown(
+        f"<div class='equity-title'>INDEXER // POLYGON RAW TRANSACTIONS{live}</div>",
+        unsafe_allow_html=True,
+    )
     if not snapshot["db_exists"]:
         st.info(f"Indexer DB not found: {indexer_db}")
         if snapshot["running"]:
@@ -843,6 +882,10 @@ def _indexer_db_path() -> Path:
     return path if path.is_absolute() else ROOT / path
 
 
+def _indexer_update_active(_db_path: Path) -> bool:
+    return _indexer_process_running()
+
+
 def _indexer_snapshot(db_path: Path) -> dict[str, Any]:
     running = _indexer_process_running()
     snapshot = {
@@ -852,6 +895,8 @@ def _indexer_snapshot(db_path: Path) -> dict[str, Any]:
         "last_block": 0,
         "updated_at": 0,
         "running": running,
+        "update_active": running,
+        "recent_checkpoint": False,
         "retrain_running": _retrain_process_running(show_error=False),
         "last_training_at": 0,
         "last_training_ok": None,
@@ -900,7 +945,7 @@ def _indexer_snapshot(db_path: Path) -> dict[str, Any]:
         snapshot.update(training)
         snapshot["has_data"] = bool(snapshot["records"] or snapshot["last_block"])
         if snapshot["updated_at"]:
-            snapshot["running"] = running or (time.time() - int(snapshot["updated_at"]) <= INDEXER_STALE_SECONDS)
+            snapshot["recent_checkpoint"] = time.time() - int(snapshot["updated_at"]) <= INDEXER_STALE_SECONDS
         return snapshot
     except Exception:  # noqa: BLE001 - dashboard should stay up if the DB is mid-write.
         snapshot["schema_ready"] = False
@@ -1090,12 +1135,15 @@ def _inject_style() -> None:
         }
         header[data-testid="stHeader"], #MainMenu, footer {display:none;}
         .block-container {max-width:none; padding:14px 14px 8px;}
-        .stTabs [data-baseweb="tab-list"] {gap:8px; border-bottom:1px solid var(--line-soft); margin-top:10px;}
-        .stTabs [data-baseweb="tab"] {
-          height:38px; border:1px solid var(--line-soft); background:rgba(3,13,17,.88);
-          color:var(--muted); border-radius:0; padding:0 14px; font-family:"Cascadia Mono",Consolas,"Courier New",monospace; font-weight:800;
+        .dashboard-tabs {display:flex; gap:8px; border-bottom:1px solid var(--line-soft); margin-top:10px; padding-bottom:8px;}
+        .dashboard-tab {
+          height:38px; display:flex; align-items:center; border:1px solid var(--line-soft); background:rgba(3,13,17,.88);
+          color:var(--muted); border-radius:0; padding:0 14px; font-family:"Cascadia Mono",Consolas,"Courier New",monospace;
+          font-weight:800; text-decoration:none;
         }
-        .stTabs [aria-selected="true"] {color:var(--hot) !important; border-color:var(--line) !important; box-shadow:0 0 12px rgba(53,230,242,.16);}
+        .dashboard-tab:hover {color:var(--hot); border-color:var(--line);}
+        .dashboard-tab.active {color:var(--hot); border-color:var(--line); box-shadow:0 0 12px rgba(53,230,242,.16);}
+        .live-dot {color:#37ff7d; font-weight:900; text-shadow:0 0 8px rgba(55,255,125,.72);}
         .terminal-shell {position:relative; color:var(--text); font-family:"Cascadia Mono",Consolas,"Courier New",monospace; font-size:13px;}
         .terminal-shell::before {
           content:""; position:fixed; inset:0; pointer-events:none;
@@ -1158,7 +1206,7 @@ def _inject_style() -> None:
         .indexer-progress {margin:0 12px 12px; height:12px;}
         .indexer-path {padding:0 12px 14px; color:var(--muted); overflow:hidden; text-overflow:ellipsis; white-space:nowrap;}
         .empty {padding:22px 4px; color:var(--dim);}
-        @media (max-width:1080px) {.topbar,.cyclebar{grid-template-columns:1fr}.topline{justify-content:flex-start;flex-wrap:wrap}.metrics{grid-template-columns:repeat(2,minmax(130px,1fr))}.grid,.scan-grid,.paper-grid{grid-template-columns:1fr;grid-template-rows:none}.panel,.curve,.depth,.risk,.votes,.exits,.whales,.reviews,.scale,.alerts{grid-column:auto;grid-row:auto;min-height:280px}}
+        @media (max-width:1080px) {.topbar,.cyclebar{grid-template-columns:1fr}.topline{justify-content:flex-start;flex-wrap:wrap}.dashboard-tabs{flex-wrap:wrap}.metrics{grid-template-columns:repeat(2,minmax(130px,1fr))}.grid,.scan-grid,.paper-grid{grid-template-columns:1fr;grid-template-rows:none}.panel,.curve,.depth,.risk,.votes,.exits,.whales,.reviews,.scale,.alerts{grid-column:auto;grid-row:auto;min-height:280px}}
         </style>
         """,
         unsafe_allow_html=True,

@@ -110,7 +110,8 @@ class StreamlitDashboardIndexerTests(unittest.TestCase):
         self.assertTrue(snapshot["schema_ready"])
         self.assertEqual(snapshot["records"], 1)
         self.assertEqual(snapshot["last_block"], 12345)
-        self.assertTrue(snapshot["running"])
+        self.assertFalse(snapshot["running"])
+        self.assertTrue(snapshot["recent_checkpoint"])
         self.assertTrue(snapshot["last_training_ok"])
         self.assertEqual(snapshot["training_scored_wallets"], 2)
         self.assertEqual(snapshot["exit_examples"], 7)
@@ -130,6 +131,19 @@ class StreamlitDashboardIndexerTests(unittest.TestCase):
         )
 
         self.assertGreater(speed, 2.0)
+
+    def test_indexer_live_label_is_conditional(self) -> None:
+        live_labels = dashboard._dashboard_tab_labels(indexer_live=True)
+        idle_labels = dashboard._dashboard_tab_labels(indexer_live=False)
+
+        self.assertIn("● Live", live_labels["indexer"])
+        self.assertNotIn("● Live", idle_labels["indexer"])
+
+    def test_indexer_update_active_follows_process_state(self) -> None:
+        with patch.object(dashboard, "_indexer_process_running", return_value=False):
+            self.assertFalse(dashboard._indexer_update_active(Path("missing.db")))
+        with patch.object(dashboard, "_indexer_process_running", return_value=True):
+            self.assertTrue(dashboard._indexer_update_active(Path("missing.db")))
 
 
 if __name__ == "__main__":
