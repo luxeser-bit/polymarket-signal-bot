@@ -1,14 +1,21 @@
 from __future__ import annotations
 
+import json
+import pickle
+import sqlite3
+import threading
 import time
 from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
 
 from .alerts import TelegramConfig, TelegramNotifier
 from .analytics import DEFAULT_DUCKDB_PATH, refresh_analytics_snapshot
 from .api import ApiError, PolymarketClient
-from .cohorts import CohortConfig, wallet_cohort_report
+from .auto_trainer import run_full_training_cycle
+from .cohorts import CohortConfig, load_wallet_cohorts, wallet_cohort_report
 from .market_flow import MarketFlowConfig, sync_market_flow
-from .models import OrderBookSnapshot, Trade, Wallet
+from .models import OrderBookSnapshot, Trade, Wallet, WalletScore
 from .paper import ExitConfig, PaperBroker, RiskConfig
 from .policy_optimizer import policy_settings_from_recommendation
 from .scoring import score_wallets
@@ -64,6 +71,13 @@ class MonitorConfig:
     analytics_duckdb_path: str = str(DEFAULT_DUCKDB_PATH)
     analytics_chunk_size: int = 50000
     analytics_rebuild: bool = False
+    auto_retrain: bool = True
+    retrain_interval_hours: float = 24.0
+    retrain_min_new_records: int = 0
+    training_db_path: str = "data/indexer.db"
+    exit_model_path: str = "data/exit_model.pkl"
+    exit_stats_path: str = "data/exit_stats.json"
+    policy_path: str = "data/best_policy.json"
 
 
 class Monitor:
@@ -79,10 +93,17 @@ class Monitor:
         self.client = client or PolymarketClient()
         self.config = config or MonitorConfig()
         self.notifier = TelegramNotifier(telegram or TelegramConfig())
+        self.cohorts: dict[str, dict[str, Any]] = {}
+        self.exit_model: dict[str, Any] | None = None
+        self._retrain_thread: threading.Thread | None = None
+        self._last_retrain_started_at = 0.0
+        self._last_retrain_summary: dict[str, Any] = {}
+        self._refresh_training_artifacts()
 
     def run(self) -> None:
         self.store.init_schema()
         self.store.set_runtime_state("monitor_status", "starting")
+        self._maybe_schedule_retrain()
         iteration = 0
         while True:
             iteration += 1
@@ -107,6 +128,7 @@ class Monitor:
                 self.store.set_runtime_state("monitor_status", "stopped")
                 return
 
+            self._maybe_schedule_retrain()
             elapsed = int(time.time()) - started_at
             sleep_for = max(1, self.config.interval_seconds - elapsed)
             time.sleep(sleep_for)
@@ -154,6 +176,175 @@ class Monitor:
             f"books={books_synced} signals={signals_created} opened={positions_opened} "
             f"closed={positions_closed} risk={risk_status} alerts={alerts_sent}{market_flow_status}{analytics_status}"
         )
+
+    def retrain(self, *, force: bool = True, wait: bool = False) -> dict[str, Any]:
+        if self._retrain_thread and self._retrain_thread.is_alive():
+            return {"started": False, "reason": "already_running"}
+        self._last_retrain_started_at = time.time()
+        self._last_retrain_summary = {"started": True, "status": "running"}
+        self._set_runtime_state_safe("auto_trainer_status", "running")
+        thread = threading.Thread(target=self._run_training_cycle, args=(force,), daemon=True)
+        self._retrain_thread = thread
+        thread.start()
+        if wait:
+            thread.join()
+            return self._last_retrain_summary
+        return {"started": True, "status": "running"}
+
+    def _maybe_schedule_retrain(self) -> None:
+        if not self.config.auto_retrain:
+            return
+        if self._retrain_thread and self._retrain_thread.is_alive():
+            return
+        if not self._training_db_has_data():
+            return
+        now = time.time()
+        interval = max(1.0, self.config.retrain_interval_hours) * 3600
+        last_started = max(self._last_retrain_started_at, float(self._last_training_at()))
+        if last_started <= 0 or now - last_started >= interval:
+            self.retrain(force=False, wait=False)
+
+    def _run_training_cycle(self, force: bool) -> None:
+        try:
+            summary = run_full_training_cycle(
+                db_path=self.config.training_db_path,
+                model_path=self.config.exit_model_path,
+                stats_path=self.config.exit_stats_path,
+                policy_path=self.config.policy_path,
+                min_new_records=self.config.retrain_min_new_records,
+                force=force,
+            )
+            self._last_retrain_summary = summary
+            self._refresh_training_artifacts()
+            status = "ok" if summary.get("ok") else "error"
+            if summary.get("skipped"):
+                status = "skipped"
+            self._set_runtime_state_safe("auto_trainer_status", status)
+            self._set_runtime_state_safe(
+                "auto_trainer_last_summary",
+                json.dumps(summary, ensure_ascii=False, sort_keys=True),
+            )
+        except Exception as exc:  # noqa: BLE001 - keep monitor signal loop alive.
+            summary = {"ok": False, "error": str(exc)[:500]}
+            self._last_retrain_summary = summary
+            self._set_runtime_state_safe("auto_trainer_status", "error")
+            self._set_runtime_state_safe(
+                "auto_trainer_last_summary",
+                json.dumps(summary, ensure_ascii=False, sort_keys=True),
+            )
+
+    def _refresh_training_artifacts(self) -> None:
+        self.cohorts = load_wallet_cohorts(
+            self.config.training_db_path,
+            statuses={"STABLE", "CANDIDATE"},
+            limit=100_000,
+        )
+        self.exit_model = self._load_exit_model()
+
+    def _load_exit_model(self) -> dict[str, Any] | None:
+        path = Path(self.config.exit_model_path)
+        if not path.exists():
+            return None
+        try:
+            with path.open("rb") as handle:
+                model = pickle.load(handle)
+        except Exception:  # noqa: BLE001 - a bad model file must not stop monitoring.
+            return None
+        return model if isinstance(model, dict) else {"type": type(model).__name__, "model": model}
+
+    def _indexed_score_map(self, *, min_score: float) -> dict[str, WalletScore]:
+        path = Path(self.config.training_db_path)
+        if not path.exists():
+            return {}
+        try:
+            uri = f"{path.resolve().as_uri()}?mode=ro"
+            conn = sqlite3.connect(uri, uri=True, timeout=30)
+            try:
+                conn.row_factory = sqlite3.Row
+                if not _table_exists(conn, "scored_wallets"):
+                    return {}
+                rows = conn.execute(
+                    """
+                    SELECT wallet, score, computed_at, trade_count, buy_count, sell_count,
+                           volume, avg_trade_size, active_days, market_count, pnl,
+                           profit_factor, win_rate, max_drawdown, reason
+                    FROM scored_wallets
+                    WHERE score >= ?
+                    """,
+                    (min_score,),
+                ).fetchall()
+            finally:
+                conn.close()
+        except sqlite3.Error:
+            return {}
+        return {
+            str(row["wallet"]): WalletScore(
+                wallet=str(row["wallet"]),
+                score=float(row["score"] or 0.0),
+                computed_at=int(row["computed_at"] or 0),
+                trade_count=int(row["trade_count"] or 0),
+                buy_count=int(row["buy_count"] or 0),
+                sell_count=int(row["sell_count"] or 0),
+                total_notional=float(row["volume"] or 0.0),
+                avg_notional=float(row["avg_trade_size"] or 0.0),
+                active_days=int(row["active_days"] or 0),
+                market_count=int(row["market_count"] or 0),
+                leaderboard_pnl=float(row["pnl"] or 0.0),
+                leaderboard_volume=float(row["volume"] or 0.0),
+                pnl_efficiency=float(row["pnl"] or 0.0) / max(1.0, float(row["volume"] or 0.0)),
+                reason=str(row["reason"] or ""),
+                repeatability_score=float(row["win_rate"] or 0.0),
+                drawdown_score=max(
+                    0.0,
+                    1.0 - float(row["max_drawdown"] or 0.0) / max(1.0, float(row["volume"] or 0.0)),
+                ),
+            )
+            for row in rows
+        }
+
+    def _training_db_has_data(self) -> bool:
+        path = Path(self.config.training_db_path)
+        if not path.exists():
+            return False
+        try:
+            uri = f"{path.resolve().as_uri()}?mode=ro"
+            conn = sqlite3.connect(uri, uri=True, timeout=5)
+            try:
+                if not _table_exists(conn, "raw_transactions"):
+                    return False
+                row = conn.execute("SELECT 1 FROM raw_transactions LIMIT 1").fetchone()
+                return row is not None
+            finally:
+                conn.close()
+        except sqlite3.Error:
+            return False
+
+    def _last_training_at(self) -> int:
+        path = Path(self.config.training_db_path)
+        if not path.exists():
+            return 0
+        try:
+            uri = f"{path.resolve().as_uri()}?mode=ro"
+            conn = sqlite3.connect(uri, uri=True, timeout=5)
+            try:
+                if not _table_exists(conn, "training_runs"):
+                    return 0
+                row = conn.execute(
+                    "SELECT started_at FROM training_runs WHERE ok = 1 ORDER BY started_at DESC LIMIT 1"
+                ).fetchone()
+                return int(row[0] or 0) if row else 0
+            finally:
+                conn.close()
+        except sqlite3.Error:
+            return 0
+
+    def _set_runtime_state_safe(self, key: str, value: str) -> None:
+        try:
+            with Store(self.store.path) as store:
+                store.init_schema()
+                store.set_runtime_state(key, value)
+        except Exception:  # noqa: BLE001 - runtime state is diagnostic only.
+            return
 
     def discover_wallets(self) -> int:
         wallets: list[Wallet] = []
@@ -221,6 +412,7 @@ class Monitor:
         self.store.upsert_scores(scores)
 
         score_map = self.store.fetch_scores(min_score=self.config.min_wallet_score)
+        score_map.update(self._indexed_score_map(min_score=self.config.min_wallet_score))
         recent_trades = self.store.fetch_recent_trades(
             since_ts=int(time.time()) - self.config.lookback_minutes * 60,
             min_notional=self.config.min_trade_usdc,
@@ -230,16 +422,19 @@ class Monitor:
         policy_enabled, policy_mode = self.active_signal_policy()
         wallet_cohorts = {}
         if policy_enabled:
-            cohort_report = wallet_cohort_report(
-                self.store,
-                CohortConfig(
-                    history_days=max(1, self.config.days),
-                    min_notional=1,
-                    min_trades=1,
-                    limit=max(100, len(wallets)),
-                ),
-            )
-            wallet_cohorts = {str(item["wallet"]): item for item in cohort_report["wallets"]}
+            self._refresh_training_artifacts()
+            wallet_cohorts = self.cohorts
+            if not wallet_cohorts:
+                cohort_report = wallet_cohort_report(
+                    self.store,
+                    CohortConfig(
+                        history_days=max(1, self.config.days),
+                        min_notional=1,
+                        min_trades=1,
+                        limit=max(100, len(wallets)),
+                    ),
+                )
+                wallet_cohorts = {str(item["wallet"]): item for item in cohort_report["wallets"]}
         signals = generate_signals(
             recent_trades,
             score_map,
@@ -321,3 +516,11 @@ def _should_discover(iteration: int, discover_every: int) -> bool:
 
 def _chunks(values: list[str], size: int) -> list[list[str]]:
     return [values[index : index + size] for index in range(0, len(values), size)]
+
+
+def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
+    row = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+        (table,),
+    ).fetchone()
+    return row is not None

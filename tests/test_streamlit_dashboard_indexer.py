@@ -40,6 +40,32 @@ class StreamlitDashboardIndexerTests(unittest.TestCase):
                     last_block_hash TEXT NOT NULL DEFAULT '',
                     updated_at INTEGER NOT NULL
                 );
+                CREATE TABLE training_runs (
+                    run_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    started_at INTEGER NOT NULL,
+                    ok INTEGER NOT NULL,
+                    raw_transactions INTEGER NOT NULL,
+                    scored_wallets INTEGER NOT NULL DEFAULT 0,
+                    stable_wallets INTEGER NOT NULL DEFAULT 0,
+                    candidate_wallets INTEGER NOT NULL DEFAULT 0,
+                    watch_wallets INTEGER NOT NULL DEFAULT 0,
+                    noise_wallets INTEGER NOT NULL DEFAULT 0,
+                    exit_examples INTEGER NOT NULL DEFAULT 0,
+                    summary_json TEXT NOT NULL
+                );
+                CREATE TABLE wallet_cohorts (
+                    wallet TEXT PRIMARY KEY,
+                    status TEXT NOT NULL,
+                    stability_score REAL NOT NULL,
+                    score REAL NOT NULL,
+                    pnl REAL NOT NULL,
+                    volume REAL NOT NULL,
+                    trade_count INTEGER NOT NULL,
+                    win_rate REAL NOT NULL,
+                    profit_factor REAL NOT NULL,
+                    max_drawdown REAL NOT NULL,
+                    updated_at INTEGER NOT NULL
+                );
                 """
             )
             conn.execute(
@@ -54,6 +80,26 @@ class StreamlitDashboardIndexerTests(unittest.TestCase):
                 "INSERT INTO indexer_state(name, last_block, updated_at) VALUES ('polygon', 12345, ?)",
                 (int(time.time()),),
             )
+            conn.execute(
+                """
+                INSERT INTO training_runs(
+                    started_at, ok, raw_transactions, scored_wallets, stable_wallets,
+                    candidate_wallets, watch_wallets, noise_wallets, exit_examples, summary_json
+                )
+                VALUES (?, 1, 1, 2, 1, 1, 0, 0, 7, '{}')
+                """,
+                (int(time.time()),),
+            )
+            conn.executemany(
+                """
+                INSERT INTO wallet_cohorts(
+                    wallet, status, stability_score, score, pnl, volume, trade_count,
+                    win_rate, profit_factor, max_drawdown, updated_at
+                )
+                VALUES (?, ?, 0.7, 0.7, 1, 100, 10, 0.6, 1.2, 0.1, ?)
+                """,
+                [("0xaaa", "STABLE", int(time.time())), ("0xbbb", "CANDIDATE", int(time.time()))],
+            )
             conn.commit()
             conn.close()
 
@@ -65,6 +111,10 @@ class StreamlitDashboardIndexerTests(unittest.TestCase):
         self.assertEqual(snapshot["records"], 1)
         self.assertEqual(snapshot["last_block"], 12345)
         self.assertTrue(snapshot["running"])
+        self.assertTrue(snapshot["last_training_ok"])
+        self.assertEqual(snapshot["training_scored_wallets"], 2)
+        self.assertEqual(snapshot["exit_examples"], 7)
+        self.assertEqual(snapshot["cohort_counts"]["STABLE"], 1)
 
     def test_indexer_db_path_uses_env(self) -> None:
         with patch.dict("os.environ", {"INDEXER_DB_PATH": "data/custom-indexer.db"}):

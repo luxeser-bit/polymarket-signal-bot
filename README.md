@@ -98,6 +98,27 @@ python -m polymarket_signal_bot monitor
 
 Use `--telegram-dry-run` to record what would be sent without sending messages.
 
+Monitor also runs the autonomous training loop by default. Every 24 hours it
+uses `data/indexer.db` (`INDEXER_DB_PATH` if set), recalculates SQL wallet
+metrics into `scored_wallets`, refreshes STABLE/CANDIDATE/WATCH/NOISE cohorts,
+and writes `data/exit_model.pkl` plus `data/exit_stats.json`.
+
+Manual training smoke run:
+
+```powershell
+python -m src.auto_trainer --test --db data/indexer.db
+```
+
+Disable or tune automatic retraining:
+
+```powershell
+python -m polymarket_signal_bot monitor --no-auto-retrain
+python -m polymarket_signal_bot monitor --retrain-interval-hours 12 --retrain-min-new-records 100000
+```
+
+The Streamlit Indexer tab has a `RETRAIN NOW` button and shows the latest
+training time, scored wallet count, cohort counts, and exit-model examples.
+
 ## Live paper runner
 
 `live-paper` is the async runner that combines monitoring with paper position

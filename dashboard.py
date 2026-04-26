@@ -33,6 +33,7 @@ DEFAULT_MAIN_DB = ROOT / DEFAULT_DB_PATH
 DEFAULT_STATE_DB = ROOT / "data" / "paper_state.db"
 DEFAULT_INDEXER_DB = ROOT / "data" / "indexer.db"
 DEFAULT_LOG_PATH = ROOT / "data" / "streamlit_live_paper.log"
+DEFAULT_TRAINER_LOG_PATH = ROOT / "data" / "auto_trainer_dashboard.log"
 DEFAULT_BANKROLL = 200.0
 INDEXER_TARGET_RECORDS = 86_000_000
 INDEXER_REFRESH_SECONDS = 3.0
@@ -70,7 +71,7 @@ def main() -> None:
     with indexer_tab:
         _render_indexer_tab(indexer_db)
 
-    if _paper_process_running():
+    if _paper_process_running() or _retrain_process_running(show_error=False):
         time.sleep(2)
         st.rerun()
 
@@ -242,7 +243,23 @@ def _render_paper_tab(main_db: Path, state_db: Path, state: dict[str, Any]) -> N
 
 def _render_indexer_tab(indexer_db: Path) -> None:
     placeholder = st.empty()
-    manual_refresh = st.button("REFRESH INDEXER", width="stretch", key="indexer_refresh")
+    cols = st.columns([1, 1, 5])
+    with cols[0]:
+        manual_refresh = st.button("REFRESH INDEXER", width="stretch", key="indexer_refresh")
+    with cols[1]:
+        retrain_running = _retrain_process_running()
+        if st.button("RETRAIN NOW", width="stretch", key="indexer_retrain", disabled=retrain_running):
+            try:
+                _start_retrain_process(indexer_db)
+            except Exception as exc:  # noqa: BLE001 - keep dashboard visible.
+                st.error(f"Retrain failed to start: {exc}")
+            st.rerun()
+    with cols[2]:
+        train_status = "TRAINING" if _retrain_process_running() else "IDLE"
+        st.markdown(
+            f"<div class='action-note'>AUTO TRAINER {train_status} // SOURCE {_e(indexer_db)}</div>",
+            unsafe_allow_html=True,
+        )
     snapshot = _indexer_snapshot(indexer_db)
     previous = st.session_state.get("indexer_previous_snapshot")
     speed = _indexer_speed(snapshot, previous)
@@ -256,7 +273,7 @@ def _render_indexer_tab(indexer_db: Path) -> None:
 
     if manual_refresh:
         st.rerun()
-    if snapshot["running"] or snapshot["has_data"]:
+    if snapshot["running"] or snapshot["has_data"] or _retrain_process_running(show_error=False):
         time.sleep(INDEXER_REFRESH_SECONDS)
         st.rerun()
 
@@ -286,9 +303,27 @@ def _render_indexer_snapshot(indexer_db: Path, snapshot: dict[str, Any], speed: 
         ("STATUS", status),
         ("UPDATED", updated),
     ]
+    cohort_counts = snapshot.get("cohort_counts") if isinstance(snapshot.get("cohort_counts"), dict) else {}
+    if snapshot.get("retrain_running"):
+        train_status = "RUNNING"
+    elif snapshot.get("last_training_ok") is True:
+        train_status = "OK"
+    elif snapshot.get("last_training_ok") is False:
+        train_status = "ERROR"
+    else:
+        train_status = "WAIT"
+    training_metrics = [
+        ("TRAIN", train_status),
+        ("LAST TRAIN", _datetime_label(snapshot.get("last_training_at"))),
+        ("SCORED", _intfmt(snapshot.get("training_scored_wallets"))),
+        ("STABLE", _intfmt(cohort_counts.get("STABLE", 0))),
+        ("CANDIDATE", _intfmt(cohort_counts.get("CANDIDATE", 0))),
+        ("EXIT EXAMPLES", _intfmt(snapshot.get("exit_examples"))),
+    ]
     st.markdown(
         "<div class='terminal-shell indexer-shell'>"
         f"<section class='metrics indexer-metrics'>{''.join(_metric(label, value) for label, value in metrics)}</section>"
+        f"<section class='metrics indexer-metrics training-metrics'>{''.join(_metric(label, value) for label, value in training_metrics)}</section>"
         "<section class='panel indexer-panel'>"
         "<div class='panel-title'>SCALE TARGET // 86M RAW EVENTS</div>"
         f"<div class='indexer-progress-label'>{_intfmt(records)} / {_intfmt(INDEXER_TARGET_RECORDS)} ({progress * 100:.4f}%)</div>"
@@ -694,6 +729,51 @@ def _paper_process_running() -> bool:
     return False
 
 
+def _start_retrain_process(indexer_db: Path) -> None:
+    command = [
+        sys.executable,
+        "-m",
+        "src.auto_trainer",
+        "--db",
+        str(indexer_db),
+    ]
+    env = os.environ.copy()
+    env.setdefault("PYTHONUTF8", "1")
+    DEFAULT_TRAINER_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with DEFAULT_TRAINER_LOG_PATH.open("ab") as log_file:
+        process = subprocess.Popen(
+            command,
+            cwd=ROOT,
+            env=env,
+            stdout=log_file,
+            stderr=log_file,
+        )
+    st.session_state.retrain_process = process
+    st.session_state.retrain_pid = process.pid
+    st.session_state.retrain_started_at = time.time()
+    st.session_state.retrain_command = " ".join(command)
+
+
+def _retrain_process_running(*, show_error: bool = True) -> bool:
+    if st is None:
+        return False
+    try:
+        process = st.session_state.get("retrain_process")
+    except Exception:  # noqa: BLE001 - tests may call helpers outside Streamlit runtime.
+        return False
+    if not process:
+        return False
+    code = process.poll()
+    if code is None:
+        return True
+    st.session_state.retrain_process = None
+    st.session_state.retrain_pid = None
+    st.session_state.retrain_started_at = None
+    if code != 0 and show_error:
+        st.error(f"Retrain process stopped with exit code {code}. Check {DEFAULT_TRAINER_LOG_PATH}.")
+    return False
+
+
 def _latest_balance(state_db: Path) -> dict[str, float]:
     df = _read_sql_df(
         state_db,
@@ -772,6 +852,13 @@ def _indexer_snapshot(db_path: Path) -> dict[str, Any]:
         "last_block": 0,
         "updated_at": 0,
         "running": running,
+        "retrain_running": _retrain_process_running(show_error=False),
+        "last_training_at": 0,
+        "last_training_ok": None,
+        "training_raw_transactions": 0,
+        "training_scored_wallets": 0,
+        "exit_examples": 0,
+        "cohort_counts": {},
         "has_data": False,
     }
     if not db_path.exists():
@@ -809,6 +896,8 @@ def _indexer_snapshot(db_path: Path) -> dict[str, Any]:
         if state_row:
             snapshot["last_block"] = int(state_row["last_block"] or 0)
             snapshot["updated_at"] = int(state_row["updated_at"] or 0)
+        training = _training_snapshot(conn)
+        snapshot.update(training)
         snapshot["has_data"] = bool(snapshot["records"] or snapshot["last_block"])
         if snapshot["updated_at"]:
             snapshot["running"] = running or (time.time() - int(snapshot["updated_at"]) <= INDEXER_STALE_SECONDS)
@@ -819,6 +908,49 @@ def _indexer_snapshot(db_path: Path) -> dict[str, Any]:
     finally:
         if conn is not None:
             conn.close()
+
+
+def _training_snapshot(conn: sqlite3.Connection) -> dict[str, Any]:
+    tables = {
+        str(row["name"])
+        for row in conn.execute(
+            """
+            SELECT name FROM sqlite_master
+            WHERE type = 'table' AND name IN ('training_runs', 'wallet_cohorts')
+            """
+        ).fetchall()
+    }
+    snapshot: dict[str, Any] = {
+        "last_training_at": 0,
+        "last_training_ok": None,
+        "training_raw_transactions": 0,
+        "training_scored_wallets": 0,
+        "exit_examples": 0,
+        "cohort_counts": {},
+    }
+    if "training_runs" in tables:
+        row = conn.execute(
+            """
+            SELECT started_at, ok, raw_transactions, scored_wallets, exit_examples
+            FROM training_runs
+            ORDER BY started_at DESC
+            LIMIT 1
+            """
+        ).fetchone()
+        if row:
+            snapshot.update(
+                {
+                    "last_training_at": int(row["started_at"] or 0),
+                    "last_training_ok": bool(row["ok"]),
+                    "training_raw_transactions": int(row["raw_transactions"] or 0),
+                    "training_scored_wallets": int(row["scored_wallets"] or 0),
+                    "exit_examples": int(row["exit_examples"] or 0),
+                }
+            )
+    if "wallet_cohorts" in tables:
+        rows = conn.execute("SELECT status, COUNT(*) AS wallets FROM wallet_cohorts GROUP BY status").fetchall()
+        snapshot["cohort_counts"] = {str(row["status"]): int(row["wallets"] or 0) for row in rows}
+    return snapshot
 
 
 def _indexer_speed(snapshot: dict[str, Any], previous: Any) -> float:
@@ -906,6 +1038,13 @@ def _timestamp_label(value: Any) -> str:
     return dt.datetime.fromtimestamp(timestamp).strftime("%H:%M:%S")
 
 
+def _datetime_label(value: Any) -> str:
+    timestamp = int(_float(value))
+    if timestamp <= 0:
+        return "NEVER"
+    return dt.datetime.fromtimestamp(timestamp).strftime("%m-%d %H:%M")
+
+
 def _init_session_state() -> None:
     st.session_state.setdefault("paper_process", None)
     st.session_state.setdefault("paper_pid", None)
@@ -913,6 +1052,10 @@ def _init_session_state() -> None:
     st.session_state.setdefault("paper_command", "")
     st.session_state.setdefault("paper_dry_run", True)
     st.session_state.setdefault("indexer_previous_snapshot", None)
+    st.session_state.setdefault("retrain_process", None)
+    st.session_state.setdefault("retrain_pid", None)
+    st.session_state.setdefault("retrain_started_at", None)
+    st.session_state.setdefault("retrain_command", "")
 
 
 def _require_dashboard_dependencies() -> None:
@@ -1009,6 +1152,7 @@ def _inject_style() -> None:
         .scan-grid .panel,.paper-grid .panel {min-height:310px;}
         .indexer-shell {margin-top:10px;}
         .indexer-metrics {grid-template-columns:repeat(6,minmax(120px,1fr));}
+        .training-metrics {margin-top:10px;}
         .indexer-panel {margin-top:10px; min-height:126px;}
         .indexer-progress-label {padding:16px 12px 10px; color:var(--hot); font-size:16px; font-weight:900;}
         .indexer-progress {margin:0 12px 12px; height:12px;}

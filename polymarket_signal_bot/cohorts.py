@@ -1,10 +1,17 @@
 from __future__ import annotations
 
+import json
+import sqlite3
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 from .storage import Store
+
+
+DEFAULT_INDEXER_DB_PATH = Path("data/indexer.db")
+DEFAULT_POLICY_PATH = Path("data/best_policy.json")
 
 
 @dataclass(frozen=True)
@@ -13,6 +20,19 @@ class CohortConfig:
     min_notional: float = 0.0
     min_trades: int = 1
     limit: int = 20
+
+
+@dataclass(frozen=True)
+class CohortThresholds:
+    stable_score: float = 0.68
+    candidate_score: float = 0.52
+    watch_score: float = 0.32
+    stable_min_trades: int = 20
+    candidate_min_trades: int = 8
+    watch_min_trades: int = 2
+    stable_min_volume: float = 1_000.0
+    candidate_min_volume: float = 250.0
+    watch_min_volume: float = 25.0
 
 
 def wallet_cohort_report(store: Store, config: CohortConfig | None = None) -> dict[str, Any]:
@@ -38,6 +58,204 @@ def format_cohort_summary(report: dict[str, Any]) -> str:
         f"cohorts wallets={report['totalWallets']} "
         f"top={len(report['wallets'])} history_days={report['historyDays']}"
     )
+
+
+def update_cohorts(
+    db_path: str | Path = DEFAULT_INDEXER_DB_PATH,
+    *,
+    policy_path: str | Path = DEFAULT_POLICY_PATH,
+    thresholds: CohortThresholds | None = None,
+) -> dict[str, Any]:
+    thresholds = thresholds or load_cohort_thresholds(policy_path)
+    conn = _connect(db_path)
+    try:
+        ensure_cohort_schema(conn)
+        if not _table_exists(conn, "scored_wallets"):
+            return {"updated": 0, "counts": {}, "thresholds": thresholds.__dict__}
+        scored_count = int(conn.execute("SELECT COUNT(*) FROM scored_wallets").fetchone()[0] or 0)
+        if scored_count <= 0:
+            return {"updated": 0, "counts": {}, "thresholds": thresholds.__dict__}
+        now = int(time.time())
+        conn.execute("DELETE FROM wallet_cohorts")
+        conn.execute(
+            """
+            INSERT INTO wallet_cohorts(
+                wallet, status, stability_score, score, pnl, volume, trade_count,
+                win_rate, profit_factor, max_drawdown, updated_at
+            )
+            SELECT
+                wallet,
+                CASE
+                    WHEN score >= ? AND trade_count >= ? AND volume >= ? THEN 'STABLE'
+                    WHEN score >= ? AND trade_count >= ? AND volume >= ? THEN 'CANDIDATE'
+                    WHEN score >= ? AND trade_count >= ? AND volume >= ? THEN 'WATCH'
+                    ELSE 'NOISE'
+                END AS status,
+                score AS stability_score,
+                score,
+                pnl,
+                volume,
+                trade_count,
+                win_rate,
+                profit_factor,
+                max_drawdown,
+                ?
+            FROM scored_wallets
+            """,
+            (
+                thresholds.stable_score,
+                thresholds.stable_min_trades,
+                thresholds.stable_min_volume,
+                thresholds.candidate_score,
+                thresholds.candidate_min_trades,
+                thresholds.candidate_min_volume,
+                thresholds.watch_score,
+                thresholds.watch_min_trades,
+                thresholds.watch_min_volume,
+                now,
+            ),
+        )
+        rows = conn.execute(
+            "SELECT status, COUNT(*) AS wallets FROM wallet_cohorts GROUP BY status"
+        ).fetchall()
+        counts = {str(row["status"]): int(row["wallets"]) for row in rows}
+        updated = sum(counts.values())
+        conn.execute(
+            """
+            INSERT INTO training_state(key, value, updated_at)
+            VALUES ('cohorts_last_summary', ?, ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+            """,
+            (json.dumps({"counts": counts, "updated": updated}, sort_keys=True), now),
+        )
+        conn.commit()
+        return {"updated": updated, "counts": counts, "thresholds": thresholds.__dict__}
+    finally:
+        conn.close()
+
+
+def load_wallet_cohorts(
+    db_path: str | Path = DEFAULT_INDEXER_DB_PATH,
+    *,
+    statuses: set[str] | None = None,
+    limit: int | None = None,
+) -> dict[str, dict[str, Any]]:
+    if not Path(db_path).exists():
+        return {}
+    conn = _connect(db_path, read_only=True)
+    try:
+        if not _table_exists(conn, "wallet_cohorts"):
+            return {}
+        clauses = []
+        params: list[Any] = []
+        if statuses:
+            placeholders = ",".join("?" for _ in statuses)
+            clauses.append(f"status IN ({placeholders})")
+            params.extend(sorted(statuses))
+        where = "WHERE " + " AND ".join(clauses) if clauses else ""
+        limit_sql = "LIMIT ?" if limit else ""
+        if limit:
+            params.append(limit)
+        rows = conn.execute(
+            f"""
+            SELECT wallet, status, stability_score, score, pnl, volume, trade_count,
+                   win_rate, profit_factor, max_drawdown, updated_at
+            FROM wallet_cohorts
+            {where}
+            ORDER BY stability_score DESC, volume DESC
+            {limit_sql}
+            """,
+            tuple(params),
+        ).fetchall()
+        return {
+            str(row["wallet"]): {
+                "wallet": str(row["wallet"]),
+                "status": str(row["status"]),
+                "stabilityScore": float(row["stability_score"] or 0.0),
+                "score": float(row["score"] or 0.0),
+                "pnl": float(row["pnl"] or 0.0),
+                "volume": float(row["volume"] or 0.0),
+                "tradeCount": int(row["trade_count"] or 0),
+                "winRate": float(row["win_rate"] or 0.0),
+                "profitFactor": float(row["profit_factor"] or 0.0),
+                "maxDrawdown": float(row["max_drawdown"] or 0.0),
+                "updatedAt": int(row["updated_at"] or 0),
+            }
+            for row in rows
+        }
+    finally:
+        conn.close()
+
+
+def load_cohort_thresholds(policy_path: str | Path = DEFAULT_POLICY_PATH) -> CohortThresholds:
+    path = Path(policy_path)
+    if not path.exists():
+        return CohortThresholds()
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return CohortThresholds()
+    source = payload.get("cohort_thresholds") if isinstance(payload, dict) else None
+    if not isinstance(source, dict):
+        source = payload.get("thresholds") if isinstance(payload, dict) else None
+    if not isinstance(source, dict):
+        return CohortThresholds()
+    defaults = CohortThresholds()
+    values = {
+        field: type(getattr(defaults, field))(source.get(field, getattr(defaults, field)))
+        for field in defaults.__dict__
+    }
+    return CohortThresholds(**values)
+
+
+def ensure_cohort_schema(conn: sqlite3.Connection) -> None:
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=30000")
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS wallet_cohorts (
+            wallet TEXT PRIMARY KEY,
+            status TEXT NOT NULL,
+            stability_score REAL NOT NULL,
+            score REAL NOT NULL,
+            pnl REAL NOT NULL,
+            volume REAL NOT NULL,
+            trade_count INTEGER NOT NULL,
+            win_rate REAL NOT NULL,
+            profit_factor REAL NOT NULL,
+            max_drawdown REAL NOT NULL,
+            updated_at INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_wallet_cohorts_status_score
+            ON wallet_cohorts(status, stability_score DESC);
+        CREATE TABLE IF NOT EXISTS training_state (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL,
+            updated_at INTEGER NOT NULL
+        );
+        """
+    )
+    conn.commit()
+
+
+def _connect(db_path: str | Path, *, read_only: bool = False) -> sqlite3.Connection:
+    path = Path(db_path)
+    if not read_only:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(path, timeout=30)
+    else:
+        uri = f"{path.resolve().as_uri()}?mode=ro"
+        conn = sqlite3.connect(uri, uri=True, timeout=30)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
+    row = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+        (table,),
+    ).fetchone()
+    return row is not None
 
 
 def _wallet_rows(store: Store, since_ts: int, config: CohortConfig) -> list[dict[str, Any]]:

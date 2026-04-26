@@ -32,7 +32,13 @@ from .market_flow import MarketFlowConfig, format_market_flow_summary, sync_mark
 from .monitor import Monitor, MonitorConfig
 from .models import OrderBookSnapshot, Trade, Wallet
 from .paper import ExitConfig, PaperBroker, RiskConfig
-from .policy_optimizer import OptimizerConfig, policy_settings_from_recommendation, run_policy_optimizer
+from .policy_optimizer import (
+    OptimizerConfig,
+    policy_settings_from_recommendation,
+    prepared_training_tables_available,
+    run_policy_optimizer,
+    run_policy_optimizer_from_db,
+)
 from .scoring import score_wallets
 from .signals import SignalConfig, generate_signals
 from .storage import DEFAULT_DB_PATH, Store
@@ -180,6 +186,12 @@ def build_parser() -> argparse.ArgumentParser:
     optimizer.add_argument("--limit", type=int, default=100000)
     optimizer.add_argument("--warmup-trades", type=int, default=8)
     optimizer.add_argument("--min-closed-trades", type=int, default=25)
+    optimizer.add_argument("--indexer-db", default=os.environ.get("INDEXER_DB_PATH", "data/indexer.db"))
+    optimizer.add_argument(
+        "--no-indexed-training",
+        action="store_true",
+        help="Do not use prepared scored_wallets/raw_transactions even if available.",
+    )
     optimizer.add_argument("--no-save", action="store_true", help="Do not save the recommended mode into runtime state.")
     optimizer.set_defaults(func=cmd_policy_optimizer)
 
@@ -364,6 +376,13 @@ def build_parser() -> argparse.ArgumentParser:
     monitor.add_argument("--duckdb", default=str(DEFAULT_DUCKDB_PATH))
     monitor.add_argument("--analytics-chunk-size", type=int, default=50000)
     monitor.add_argument("--analytics-rebuild", action="store_true")
+    monitor.add_argument("--no-auto-retrain", action="store_true", help="Disable the 24h autonomous training cycle.")
+    monitor.add_argument("--retrain-interval-hours", type=float, default=24.0)
+    monitor.add_argument("--retrain-min-new-records", type=int, default=0)
+    monitor.add_argument("--training-db", default=os.environ.get("INDEXER_DB_PATH", "data/indexer.db"))
+    monitor.add_argument("--exit-model-path", default="data/exit_model.pkl")
+    monitor.add_argument("--exit-stats-path", default="data/exit_stats.json")
+    monitor.add_argument("--policy-path", default="data/best_policy.json")
     monitor.set_defaults(func=cmd_monitor)
 
     return parser
@@ -677,15 +696,25 @@ def cmd_backtest(args: argparse.Namespace) -> int:
 def cmd_policy_optimizer(args: argparse.Namespace) -> int:
     with open_store(args.db) as store:
         store.init_schema()
-        since_ts = int(time.time()) - max(1, args.history_days) * 86400
-        trades = store.fetch_trades_chronological(since_ts=since_ts, limit=args.limit)
-        order_books = store.fetch_order_books(list({trade.asset for trade in trades}))
-        result = run_policy_optimizer(
-            trades,
-            _backtest_config_from_args(args, use_cohort_policy=False),
-            order_books=order_books,
-            optimizer_config=OptimizerConfig(min_closed_trades=args.min_closed_trades),
-        )
+        base_config = _backtest_config_from_args(args, use_cohort_policy=False)
+        if not args.no_indexed_training and prepared_training_tables_available(args.indexer_db):
+            result = run_policy_optimizer_from_db(
+                args.indexer_db,
+                base_config,
+                history_days=args.history_days,
+                limit=args.limit,
+                optimizer_config=OptimizerConfig(min_closed_trades=args.min_closed_trades),
+            )
+        else:
+            since_ts = int(time.time()) - max(1, args.history_days) * 86400
+            trades = store.fetch_trades_chronological(since_ts=since_ts, limit=args.limit)
+            order_books = store.fetch_order_books(list({trade.asset for trade in trades}))
+            result = run_policy_optimizer(
+                trades,
+                base_config,
+                order_books=order_books,
+                optimizer_config=OptimizerConfig(min_closed_trades=args.min_closed_trades),
+            )
         if not args.no_save:
             _save_policy_optimizer_result(store, result)
 
@@ -1348,6 +1377,13 @@ def cmd_monitor(args: argparse.Namespace) -> int:
         analytics_duckdb_path=args.duckdb,
         analytics_chunk_size=args.analytics_chunk_size,
         analytics_rebuild=args.analytics_rebuild,
+        auto_retrain=not args.no_auto_retrain,
+        retrain_interval_hours=args.retrain_interval_hours,
+        retrain_min_new_records=args.retrain_min_new_records,
+        training_db_path=args.training_db,
+        exit_model_path=args.exit_model_path,
+        exit_stats_path=args.exit_stats_path,
+        policy_path=args.policy_path,
     )
     telegram = TelegramConfig(
         token=args.telegram_token,
