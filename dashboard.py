@@ -21,6 +21,11 @@ try:
 except ModuleNotFoundError:  # pragma: no cover - shown in UI startup error.
     st = None  # type: ignore[assignment]
 
+try:
+    from dotenv import load_dotenv
+except ModuleNotFoundError:  # pragma: no cover - dashboard can still run without .env support.
+    load_dotenv = None  # type: ignore[assignment]
+
 from polymarket_signal_bot.bulk_sync import TARGET_TRADES, TARGET_WALLETS
 from polymarket_signal_bot.dashboard import build_dashboard_state
 from polymarket_signal_bot.demo import demo_trades, demo_wallets
@@ -34,11 +39,13 @@ DEFAULT_STATE_DB = ROOT / "data" / "paper_state.db"
 DEFAULT_INDEXER_DB = ROOT / "data" / "indexer.db"
 DEFAULT_LOG_PATH = ROOT / "data" / "streamlit_live_paper.log"
 DEFAULT_TRAINER_LOG_PATH = ROOT / "data" / "auto_trainer_dashboard.log"
+DEFAULT_SYSTEM_LOG_DIR = ROOT / "data" / "system_logs"
 DEFAULT_BANKROLL = 200.0
 INDEXER_TARGET_RECORDS = 86_000_000
 INDEXER_REFRESH_SECONDS = 1.0
 INDEXER_STALE_SECONDS = 120.0
 TAB_KEYS = ("overview", "scan", "paper", "indexer")
+SYSTEM_COMPONENT_KEYS = ("indexer", "monitor", "live_paper")
 
 
 def main() -> None:
@@ -50,6 +57,7 @@ def main() -> None:
     main_db = DEFAULT_MAIN_DB
     state_db = DEFAULT_STATE_DB
     indexer_db = _indexer_db_path()
+    _render_system_control(main_db, state_db, indexer_db)
     state = _terminal_state(main_db, state_db)
 
     _render_terminal_header(state)
@@ -142,6 +150,39 @@ def _active_tab_from_query() -> str:
         raw_value = raw_value[0] if raw_value else "overview"
     value = str(raw_value or "overview").lower()
     return value if value in TAB_KEYS else "overview"
+
+
+def _render_system_control(main_db: Path, state_db: Path, indexer_db: Path) -> None:
+    specs = _system_component_specs(main_db, state_db, indexer_db)
+    status = _system_component_statuses(specs)
+    all_running = all(item["running"] for item in status.values())
+    st.sidebar.markdown("<div class='side-title'>SYSTEM CONTROL</div>", unsafe_allow_html=True)
+    autostart_default = bool(st.session_state.get("system_autostart", _dashboard_autostart_requested()))
+    st.session_state.system_autostart = st.sidebar.checkbox(
+        "Autostart",
+        value=autostart_default,
+        key="system_autostart_checkbox",
+    )
+    button_label = "STOP ALL" if all_running else "START ALL"
+    if st.sidebar.button(button_label, width="stretch", type="primary", key="system_toggle"):
+        if all_running:
+            _stop_all_system(specs)
+        else:
+            _start_all_system(specs)
+        st.rerun()
+
+    if st.session_state.system_autostart and not st.session_state.get("system_autostart_done"):
+        st.session_state.system_autostart_done = True
+        if not all_running:
+            _start_all_system(specs)
+            st.rerun()
+
+    st.sidebar.markdown(_system_status_html(status), unsafe_allow_html=True)
+    with st.sidebar.expander("System Logs", expanded=False):
+        for key in SYSTEM_COMPONENT_KEYS:
+            spec = specs[key]
+            st.caption(str(spec["label"]))
+            st.code(_tail_file(Path(spec["log_path"]), max_lines=80) or "No log yet", language="text")
 
 
 def _render_terminal_actions(main_db: Path, state_db: Path) -> None:
@@ -657,6 +698,313 @@ def _scale_rows(state: dict[str, Any]) -> str:
     return "".join(out)
 
 
+def _system_component_specs(main_db: Path, state_db: Path, indexer_db: Path) -> dict[str, dict[str, Any]]:
+    _load_dotenv_file()
+    DEFAULT_SYSTEM_LOG_DIR.mkdir(parents=True, exist_ok=True)
+    env = _system_env(main_db, state_db, indexer_db)
+    live_command = [
+        sys.executable,
+        "-m",
+        "polymarket_signal_bot.live_paper_runner",
+        "--db",
+        str(main_db.resolve()),
+        "--state-db",
+        str(state_db.resolve()),
+        "--log-path",
+        str(DEFAULT_LOG_PATH.resolve()),
+        "--poll-interval",
+        "60",
+        "--price-interval",
+        "15",
+    ]
+    if _env_bool("DRY_RUN", True):
+        live_command.append("--dry-run")
+    return {
+        "indexer": {
+            "label": "Indexer",
+            "command": [
+                sys.executable,
+                "-m",
+                "src.indexer",
+                "--sync",
+                "--db",
+                str(indexer_db.resolve()),
+            ],
+            "patterns": ("*src.indexer*", "*polymarket_signal_bot.indexer*"),
+            "log_path": DEFAULT_SYSTEM_LOG_DIR / "indexer.log",
+            "env": env,
+        },
+        "monitor": {
+            "label": "Monitor",
+            "command": [
+                sys.executable,
+                "-m",
+                "polymarket_signal_bot",
+                "--db",
+                str(main_db.resolve()),
+                "monitor",
+                "--interval-seconds",
+                "60",
+                "--training-db",
+                str(indexer_db.resolve()),
+                "--retrain-min-new-records",
+                "10000",
+            ],
+            "patterns": ("*polymarket_signal_bot*monitor*", "*src.monitor*"),
+            "log_path": DEFAULT_SYSTEM_LOG_DIR / "monitor.log",
+            "env": env,
+        },
+        "live_paper": {
+            "label": "Live Paper",
+            "command": live_command,
+            "patterns": ("*polymarket_signal_bot.live_paper_runner*", "*polymarket_signal_bot*live-paper*"),
+            "log_path": DEFAULT_SYSTEM_LOG_DIR / "live_paper.log",
+            "env": env,
+        },
+    }
+
+
+def _system_env(main_db: Path, state_db: Path, indexer_db: Path) -> dict[str, str]:
+    env = os.environ.copy()
+    env.setdefault("PYTHONUTF8", "1")
+    env["POLYSIGNAL_DB"] = str(main_db.resolve())
+    env["POLYSIGNAL_PAPER_STATE_DB"] = str(state_db.resolve())
+    env["INDEXER_DB_PATH"] = str(indexer_db.resolve())
+    env.setdefault("RPC_RPS", "5")
+    return env
+
+
+def _load_dotenv_file() -> None:
+    if st is not None and st.session_state.get("dotenv_loaded"):
+        return
+    if load_dotenv is not None:
+        load_dotenv(ROOT / ".env", override=False)
+    if st is not None:
+        st.session_state.dotenv_loaded = True
+
+
+def _start_all_system(specs: dict[str, dict[str, Any]]) -> None:
+    processes = dict(st.session_state.get("system_processes") or {})
+    pids = dict(st.session_state.get("system_pids") or {})
+    for key in SYSTEM_COMPONENT_KEYS:
+        if _system_component_running(key, specs[key]):
+            discovered_pid = _discover_component_pid(specs[key])
+            if discovered_pid:
+                pids[key] = discovered_pid
+            continue
+        process = _start_system_component(key, specs[key])
+        processes[key] = process
+        pids[key] = process.pid
+        if key == "live_paper":
+            st.session_state.paper_process = process
+            st.session_state.paper_pid = process.pid
+            st.session_state.paper_started_at = time.time()
+            st.session_state.paper_command = " ".join(str(part) for part in specs[key]["command"])
+    st.session_state.system_processes = processes
+    st.session_state.system_pids = pids
+    st.session_state.system_status = "Running"
+
+
+def _start_system_component(key: str, spec: dict[str, Any]) -> subprocess.Popen:
+    log_path = Path(spec["log_path"])
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    header = (
+        f"\n\n[{dt.datetime.now().isoformat(timespec='seconds')}] "
+        f"START {key}: {' '.join(str(part) for part in spec['command'])}\n"
+    )
+    log_path.write_text(header, encoding="utf-8", errors="replace")
+    log_file = log_path.open("ab")
+    try:
+        return subprocess.Popen(
+            [str(part) for part in spec["command"]],
+            cwd=ROOT,
+            env=spec["env"],
+            stdout=log_file,
+            stderr=log_file,
+        )
+    finally:
+        log_file.close()
+
+
+def _stop_all_system(specs: dict[str, dict[str, Any]]) -> None:
+    processes = dict(st.session_state.get("system_processes") or {})
+    pids = dict(st.session_state.get("system_pids") or {})
+    for key in reversed(SYSTEM_COMPONENT_KEYS):
+        process = processes.get(key)
+        pid = int(pids.get(key) or 0) or _discover_component_pid(specs[key])
+        if process and process.poll() is None:
+            _terminate_process(process, timeout_seconds=10)
+        elif pid:
+            _terminate_pid(pid, timeout_seconds=10)
+        processes.pop(key, None)
+        pids.pop(key, None)
+    st.session_state.system_processes = processes
+    st.session_state.system_pids = pids
+    st.session_state.system_status = "Stopped"
+    st.session_state.paper_process = None
+    st.session_state.paper_pid = None
+    st.session_state.paper_started_at = None
+
+
+def _system_component_statuses(specs: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    statuses = {}
+    pids = dict(st.session_state.get("system_pids") or {})
+    for key in SYSTEM_COMPONENT_KEYS:
+        pid = int(pids.get(key) or 0) or _discover_component_pid(specs[key])
+        running = _system_component_running(key, specs[key], pid=pid)
+        if running and pid:
+            pids[key] = pid
+        elif not running:
+            pids.pop(key, None)
+        statuses[key] = {"label": specs[key]["label"], "running": running, "pid": pid if running else 0}
+    st.session_state.system_pids = pids
+    return statuses
+
+
+def _system_component_running(key: str, spec: dict[str, Any], *, pid: int | None = None) -> bool:
+    process = (st.session_state.get("system_processes") or {}).get(key) if st is not None else None
+    if process and process.poll() is None:
+        return True
+    if pid and _pid_running(pid):
+        return True
+    discovered_pid = _discover_component_pid(spec)
+    return bool(discovered_pid and _pid_running(discovered_pid))
+
+
+def _system_status_html(status: dict[str, dict[str, Any]]) -> str:
+    rows = []
+    for key in SYSTEM_COMPONENT_KEYS:
+        item = status[key]
+        dot_class = "on" if item["running"] else "off"
+        pid = f"PID {item['pid']}" if item["pid"] else "STOPPED"
+        rows.append(
+            "<div class='system-row'>"
+            f"<span class='system-dot {dot_class}'></span>"
+            f"<span>{_e(item['label'])}</span>"
+            f"<b>{_e(pid)}</b>"
+            "</div>"
+        )
+    return "<div class='system-status'>" + "".join(rows) + "</div>"
+
+
+def _discover_component_pid(spec: dict[str, Any]) -> int:
+    patterns = tuple(str(pattern) for pattern in spec.get("patterns", ()))
+    if not patterns:
+        return 0
+    try:
+        if os.name == "nt":
+            clauses = " -or ".join(f"$_.CommandLine -like '{pattern}'" for pattern in patterns)
+            command = (
+                "Get-CimInstance Win32_Process | "
+                f"Where-Object {{ $_.Name -like 'python*' -and ({clauses}) }} | "
+                "Select-Object -First 1 -ExpandProperty ProcessId"
+            )
+            result = subprocess.run(
+                ["powershell.exe", "-NoProfile", "-Command", command],
+                capture_output=True,
+                text=True,
+                timeout=2,
+                check=False,
+            )
+            return int(result.stdout.strip() or 0)
+        pattern = "|".join(pattern.strip("*") for pattern in patterns)
+        result = subprocess.run(["pgrep", "-f", pattern], capture_output=True, text=True, timeout=2, check=False)
+        first = result.stdout.strip().splitlines()[0] if result.stdout.strip() else "0"
+        return int(first)
+    except Exception:  # noqa: BLE001 - process discovery is best effort.
+        return 0
+
+
+def _pid_running(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        if os.name == "nt":
+            result = subprocess.run(
+                [
+                    "powershell.exe",
+                    "-NoProfile",
+                    "-Command",
+                    f"Get-CimInstance Win32_Process -Filter \"ProcessId = {int(pid)}\"",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=2,
+                check=False,
+            )
+            return bool(result.stdout.strip())
+        os.kill(pid, 0)
+        return True
+    except Exception:
+        return False
+
+
+def _terminate_process(process: subprocess.Popen, *, timeout_seconds: int) -> None:
+    try:
+        process.send_signal(signal.SIGTERM)
+        process.wait(timeout=timeout_seconds)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait(timeout=3)
+    except Exception:
+        return
+
+
+def _terminate_pid(pid: int, *, timeout_seconds: int) -> None:
+    if not _pid_running(pid):
+        return
+    try:
+        if os.name == "nt":
+            subprocess.run(["taskkill", "/PID", str(pid), "/T"], capture_output=True, timeout=timeout_seconds, check=False)
+            deadline = time.time() + timeout_seconds
+            while time.time() < deadline and _pid_running(pid):
+                time.sleep(0.2)
+            if _pid_running(pid):
+                subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"], capture_output=True, timeout=5, check=False)
+        else:
+            os.kill(pid, signal.SIGTERM)
+            deadline = time.time() + timeout_seconds
+            while time.time() < deadline and _pid_running(pid):
+                time.sleep(0.2)
+            if _pid_running(pid):
+                os.kill(pid, signal.SIGKILL)
+    except Exception:
+        return
+
+
+def _tail_file(path: Path, *, max_lines: int) -> str:
+    if not path.exists():
+        return ""
+    try:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return ""
+    return "\n".join(lines[-max_lines:])
+
+
+def _dashboard_autostart_requested() -> bool:
+    if "--autostart" in sys.argv:
+        return True
+    try:
+        value = st.query_params.get("autostart", "")
+    except Exception:
+        value = ""
+    if isinstance(value, list):
+        value = value[0] if value else ""
+    return _truthy(value) or _env_bool("POLYSIGNAL_AUTOSTART", False)
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return _truthy(value)
+
+
+def _truthy(value: Any) -> bool:
+    return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
 def _load_demo(db_path: Path) -> dict[str, int]:
     with Store(db_path) as store:
         store.init_schema()
@@ -1101,6 +1449,12 @@ def _init_session_state() -> None:
     st.session_state.setdefault("retrain_pid", None)
     st.session_state.setdefault("retrain_started_at", None)
     st.session_state.setdefault("retrain_command", "")
+    st.session_state.setdefault("system_processes", {})
+    st.session_state.setdefault("system_pids", {})
+    st.session_state.setdefault("system_status", "Stopped")
+    st.session_state.setdefault("system_autostart", False)
+    st.session_state.setdefault("system_autostart_done", False)
+    st.session_state.setdefault("dotenv_loaded", False)
 
 
 def _require_dashboard_dependencies() -> None:
@@ -1135,6 +1489,18 @@ def _inject_style() -> None:
         }
         header[data-testid="stHeader"], #MainMenu, footer {display:none;}
         .block-container {max-width:none; padding:14px 14px 8px;}
+        section[data-testid="stSidebar"] {background:rgba(2,8,11,.96); border-right:1px solid var(--line-soft);}
+        section[data-testid="stSidebar"] [data-testid="stMarkdownContainer"],
+        section[data-testid="stSidebar"] label,
+        section[data-testid="stSidebar"] span {font-family:"Cascadia Mono",Consolas,"Courier New",monospace;}
+        .side-title {height:30px; display:flex; align-items:center; color:var(--hot); font-weight:900; border:1px solid var(--line-soft); background:rgba(3,13,17,.88); padding:0 10px; margin-bottom:8px;}
+        .system-status {border:1px solid var(--line-soft); background:rgba(3,13,17,.88); margin-top:8px;}
+        .system-row {display:grid; grid-template-columns:16px minmax(0,1fr) auto; gap:8px; align-items:center; min-height:28px; padding:5px 8px; border-bottom:1px solid rgba(37,123,132,.22); color:var(--text);}
+        .system-row:last-child {border-bottom:0;}
+        .system-row b {color:var(--muted); font-size:11px;}
+        .system-dot {width:8px; height:8px; border-radius:50%; display:inline-block; background:#59656a;}
+        .system-dot.on {background:#37ff7d; box-shadow:0 0 8px rgba(55,255,125,.72);}
+        .system-dot.off {background:#59656a;}
         .dashboard-tabs {display:flex; gap:8px; border-bottom:1px solid var(--line-soft); margin-top:10px; padding-bottom:8px;}
         .dashboard-tab {
           height:38px; display:flex; align-items:center; border:1px solid var(--line-soft); background:rgba(3,13,17,.88);

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
+import sys
 import tempfile
 import time
 import unittest
@@ -144,6 +145,42 @@ class StreamlitDashboardIndexerTests(unittest.TestCase):
             self.assertFalse(dashboard._indexer_update_active(Path("missing.db")))
         with patch.object(dashboard, "_indexer_process_running", return_value=True):
             self.assertTrue(dashboard._indexer_update_active(Path("missing.db")))
+
+    def test_system_component_specs_use_absolute_paths_and_dry_run(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with patch.dict("os.environ", {"DRY_RUN": "true"}, clear=False), patch.object(
+                dashboard, "load_dotenv", None
+            ):
+                specs = dashboard._system_component_specs(
+                    root / "polysignal.db",
+                    root / "paper_state.db",
+                    root / "indexer.db",
+                )
+
+        self.assertEqual(specs["indexer"]["command"][0], sys.executable)
+        self.assertIn("--sync", specs["indexer"]["command"])
+        self.assertIn("--db", specs["indexer"]["command"])
+        self.assertIn("--dry-run", specs["live_paper"]["command"])
+        self.assertIn("monitor", specs["monitor"]["command"])
+        self.assertTrue(Path(specs["indexer"]["command"][-1]).is_absolute())
+
+    def test_system_status_html_shows_running_and_stopped(self) -> None:
+        html = dashboard._system_status_html(
+            {
+                "indexer": {"label": "Indexer", "running": True, "pid": 11},
+                "monitor": {"label": "Monitor", "running": False, "pid": 0},
+                "live_paper": {"label": "Live Paper", "running": False, "pid": 0},
+            }
+        )
+
+        self.assertIn("system-dot on", html)
+        self.assertIn("PID 11", html)
+        self.assertIn("STOPPED", html)
+
+    def test_dashboard_autostart_accepts_cli_flag(self) -> None:
+        with patch.object(sys, "argv", ["streamlit", "--autostart"]):
+            self.assertTrue(dashboard._dashboard_autostart_requested())
 
 
 if __name__ == "__main__":

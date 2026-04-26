@@ -33,6 +33,9 @@ Open the Streamlit dashboard URL printed by Streamlit, usually
 `data/paper_state.db`. The Indexer tab reads `INDEXER_DB_PATH` or
 `data/indexer.db` and shows raw event ingestion progress toward 86M records.
 The Streamlit app replaces the old HTML/JS control room as the primary dashboard.
+Its sidebar includes `SYSTEM CONTROL`: `START ALL` launches the indexer,
+monitor, and live paper runner in the background, while `STOP ALL` terminates
+those component PIDs and shows recent per-component logs.
 
 ## Live public-data run
 
