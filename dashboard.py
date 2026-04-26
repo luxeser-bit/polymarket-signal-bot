@@ -31,8 +31,12 @@ from polymarket_signal_bot.storage import DEFAULT_DB_PATH, Store
 ROOT = Path(__file__).resolve().parent
 DEFAULT_MAIN_DB = ROOT / DEFAULT_DB_PATH
 DEFAULT_STATE_DB = ROOT / "data" / "paper_state.db"
+DEFAULT_INDEXER_DB = ROOT / "data" / "indexer.db"
 DEFAULT_LOG_PATH = ROOT / "data" / "streamlit_live_paper.log"
 DEFAULT_BANKROLL = 200.0
+INDEXER_TARGET_RECORDS = 86_000_000
+INDEXER_REFRESH_SECONDS = 3.0
+INDEXER_STALE_SECONDS = 120.0
 
 
 def main() -> None:
@@ -43,13 +47,28 @@ def main() -> None:
 
     main_db = DEFAULT_MAIN_DB
     state_db = DEFAULT_STATE_DB
+    indexer_db = _indexer_db_path()
     state = _terminal_state(main_db, state_db)
 
     _render_terminal_header(state)
-    _render_terminal_actions(main_db, state_db)
-    state = _terminal_state(main_db, state_db)
-    _render_terminal_shell(state)
-    _render_equity_chart(state_db)
+    overview_tab, scan_tab, paper_tab, indexer_tab = st.tabs(
+        ["Overview", "Scan", "Paper Trading", "Indexer"]
+    )
+
+    with overview_tab:
+        _render_terminal_actions(main_db, state_db)
+        state = _terminal_state(main_db, state_db)
+        _render_terminal_shell(state)
+        _render_equity_chart(state_db)
+
+    with scan_tab:
+        _render_scan_tab(main_db, state)
+
+    with paper_tab:
+        _render_paper_tab(main_db, state_db, state)
+
+    with indexer_tab:
+        _render_indexer_tab(indexer_db)
 
     if _paper_process_running():
         time.sleep(2)
@@ -138,6 +157,150 @@ def _render_terminal_actions(main_db: Path, state_db: Path) -> None:
             "<div class='action-note'>Demo / Overview, Scan and Paper Trade are sections on this same terminal screen.</div>",
             unsafe_allow_html=True,
         )
+
+
+def _render_scan_tab(main_db: Path, state: dict[str, Any]) -> None:
+    st.markdown("<div class='equity-title'>SCAN // MANUAL MARKET FLOW</div>", unsafe_allow_html=True)
+    cols = st.columns([1, 1, 5])
+    with cols[0]:
+        if st.button("RUN SCAN", width="stretch", key="scan_tab_run"):
+            try:
+                result = _run_manual_scan(main_db)
+                st.toast(
+                    f"Scan complete: signals={result['signals']} opened={result['opened']} closed={result['closed']}"
+                )
+                st.rerun()
+            except Exception as exc:  # noqa: BLE001 - show action errors.
+                st.error(f"Scan failed: {exc}")
+    with cols[1]:
+        if st.button("LOAD DEMO", width="stretch", key="scan_tab_demo"):
+            try:
+                result = _load_demo(main_db)
+                st.toast(
+                    f"Demo loaded: trades={result['trades']} signals={result['signals']} opened={result['opened']}"
+                )
+                st.rerun()
+            except Exception as exc:  # noqa: BLE001 - show action errors.
+                st.error(f"Demo failed: {exc}")
+    with cols[2]:
+        st.markdown(
+            "<div class='action-note'>Manual scan uses the same monitor and signal engine as the control room.</div>",
+            unsafe_allow_html=True,
+        )
+    st.markdown(
+        "<div class='terminal-shell scan-grid'>"
+        f"{_panel('scanner', 'MARKET SCANNER // TOP FLOW', _scanner_rows(state.get('scanner', [])))}"
+        f"{_panel('consensus', 'AGENT CONSENSUS // COPY CANDIDATES', _consensus_rows(state.get('consensus', [])))}"
+        f"{_panel('reviews', 'MANUAL APPROVAL QUEUE', _review_rows(state.get('reviews', [])))}"
+        "</div>",
+        unsafe_allow_html=True,
+    )
+
+
+def _render_paper_tab(main_db: Path, state_db: Path, state: dict[str, Any]) -> None:
+    st.markdown("<div class='equity-title'>PAPER TRADING // LIVE SIMULATION</div>", unsafe_allow_html=True)
+    paper = state["paper"]
+    positions = paper["statePositions"] or state.get("positions", [])
+    cols = st.columns([1.2, 1.2, 4.6])
+    with cols[0]:
+        st.session_state.paper_dry_run = st.checkbox(
+            "Dry-run mode",
+            value=bool(st.session_state.get("paper_dry_run", True)),
+            key="paper_tab_dry_run_checkbox",
+        )
+    with cols[1]:
+        label = "STOP PAPER" if _paper_process_running() else "START PAPER"
+        if st.button(label, width="stretch", type="primary", key="paper_tab_toggle"):
+            if _paper_process_running():
+                _stop_paper_process()
+            else:
+                try:
+                    _start_paper_process(
+                        main_db=main_db,
+                        state_db=state_db,
+                        dry_run=bool(st.session_state.get("paper_dry_run", True)),
+                    )
+                except Exception as exc:  # noqa: BLE001 - show action errors.
+                    st.error(f"Paper trading failed to start: {exc}")
+                    return
+            st.rerun()
+    with cols[2]:
+        status = "RUNNING" if paper["running"] else "STOPPED"
+        st.markdown(
+            f"<div class='action-note'>STATUS {status} // DAY PNL {_money(paper['dailyPnl'])} // UPTIME {_e(paper['uptime'])}</div>",
+            unsafe_allow_html=True,
+        )
+    st.markdown(
+        "<div class='terminal-shell paper-grid'>"
+        f"{_panel('positions', 'ACTIVE POSITIONS', _position_rows(positions))}"
+        f"{_panel('risk', 'RISK MONITOR', _risk_rows(state.get('risk', [])))}"
+        f"{_panel('exits', 'EXIT TRIGGERS', _exit_rows(state.get('exitTriggers', [])))}"
+        "</div>",
+        unsafe_allow_html=True,
+    )
+
+
+def _render_indexer_tab(indexer_db: Path) -> None:
+    placeholder = st.empty()
+    manual_refresh = st.button("REFRESH INDEXER", width="stretch", key="indexer_refresh")
+    snapshot = _indexer_snapshot(indexer_db)
+    previous = st.session_state.get("indexer_previous_snapshot")
+    speed = _indexer_speed(snapshot, previous)
+    st.session_state.indexer_previous_snapshot = {
+        "at": time.time(),
+        "last_block": snapshot["last_block"],
+    }
+
+    with placeholder.container():
+        _render_indexer_snapshot(indexer_db, snapshot, speed)
+
+    if manual_refresh:
+        st.rerun()
+    if snapshot["running"] or snapshot["has_data"]:
+        time.sleep(INDEXER_REFRESH_SECONDS)
+        st.rerun()
+
+
+def _render_indexer_snapshot(indexer_db: Path, snapshot: dict[str, Any], speed: float) -> None:
+    st.markdown("<div class='equity-title'>INDEXER // POLYGON RAW TRANSACTIONS</div>", unsafe_allow_html=True)
+    if not snapshot["db_exists"]:
+        st.info(f"Indexer DB not found: {indexer_db}")
+        if snapshot["running"]:
+            st.info("Indexer process is running, waiting for the database file.")
+        return
+    if not snapshot["schema_ready"]:
+        st.info(f"Indexer tables are not ready yet: {indexer_db}")
+        return
+
+    records = int(snapshot["records"])
+    progress = min(1.0, records / INDEXER_TARGET_RECORDS)
+    block_label = _intfmt(snapshot["last_block"]) if snapshot["last_block"] else "0"
+    speed_label = f"{speed:.2f} blk/s"
+    updated = _timestamp_label(snapshot.get("updated_at"))
+    status = "RUNNING" if snapshot["running"] else "STOPPED"
+    metrics = [
+        ("RAW EVENTS", _intfmt(records)),
+        ("LAST BLOCK", block_label),
+        ("SPEED", speed_label),
+        ("TARGET", _intfmt(INDEXER_TARGET_RECORDS)),
+        ("STATUS", status),
+        ("UPDATED", updated),
+    ]
+    st.markdown(
+        "<div class='terminal-shell indexer-shell'>"
+        f"<section class='metrics indexer-metrics'>{''.join(_metric(label, value) for label, value in metrics)}</section>"
+        "<section class='panel indexer-panel'>"
+        "<div class='panel-title'>SCALE TARGET // 86M RAW EVENTS</div>"
+        f"<div class='indexer-progress-label'>{_intfmt(records)} / {_intfmt(INDEXER_TARGET_RECORDS)} ({progress * 100:.4f}%)</div>"
+        f"<div class='progress-track indexer-progress'><span style='width:{max(0.5, progress * 100):.4f}%'></span></div>"
+        f"<div class='indexer-path'>DB {_e(indexer_db)}</div>"
+        "</section>"
+        "</div>",
+        unsafe_allow_html=True,
+    )
+    st.progress(progress)
+    if not snapshot["running"]:
+        st.info("Indexer is not running or has not updated its checkpoint recently.")
 
 
 def _render_terminal_shell(state: dict[str, Any]) -> None:
@@ -592,6 +755,113 @@ def _state_positions_for_panel(state_db: Path) -> list[dict[str, Any]]:
     return rows
 
 
+def _indexer_db_path() -> Path:
+    raw_path = os.getenv("INDEXER_DB_PATH")
+    if not raw_path:
+        return DEFAULT_INDEXER_DB
+    path = Path(raw_path)
+    return path if path.is_absolute() else ROOT / path
+
+
+def _indexer_snapshot(db_path: Path) -> dict[str, Any]:
+    running = _indexer_process_running()
+    snapshot = {
+        "db_exists": db_path.exists(),
+        "schema_ready": False,
+        "records": 0,
+        "last_block": 0,
+        "updated_at": 0,
+        "running": running,
+        "has_data": False,
+    }
+    if not db_path.exists():
+        return snapshot
+
+    conn: sqlite3.Connection | None = None
+    try:
+        uri = f"{db_path.resolve().as_uri()}?mode=ro"
+        conn = sqlite3.connect(uri, uri=True, timeout=30)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA busy_timeout=30000;")
+        tables = {
+            str(row["name"])
+            for row in conn.execute(
+                """
+                SELECT name FROM sqlite_master
+                WHERE type = 'table' AND name IN ('raw_transactions', 'indexer_state')
+                """
+            ).fetchall()
+        }
+        snapshot["schema_ready"] = {"raw_transactions", "indexer_state"}.issubset(tables)
+        if not snapshot["schema_ready"]:
+            return snapshot
+
+        record_row = conn.execute("SELECT COUNT(*) AS records FROM raw_transactions").fetchone()
+        state_row = conn.execute(
+            """
+            SELECT last_block, updated_at
+            FROM indexer_state
+            ORDER BY updated_at DESC
+            LIMIT 1
+            """
+        ).fetchone()
+        snapshot["records"] = int(record_row["records"] if record_row else 0)
+        if state_row:
+            snapshot["last_block"] = int(state_row["last_block"] or 0)
+            snapshot["updated_at"] = int(state_row["updated_at"] or 0)
+        snapshot["has_data"] = bool(snapshot["records"] or snapshot["last_block"])
+        if snapshot["updated_at"]:
+            snapshot["running"] = running or (time.time() - int(snapshot["updated_at"]) <= INDEXER_STALE_SECONDS)
+        return snapshot
+    except Exception:  # noqa: BLE001 - dashboard should stay up if the DB is mid-write.
+        snapshot["schema_ready"] = False
+        return snapshot
+    finally:
+        if conn is not None:
+            conn.close()
+
+
+def _indexer_speed(snapshot: dict[str, Any], previous: Any) -> float:
+    if not previous:
+        return 0.0
+    now = time.time()
+    last_block = int(snapshot.get("last_block") or 0)
+    previous_block = int(previous.get("last_block") or 0)
+    previous_at = float(previous.get("at") or now)
+    elapsed = max(0.001, now - previous_at)
+    return max(0.0, (last_block - previous_block) / elapsed)
+
+
+def _indexer_process_running() -> bool:
+    try:
+        if os.name == "nt":
+            command = (
+                "Get-CimInstance Win32_Process | "
+                "Where-Object { $_.Name -like 'python*' -and "
+                "($_.CommandLine -like '*src.indexer*' -or "
+                "$_.CommandLine -like '*polymarket_signal_bot.indexer*') } | "
+                "Select-Object -First 1 -ExpandProperty ProcessId"
+            )
+            result = subprocess.run(
+                ["powershell.exe", "-NoProfile", "-Command", command],
+                capture_output=True,
+                text=True,
+                timeout=2,
+                check=False,
+            )
+            return bool(result.stdout.strip())
+        result = subprocess.run(
+            ["pgrep", "-f", "src.indexer|polymarket_signal_bot.indexer"],
+            capture_output=True,
+            text=True,
+            timeout=2,
+            check=False,
+        )
+        return result.returncode == 0
+    except Exception:  # noqa: BLE001 - process checks are best effort.
+        return False
+
+
 def _read_sql_df(db_path: Path, query: str, params: tuple[Any, ...] = ()) -> Any:
     if pd is None:
         raise RuntimeError("pandas is required. Install: python -m pip install -r requirements-streamlit.txt")
@@ -629,12 +899,20 @@ def _uptime_label() -> str:
     return str(dt.timedelta(seconds=max(0, int(time.time() - float(started)))))
 
 
+def _timestamp_label(value: Any) -> str:
+    timestamp = int(_float(value))
+    if timestamp <= 0:
+        return "NEVER"
+    return dt.datetime.fromtimestamp(timestamp).strftime("%H:%M:%S")
+
+
 def _init_session_state() -> None:
     st.session_state.setdefault("paper_process", None)
     st.session_state.setdefault("paper_pid", None)
     st.session_state.setdefault("paper_started_at", None)
     st.session_state.setdefault("paper_command", "")
     st.session_state.setdefault("paper_dry_run", True)
+    st.session_state.setdefault("indexer_previous_snapshot", None)
 
 
 def _require_dashboard_dependencies() -> None:
@@ -669,6 +947,12 @@ def _inject_style() -> None:
         }
         header[data-testid="stHeader"], #MainMenu, footer {display:none;}
         .block-container {max-width:none; padding:14px 14px 8px;}
+        .stTabs [data-baseweb="tab-list"] {gap:8px; border-bottom:1px solid var(--line-soft); margin-top:10px;}
+        .stTabs [data-baseweb="tab"] {
+          height:38px; border:1px solid var(--line-soft); background:rgba(3,13,17,.88);
+          color:var(--muted); border-radius:0; padding:0 14px; font-family:"Cascadia Mono",Consolas,"Courier New",monospace; font-weight:800;
+        }
+        .stTabs [aria-selected="true"] {color:var(--hot) !important; border-color:var(--line) !important; box-shadow:0 0 12px rgba(53,230,242,.16);}
         .terminal-shell {position:relative; color:var(--text); font-family:"Cascadia Mono",Consolas,"Courier New",monospace; font-size:13px;}
         .terminal-shell::before {
           content:""; position:fixed; inset:0; pointer-events:none;
@@ -721,8 +1005,16 @@ def _inject_style() -> None:
         .depth-row {display:grid; grid-template-columns:52px 1fr 1fr; gap:8px; align-items:center; height:28px; padding:0 10px;}
         .bookbar {height:18px; background:#09242b;} .bookbar.bid {justify-self:end; background:#0d4350;} .bookbar.ask {background:#147887;}
         .statusbar {display:flex; justify-content:space-between; gap:14px; margin-top:10px; padding:8px 10px; color:var(--muted);}
+        .scan-grid,.paper-grid {display:grid; grid-template-columns:1fr 1fr 1fr; gap:10px; margin-top:10px;}
+        .scan-grid .panel,.paper-grid .panel {min-height:310px;}
+        .indexer-shell {margin-top:10px;}
+        .indexer-metrics {grid-template-columns:repeat(6,minmax(120px,1fr));}
+        .indexer-panel {margin-top:10px; min-height:126px;}
+        .indexer-progress-label {padding:16px 12px 10px; color:var(--hot); font-size:16px; font-weight:900;}
+        .indexer-progress {margin:0 12px 12px; height:12px;}
+        .indexer-path {padding:0 12px 14px; color:var(--muted); overflow:hidden; text-overflow:ellipsis; white-space:nowrap;}
         .empty {padding:22px 4px; color:var(--dim);}
-        @media (max-width:1080px) {.topbar,.cyclebar{grid-template-columns:1fr}.topline{justify-content:flex-start;flex-wrap:wrap}.metrics{grid-template-columns:repeat(2,minmax(130px,1fr))}.grid{grid-template-columns:1fr;grid-template-rows:none}.panel,.curve,.depth,.risk,.votes,.exits,.whales,.reviews,.scale,.alerts{grid-column:auto;grid-row:auto;min-height:280px}}
+        @media (max-width:1080px) {.topbar,.cyclebar{grid-template-columns:1fr}.topline{justify-content:flex-start;flex-wrap:wrap}.metrics{grid-template-columns:repeat(2,minmax(130px,1fr))}.grid,.scan-grid,.paper-grid{grid-template-columns:1fr;grid-template-rows:none}.panel,.curve,.depth,.risk,.votes,.exits,.whales,.reviews,.scale,.alerts{grid-column:auto;grid-row:auto;min-height:280px}}
         </style>
         """,
         unsafe_allow_html=True,

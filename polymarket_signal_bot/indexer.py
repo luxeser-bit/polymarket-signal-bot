@@ -26,11 +26,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from .storage import DEFAULT_DB_PATH
-
-
 LOGGER = logging.getLogger(__name__)
 
+DEFAULT_INDEXER_DB_PATH = Path("data/indexer.db")
 ZERO_ADDRESS = "0x0000000000000000000000000000000000000000"
 USDC_ASSET_ID = 0
 TOKEN_DECIMALS = 1_000_000
@@ -109,7 +107,7 @@ class RpcLogRangeTooLarge(RuntimeError):
 @dataclass(frozen=True)
 class IndexerConfig:
     rpc_url: str
-    db_path: Path = DEFAULT_DB_PATH
+    db_path: Path = DEFAULT_INDEXER_DB_PATH
     start_block: int | None = None
     end_block: int | None = None
     sync: bool = False
@@ -167,7 +165,7 @@ class RawTransaction:
 
 
 class IndexerStore:
-    def __init__(self, path: str | Path = DEFAULT_DB_PATH) -> None:
+    def __init__(self, path: str | Path = DEFAULT_INDEXER_DB_PATH) -> None:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.conn = sqlite3.connect(self.path, timeout=30)
@@ -1469,8 +1467,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--rpc-url", default=os.getenv("POLYGON_RPC_URL", ""))
     parser.add_argument(
         "--db",
-        default=os.getenv("POLYSIGNAL_DB", str(DEFAULT_DB_PATH)),
-        help="SQLite database path. Defaults to POLYSIGNAL_DB or data/polysignal.db.",
+        default=os.getenv(
+            "INDEXER_DB_PATH",
+            os.getenv("POLYSIGNAL_DB", str(DEFAULT_INDEXER_DB_PATH)),
+        ),
+        help="SQLite database path. Defaults to INDEXER_DB_PATH or data/indexer.db.",
     )
     parser.add_argument("--start-block", type=int, default=None)
     parser.add_argument("--end-block", type=int, default=None)

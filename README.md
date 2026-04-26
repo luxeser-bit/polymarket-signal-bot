@@ -30,8 +30,9 @@ wallets, creates signals, and opens paper positions.
 
 Open the Streamlit dashboard URL printed by Streamlit, usually
 `http://localhost:8501`. It reads the same SQLite data plus
-`data/paper_state.db`, and replaces the old HTML/JS control room as the primary
-dashboard.
+`data/paper_state.db`. The Indexer tab reads `INDEXER_DB_PATH` or
+`data/indexer.db` and shows raw event ingestion progress toward 86M records.
+The Streamlit app replaces the old HTML/JS control room as the primary dashboard.
 
 ## Live public-data run
 
@@ -236,6 +237,7 @@ python -m pip install ".[indexer]"
 $env:POLYGON_RPC_URL="https://polygon-mainnet.g.alchemy.com/v2/YOUR_KEY"
 $env:RPC_RPS="5"
 $env:CHUNK_SIZE="50"
+$env:INDEXER_DB_PATH="data/indexer.db"
 
 python -m src.indexer --start-block 50000000 --end-block 50001000 --dry-run
 python -m src.indexer --start-block 50000000 --test
