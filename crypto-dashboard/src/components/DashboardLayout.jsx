@@ -19,6 +19,9 @@ export default function DashboardLayout({
   positions,
   paperStatus,
   onRefreshPaper,
+  trainingStatus,
+  onRefreshTraining,
+  onRefreshData,
   equityHistory,
   apiErrors,
 }) {
@@ -84,7 +87,12 @@ export default function DashboardLayout({
           <EquityChart history={equityHistory} live={live} />
         </section>
         <section className="col-span-12 2xl:col-span-5">
-          <WalletCohorts data={wallets} />
+          <WalletCohorts
+            data={wallets}
+            training={trainingStatus}
+            onRefreshTraining={onRefreshTraining}
+            onRefreshWallets={onRefreshData}
+          />
         </section>
 
         <section className="col-span-12">

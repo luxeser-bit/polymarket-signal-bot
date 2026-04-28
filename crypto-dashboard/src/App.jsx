@@ -14,6 +14,7 @@ export default function App() {
   const [wallets, setWallets] = useState(null);
   const [positions, setPositions] = useState(null);
   const [paperStatus, setPaperStatus] = useState(null);
+  const [trainingStatus, setTrainingStatus] = useState(null);
   const [equityHistory, setEquityHistory] = useState([]);
   const [apiErrors, setApiErrors] = useState([]);
 
@@ -69,6 +70,18 @@ export default function App() {
     }
   }, [rememberError]);
 
+  const refreshTraining = useCallback(async () => {
+    try {
+      const payload = await getJson('/api/training/status');
+      setTrainingStatus(payload);
+      return payload;
+    } catch (err) {
+      const message = `Training status unavailable: ${err.message || err}`;
+      rememberError(message);
+      throw err;
+    }
+  }, [rememberError]);
+
   const refreshData = useCallback(async () => {
     try {
       const [metricsPayload, walletsPayload, positionsPayload] = await Promise.all([
@@ -89,11 +102,13 @@ export default function App() {
   useEffect(() => {
     refreshSystem().catch(() => {});
     refreshPaper().catch(() => {});
+    refreshTraining().catch(() => {});
     refreshData().catch(() => {});
-  }, [refreshData, refreshPaper, refreshSystem]);
+  }, [refreshData, refreshPaper, refreshSystem, refreshTraining]);
 
   useInterval(() => refreshSystem().catch(() => {}), 4000);
   useInterval(() => refreshPaper().catch(() => {}), 3000);
+  useInterval(() => refreshTraining().catch(() => {}), 3000);
   useInterval(() => refreshData().catch(() => {}), 3000);
 
   useEffect(() => {
@@ -121,6 +136,9 @@ export default function App() {
       positions={positions}
       paperStatus={paperStatus}
       onRefreshPaper={refreshPaper}
+      trainingStatus={trainingStatus}
+      onRefreshTraining={refreshTraining}
+      onRefreshData={refreshData}
       equityHistory={equityHistory}
       apiErrors={apiErrors}
     />

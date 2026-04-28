@@ -3,6 +3,7 @@ from __future__ import annotations
 import sqlite3
 import tempfile
 import unittest
+import json
 from pathlib import Path
 from unittest.mock import patch
 
@@ -141,6 +142,50 @@ class ServerApiTests(unittest.TestCase):
         self.assertEqual(result["top_wallets"][0]["wallet"], "0xaaa")
         self.assertEqual(result["top_wallets"][0]["status"], "STABLE")
         self.assertEqual(result["top_wallets"][0]["sharpe"], 1)
+
+    def test_training_status_reads_last_training_summary(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "indexer.db"
+            summary = {
+                "ok": True,
+                "raw_transactions": 25,
+                "scored_wallets": 2,
+                "cohorts": {"STABLE": 1, "CANDIDATE": 1},
+            }
+            conn = sqlite3.connect(db_path)
+            conn.execute(
+                """
+                CREATE TABLE training_state (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL,
+                    updated_at INTEGER NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                "INSERT INTO training_state VALUES ('last_training_summary', ?, 1700000000)",
+                (json.dumps(summary),),
+            )
+            conn.commit()
+            conn.close()
+            settings = api.ServerSettings(indexer_db=db_path)
+
+            result = api.training_status_snapshot(settings)
+
+        self.assertFalse(result["running"])
+        self.assertEqual(result["last_run"]["raw_transactions"], 25)
+        self.assertEqual(result["last_run"]["updated_at"], 1700000000)
+
+    def test_training_command_uses_auto_trainer_entrypoint(self) -> None:
+        settings = api.ServerSettings(indexer_db=Path("data/indexer.db"))
+
+        command = api.training_command(settings, test=True, limit=1000, force=False)
+
+        self.assertEqual(command[:3], (api.sys.executable, "-m", "polymarket_signal_bot.auto_trainer"))
+        self.assertIn("--db", command)
+        self.assertIn("--test", command)
+        self.assertIn("--limit", command)
+        self.assertIn("--no-force", command)
 
 
 if __name__ == "__main__":

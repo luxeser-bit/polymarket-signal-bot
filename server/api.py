@@ -14,6 +14,7 @@ state over HTTP/WebSocket for Streamlit today and a React control room later.
 
 import asyncio
 import contextlib
+import json
 import os
 import signal
 import sqlite3
@@ -60,6 +61,8 @@ COMPONENT_KEYS = ("indexer", "monitor", "live_paper")
 SERVER_LOG_DIR = ROOT / "data" / "server_logs"
 PROCESS_LOCK = threading.RLock()
 PROCESS_REGISTRY: dict[str, "ManagedProcess"] = {}
+TRAINING_LOCK = threading.RLock()
+TRAINING_PROCESS: "ManagedTrainingProcess | None" = None
 METRICS_CURSOR: dict[str, float] = {"last_block": 0.0, "seen_at": 0.0}
 LIVE_PAYLOAD_CACHE: dict[str, Any] = {"payload": None, "expires_at": 0.0}
 LIVE_PAYLOAD_LOCK = threading.RLock()
@@ -98,16 +101,36 @@ class ManagedProcess:
     dry_run: bool = False
 
 
+@dataclass
+class ManagedTrainingProcess:
+    process: subprocess.Popen[Any]
+    started_at: float
+    log_handle: Any
+    test: bool = False
+    limit: int | None = None
+
+
 if isinstance(BaseModel, type) and BaseModel is not object:
 
     class PaperStartRequest(BaseModel):
         dry_run: bool | None = None
+
+    class TrainingStartRequest(BaseModel):
+        test: bool | None = None
+        limit: int | None = None
+        force: bool | None = None
 
 else:
 
     class PaperStartRequest:  # pragma: no cover - used only without pydantic installed.
         def __init__(self, dry_run: bool | None = None) -> None:
             self.dry_run = dry_run
+
+    class TrainingStartRequest:  # pragma: no cover - used only without pydantic installed.
+        def __init__(self, test: bool | None = None, limit: int | None = None, force: bool | None = None) -> None:
+            self.test = test
+            self.limit = limit
+            self.force = force
 
 
 class MissingDependencyApp:
@@ -162,6 +185,25 @@ def create_app() -> Any:
     @api.get("/api/wallets")
     async def api_wallets() -> dict[str, Any]:
         return wallet_metrics(settings_from_env())
+
+    @api.post("/api/training/start")
+    async def training_start(request: TrainingStartRequest | None = Body(default=None)) -> dict[str, Any]:
+        settings = settings_from_env()
+        result = start_training(
+            settings,
+            test=bool(request.test) if request and request.test is not None else False,
+            limit=request.limit if request and request.limit else None,
+            force=bool(request.force) if request and request.force is not None else True,
+        )
+        return {"ok": True, "training": result}
+
+    @api.post("/api/training/stop")
+    async def training_stop() -> dict[str, Any]:
+        return {"ok": True, "training": stop_training(settings_from_env(), timeout_seconds=10.0)}
+
+    @api.get("/api/training/status")
+    async def training_status() -> dict[str, Any]:
+        return training_status_snapshot(settings_from_env())
 
     @api.get("/api/positions")
     async def api_positions() -> dict[str, Any]:
@@ -305,6 +347,173 @@ def start_all(settings: ServerSettings) -> dict[str, dict[str, Any]]:
 def stop_all(settings: ServerSettings, *, timeout_seconds: float = 10.0) -> dict[str, dict[str, Any]]:
     specs = component_specs(settings)
     return {key: stop_component(specs[key], timeout_seconds=timeout_seconds) for key in reversed(COMPONENT_KEYS)}
+
+
+def start_training(
+    settings: ServerSettings,
+    *,
+    test: bool = False,
+    limit: int | None = None,
+    force: bool = True,
+) -> dict[str, Any]:
+    global TRAINING_PROCESS
+    with TRAINING_LOCK:
+        current = TRAINING_PROCESS
+        if current and current.process.poll() is None:
+            return {
+                **training_process_status(current),
+                "started": False,
+                "message": "already running",
+                "last_run": latest_training_summary(settings.indexer_db),
+            }
+        cleanup_training_process()
+        SERVER_LOG_DIR.mkdir(parents=True, exist_ok=True)
+        log_path = SERVER_LOG_DIR / "auto_trainer.log"
+        log_handle = log_path.open("ab")
+        command = training_command(settings, test=test, limit=limit, force=force)
+        env = os.environ.copy()
+        env.setdefault("INDEXER_DB_PATH", str(settings.indexer_db))
+        env.setdefault("POLYSIGNAL_DB", str(settings.main_db))
+        creationflags = 0
+        startupinfo = None
+        if os.name == "nt":
+            creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+            startupinfo = subprocess.STARTUPINFO()
+            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        process = subprocess.Popen(
+            list(command),
+            cwd=str(ROOT),
+            env=env,
+            stdout=log_handle,
+            stderr=subprocess.STDOUT,
+            stdin=subprocess.DEVNULL,
+            creationflags=creationflags,
+            startupinfo=startupinfo,
+        )
+        TRAINING_PROCESS = ManagedTrainingProcess(
+            process=process,
+            started_at=time.time(),
+            log_handle=log_handle,
+            test=test,
+            limit=limit,
+        )
+        return {
+            **training_process_status(TRAINING_PROCESS),
+            "started": True,
+            "command": list(command),
+            "log_path": str(log_path),
+            "last_run": latest_training_summary(settings.indexer_db),
+        }
+
+
+def stop_training(settings: ServerSettings, *, timeout_seconds: float = 10.0) -> dict[str, Any]:
+    global TRAINING_PROCESS
+    with TRAINING_LOCK:
+        current = TRAINING_PROCESS
+        if current is None or current.process.poll() is not None:
+            cleanup_training_process()
+            return {
+                "running": False,
+                "status": "stopped",
+                "pid": 0,
+                "stopped": False,
+                "message": "not running",
+                "last_run": latest_training_summary(settings.indexer_db),
+                "log_tail": tail_file(SERVER_LOG_DIR / "auto_trainer.log"),
+            }
+        pid = int(current.process.pid)
+        terminated = terminate_pid(pid, timeout_seconds=timeout_seconds, process=current.process)
+        cleanup_training_process()
+        return {
+            "running": not terminated,
+            "status": "running" if not terminated else "stopped",
+            "pid": pid if not terminated else 0,
+            "stopped": terminated,
+            "message": "stopped" if terminated else "kill failed",
+            "last_run": latest_training_summary(settings.indexer_db),
+            "log_tail": tail_file(SERVER_LOG_DIR / "auto_trainer.log"),
+        }
+
+
+def training_command(
+    settings: ServerSettings,
+    *,
+    test: bool = False,
+    limit: int | None = None,
+    force: bool = True,
+) -> tuple[str, ...]:
+    command = [
+        sys.executable,
+        "-m",
+        "polymarket_signal_bot.auto_trainer",
+        "--db",
+        str(settings.indexer_db),
+        "--model-path",
+        str(ROOT / "data" / "exit_model.pkl"),
+        "--stats-path",
+        str(ROOT / "data" / "exit_stats.json"),
+        "--policy-path",
+        str(ROOT / "data" / "best_policy.json"),
+    ]
+    if test:
+        command.append("--test")
+    if limit:
+        command.extend(["--limit", str(int(limit))])
+    if not force:
+        command.append("--no-force")
+    return tuple(command)
+
+
+def training_status_snapshot(settings: ServerSettings) -> dict[str, Any]:
+    with TRAINING_LOCK:
+        cleanup_training_process()
+        current = TRAINING_PROCESS
+        status = training_process_status(current) if current else {
+            "running": False,
+            "status": "stopped",
+            "pid": 0,
+            "uptime_seconds": 0,
+            "test": False,
+            "limit": None,
+        }
+    log_path = SERVER_LOG_DIR / "auto_trainer.log"
+    return {
+        **status,
+        "last_run": latest_training_summary(settings.indexer_db),
+        "log_path": str(log_path),
+        "log_tail": tail_file(log_path),
+    }
+
+
+def training_process_status(process: ManagedTrainingProcess | None) -> dict[str, Any]:
+    if process is None or process.process.poll() is not None:
+        return {
+            "running": False,
+            "status": "stopped",
+            "pid": 0,
+            "uptime_seconds": 0,
+            "test": bool(process.test) if process else False,
+            "limit": process.limit if process else None,
+        }
+    return {
+        "running": True,
+        "status": "running",
+        "pid": int(process.process.pid),
+        "uptime_seconds": int(time.time() - process.started_at),
+        "test": bool(process.test),
+        "limit": process.limit,
+    }
+
+
+def cleanup_training_process() -> None:
+    global TRAINING_PROCESS
+    if TRAINING_PROCESS is None:
+        return
+    if TRAINING_PROCESS.process.poll() is None:
+        return
+    with contextlib.suppress(Exception):
+        TRAINING_PROCESS.log_handle.close()
+    TRAINING_PROCESS = None
 
 
 def start_component(spec: ComponentSpec) -> dict[str, Any]:
@@ -544,6 +753,7 @@ def wallet_metrics(settings: ServerSettings) -> dict[str, Any]:
         "top_wallets": [],
         "scored_wallets": 0,
         "db_path": str(settings.indexer_db),
+        "last_training": latest_training_summary(settings.indexer_db),
         "error": "",
     }
     if not settings.indexer_db.exists():
@@ -567,6 +777,35 @@ def wallet_metrics(settings: ServerSettings) -> dict[str, Any]:
     except Exception as exc:  # noqa: BLE001 - dashboard can show partial data.
         result["error"] = str(exc)
         return result
+
+
+def latest_training_summary(db_path: Path) -> dict[str, Any] | None:
+    if not db_path.exists():
+        return None
+    try:
+        with sqlite_connect(db_path) as conn:
+            if table_exists(conn, "training_state"):
+                row = conn.execute(
+                    "SELECT value, updated_at FROM training_state WHERE key = 'last_training_summary'"
+                ).fetchone()
+                if row:
+                    payload = json.loads(str(row["value"] or "{}"))
+                    if isinstance(payload, dict):
+                        payload["updated_at"] = int(row["updated_at"] or 0)
+                        return payload
+            if table_exists(conn, "training_runs"):
+                row = conn.execute(
+                    "SELECT started_at, ok, summary_json FROM training_runs ORDER BY started_at DESC LIMIT 1"
+                ).fetchone()
+                if row:
+                    payload = json.loads(str(row["summary_json"] or "{}"))
+                    if isinstance(payload, dict):
+                        payload["updated_at"] = int(row["started_at"] or 0)
+                        payload.setdefault("ok", bool(row["ok"]))
+                        return payload
+    except Exception:
+        return None
+    return None
 
 
 def positions_snapshot(settings: ServerSettings) -> dict[str, Any]:

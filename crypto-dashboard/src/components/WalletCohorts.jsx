@@ -1,5 +1,8 @@
-import { FiUsers } from 'react-icons/fi';
-import { money, numberFull, shortAddress } from '../utils/format';
+import { useState } from 'react';
+import toast from 'react-hot-toast';
+import { FiPlay, FiSquare, FiUsers } from 'react-icons/fi';
+import { postJson } from '../hooks/useApi';
+import { money, numberFull, secondsToDuration, shortAddress, timestampLabel } from '../utils/format';
 
 const COHORTS = [
   ['STABLE', 'text-emerald-300'],
@@ -8,9 +11,36 @@ const COHORTS = [
   ['NOISE', 'text-slate-500'],
 ];
 
-export default function WalletCohorts({ data }) {
+export default function WalletCohorts({ data, training, onRefreshTraining, onRefreshWallets }) {
+  const [loading, setLoading] = useState(false);
+  const [sampleMode, setSampleMode] = useState(false);
   const counts = data?.counts || {};
   const topWallets = Array.isArray(data?.top_wallets) ? data.top_wallets : [];
+  const lastRun = training?.last_run || data?.last_training || null;
+  const trainingRunning = Boolean(training?.running);
+
+  async function trainModel() {
+    setLoading(true);
+    try {
+      if (trainingRunning) {
+        await postJson('/api/training/stop');
+        toast.success('Model training stopped');
+      } else {
+        await postJson('/api/training/start', {
+          test: sampleMode,
+          limit: sampleMode ? 10000 : undefined,
+          force: true,
+        });
+        toast.success(sampleMode ? 'Sample training started' : 'Model training started');
+      }
+      await onRefreshTraining?.();
+      await onRefreshWallets?.();
+    } catch (err) {
+      toast.error(`Training failed: ${err.message || err}`);
+    } finally {
+      setLoading(false);
+    }
+  }
 
   return (
     <div className="panel-card h-full p-4">
@@ -21,7 +51,44 @@ export default function WalletCohorts({ data }) {
             {numberFull(data?.scored_wallets || 0)} scored wallets
           </h2>
         </div>
-        <FiUsers className="text-cyan-300" size={22} aria-hidden="true" />
+        <div className="flex items-center gap-2">
+          <button
+            className="icon-button px-3 py-1.5 text-xs"
+            onClick={trainModel}
+            disabled={loading}
+            title="Run scoring, cohorts and exit model training"
+          >
+            {trainingRunning ? <FiSquare aria-hidden="true" /> : <FiPlay aria-hidden="true" />}
+            {loading ? 'Working' : trainingRunning ? 'Stop Training' : 'Train Model'}
+          </button>
+          <FiUsers className="text-cyan-300" size={22} aria-hidden="true" />
+        </div>
+      </div>
+
+      <div className="mb-3 grid gap-2 border border-slate-700/70 bg-slate-950/40 p-3 text-xs uppercase text-slate-400 lg:grid-cols-[1fr_auto]">
+        <div>
+          <span className="text-cyanLive">Source</span> raw_transactions -&gt; scored_wallets -&gt; wallet_cohorts
+          <div className="mt-1">
+            <span className={trainingRunning ? 'text-good' : 'text-slate-500'}>
+              {trainingRunning ? `Running ${secondsToDuration(training?.uptime_seconds || 0)}` : 'Idle'}
+            </span>
+            {lastRun?.updated_at ? (
+              <span> - last {timestampLabel(lastRun.updated_at)} - {numberFull(lastRun.raw_transactions || 0)} rows</span>
+            ) : (
+              <span> - no training run yet</span>
+            )}
+          </div>
+        </div>
+        <label className="flex items-center gap-2 text-slate-400">
+          <input
+            type="checkbox"
+            checked={sampleMode}
+            disabled={trainingRunning}
+            onChange={(event) => setSampleMode(event.target.checked)}
+            className="h-4 w-4 accent-cyan-400"
+          />
+          Sample 10k
+        </label>
       </div>
 
       <div className="grid grid-cols-4 gap-2">
