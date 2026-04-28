@@ -14,6 +14,7 @@ from polymarket_signal_bot.indexer import (
     IndexerStore,
     ORDER_FILLED_TOPIC,
     PolygonEventIndexer,
+    RawTransaction,
     RpcLogRangeTooLarge,
     TRANSFER_SINGLE_TOPIC,
     build_arg_parser,
@@ -198,6 +199,43 @@ class IndexerTests(unittest.TestCase):
         import src.indexer as indexer
 
         self.assertTrue(callable(indexer.main))
+
+    def test_historical_store_does_not_move_checkpoint_backwards(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with IndexerStore(Path(tmp) / "state.db") as store:
+                store.init_schema()
+                store.set_last_block(500, "0xcurrent")
+                indexer = PolygonEventIndexer(
+                    IndexerConfig(rpc_url="http://rpc"),
+                    store=store,
+                    contracts=[],
+                )
+
+                inserted = indexer._store_chunk(
+                    100,
+                    110,
+                    [
+                        RawTransaction(
+                            hash="0xtx",
+                            log_index=1,
+                            block_number=101,
+                            block_hash="0xold",
+                            timestamp=1700000000,
+                            user_address="0x1111111111111111111111111111111111111111",
+                            market_id="market",
+                            side="BUY",
+                            price=0.5,
+                            amount=1.0,
+                            event_type="OrderFilled",
+                            contract=CTF_EXCHANGE_ADDRESS,
+                            raw_json="{}",
+                        )
+                    ],
+                    [BlockInfo(110, "0xold", 1700000010)],
+                )
+
+                self.assertEqual(inserted, 1)
+                self.assertEqual(store.last_block(), 500)
 
 
 class AdaptiveLogFetchTests(unittest.IsolatedAsyncioTestCase):

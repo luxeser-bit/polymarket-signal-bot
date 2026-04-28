@@ -643,7 +643,16 @@ class PolygonEventIndexer:
         for batch in batched(rows, max(1, self.config.batch_size)):
             inserted += self.store.insert_raw_transactions(batch)
         last_hash = blocks[-1].hash if blocks else ""
-        self.store.set_last_block(chunk_end, last_hash)
+        current_last = self.store.last_block()
+        if current_last is None or chunk_end >= current_last:
+            self.store.set_last_block(chunk_end, last_hash)
+        else:
+            LOGGER.debug(
+                "Stored historical chunk %s..%s without moving checkpoint %s",
+                chunk_start,
+                chunk_end,
+                current_last,
+            )
         LOGGER.debug("Stored chunk %s..%s rows=%s", chunk_start, chunk_end, len(rows))
         return inserted
 
