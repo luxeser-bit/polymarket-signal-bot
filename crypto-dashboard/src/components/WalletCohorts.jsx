@@ -16,11 +16,18 @@ export default function WalletCohorts({ data, training, onRefreshTraining, onRef
   const [loading, setLoading] = useState(false);
   const [sampleMode, setSampleMode] = useState(false);
   const counts = data?.counts || {};
-  const topWallets = Array.isArray(data?.top_wallets) ? data.top_wallets : [];
+  const scoredRows = Array.isArray(data?.scored_wallet_rows)
+    ? data.scored_wallet_rows
+    : Array.isArray(data?.top_wallets)
+      ? data.top_wallets
+      : [];
+  const topWallets = scoredRows;
   const lastRun = training?.last_run || data?.last_training || null;
   const trainingRunning = Boolean(training?.running);
   const exitExamples =
     training?.exit_examples?.count ?? data?.exit_examples?.count ?? lastRun?.exit_examples ?? 0;
+  const exitRows = Array.isArray(data?.exit_examples?.examples) ? data.exit_examples.examples : [];
+  const modelMetrics = data?.model_metrics || {};
   const scoredWallets = Number(data?.scored_wallets || 0);
   const walletProgress = Math.min(1, scoredWallets / TARGET_WALLETS);
   const walletProgressPct = walletProgress * 100;
@@ -119,6 +126,13 @@ export default function WalletCohorts({ data, training, onRefreshTraining, onRef
         </label>
       </div>
 
+      <div className="mb-3 grid gap-2 sm:grid-cols-4">
+        <MetricTile label="median hold" value={secondsToDuration(modelMetrics.median_hold_time || 0)} />
+        <MetricTile label="mae" value={modelMetrics.mae == null ? '-' : secondsToDuration(modelMetrics.mae)} />
+        <MetricTile label="r2" value={modelMetrics.r2 == null ? '-' : Number(modelMetrics.r2 || 0).toFixed(3)} />
+        <MetricTile label="model" value={modelLabel(modelMetrics.model_type, modelMetrics.fallback_reason)} />
+      </div>
+
       <div className="grid grid-cols-4 gap-2">
         {COHORTS.map(([name, color]) => (
           <div key={name} className="rounded-lg border border-slate-700/70 bg-slate-950/40 p-3">
@@ -128,10 +142,49 @@ export default function WalletCohorts({ data, training, onRefreshTraining, onRef
         ))}
       </div>
 
+      <div className="mt-4 rounded-lg border border-slate-700/70 bg-slate-950/40 p-3">
+        <div className="mb-2 flex items-center justify-between gap-3">
+          <div className="text-xs font-semibold uppercase tracking-wide text-cyanLive">Scored // top sharpe</div>
+          <div className="text-[10px] font-semibold uppercase tracking-wide text-slate-500">
+            {numberFull(scoredRows.length)} / 50
+          </div>
+        </div>
+        <div className="max-h-56 overflow-auto pr-1">
+          {scoredRows.length ? (
+            <table className="w-full text-left text-xs">
+              <thead className="sticky top-0 bg-slate-950 text-[10px] uppercase tracking-wide text-slate-500">
+                <tr>
+                  <th className="py-1 pr-2">wallet</th>
+                  <th className="py-1 pr-2">cohort</th>
+                  <th className="py-1 pr-2 text-right">sharpe</th>
+                  <th className="py-1 pr-2 text-right">win</th>
+                  <th className="py-1 text-right">pnl</th>
+                </tr>
+              </thead>
+              <tbody>
+                {scoredRows.map((wallet) => (
+                  <tr key={`${wallet.user_address || wallet.wallet}-${wallet.cohort || wallet.status}`} className="border-t border-slate-800/80">
+                    <td className="py-1.5 pr-2 text-slate-300">{shortAddress(wallet.user_address || wallet.wallet)}</td>
+                    <td className="py-1.5 pr-2 text-cyan-300">{wallet.cohort || wallet.status || '-'}</td>
+                    <td className="py-1.5 pr-2 text-right text-slate-100">{Number(wallet.sharpe || 0).toFixed(2)}</td>
+                    <td className="py-1.5 pr-2 text-right text-slate-400">{(Number(wallet.win_rate || 0) * 100).toFixed(1)}%</td>
+                    <td className={Number(wallet.pnl || 0) >= 0 ? 'py-1.5 text-right text-emerald-300' : 'py-1.5 text-right text-red-300'}>
+                      {money(wallet.pnl || 0, 0)}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          ) : (
+            <div className="py-6 text-center text-xs text-slate-600">empty</div>
+          )}
+        </div>
+      </div>
+
       <div className="mt-4 grid gap-3 lg:grid-cols-2">
         {COHORTS.map(([name, color]) => {
           const rows = topWallets
-            .filter((wallet) => (wallet.status || 'NOISE') === name)
+            .filter((wallet) => (wallet.cohort || wallet.status || 'NOISE') === name)
             .slice(0, 5);
           return (
             <div key={name} className="min-h-[136px] rounded-lg border border-slate-700/70 bg-slate-950/40 p-3">
@@ -139,8 +192,8 @@ export default function WalletCohorts({ data, training, onRefreshTraining, onRef
               {rows.length ? (
                 <div className="space-y-1.5">
                   {rows.map((wallet) => (
-                    <div key={wallet.wallet} className="grid grid-cols-[1fr_auto_auto] gap-2 text-xs">
-                      <span className="truncate text-slate-300">{shortAddress(wallet.wallet)}</span>
+                    <div key={wallet.user_address || wallet.wallet} className="grid grid-cols-[1fr_auto_auto] gap-2 text-xs">
+                      <span className="truncate text-slate-300">{shortAddress(wallet.user_address || wallet.wallet)}</span>
                       <span className={Number(wallet.pnl || 0) >= 0 ? 'text-emerald-300' : 'text-red-300'}>
                         {money(wallet.pnl || 0, 0)}
                       </span>
@@ -155,6 +208,62 @@ export default function WalletCohorts({ data, training, onRefreshTraining, onRef
           );
         })}
       </div>
+
+      <div className="mt-4 rounded-lg border border-slate-700/70 bg-slate-950/40 p-3">
+        <div className="mb-2 flex items-center justify-between gap-3">
+          <div className="text-xs font-semibold uppercase tracking-wide text-cyanLive">Exit examples</div>
+          <div className="text-[10px] font-semibold uppercase tracking-wide text-slate-500">{numberFull(exitRows.length)}</div>
+        </div>
+        {exitRows.length ? (
+          <div className="overflow-auto">
+            <table className="w-full text-left text-xs">
+              <thead className="text-[10px] uppercase tracking-wide text-slate-500">
+                <tr>
+                  <th className="py-1 pr-2">whale</th>
+                  <th className="py-1 pr-2">market</th>
+                  <th className="py-1 pr-2">entry</th>
+                  <th className="py-1 pr-2">exit</th>
+                  <th className="py-1 pr-2 text-right">pnl</th>
+                  <th className="py-1 text-right">predicted</th>
+                </tr>
+              </thead>
+              <tbody>
+                {exitRows.slice(0, 10).map((example, index) => (
+                  <tr key={`${example.whale_address}-${example.market_id}-${example.entry_time}-${index}`} className="border-t border-slate-800/80">
+                    <td className="py-1.5 pr-2 text-slate-300">{shortAddress(example.whale_address)}</td>
+                    <td className="py-1.5 pr-2 text-slate-400">{shortAddress(example.market_id)}</td>
+                    <td className="py-1.5 pr-2 text-slate-400">{timestampLabel(example.entry_time)}</td>
+                    <td className="py-1.5 pr-2 text-slate-400">{timestampLabel(example.exit_time)}</td>
+                    <td className={Number(example.pnl_percent || 0) >= 0 ? 'py-1.5 pr-2 text-right text-emerald-300' : 'py-1.5 pr-2 text-right text-red-300'}>
+                      {Number(example.pnl_percent || 0).toFixed(2)}%
+                    </td>
+                    <td className="py-1.5 text-right text-cyan-300">{secondsToDuration(example.predicted_time || 0)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        ) : (
+          <div className="py-6 text-center text-xs text-slate-600">empty</div>
+        )}
+      </div>
     </div>
   );
+}
+
+function MetricTile({ label, value }) {
+  return (
+    <div className="rounded-lg border border-slate-700/70 bg-slate-950/40 p-3">
+      <div className="text-sm font-semibold text-slate-100">{value}</div>
+      <div className="mt-1 text-[10px] font-semibold uppercase tracking-wide text-slate-500">{label}</div>
+    </div>
+  );
+}
+
+function modelLabel(modelType, fallbackReason) {
+  const raw = String(modelType || '').toLowerCase();
+  if (raw.includes('ridge')) return 'Ridge';
+  if (raw.includes('dummy')) return 'Dummy';
+  if (fallbackReason) return 'Dummy';
+  return '-';
 }

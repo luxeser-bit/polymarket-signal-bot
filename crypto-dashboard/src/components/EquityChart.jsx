@@ -35,7 +35,7 @@ export default function EquityChart({ history, live }) {
         <FiTrendingUp className="text-cyan-300" size={22} aria-hidden="true" />
       </div>
 
-      <div className="grid min-h-[300px] gap-4 xl:grid-cols-[1.7fr_1fr]">
+      <div className="grid min-h-[300px] gap-4">
         <div className="h-[300px] rounded-lg border border-slate-700/70 bg-slate-950/30 p-3">
           <ResponsiveContainer width="100%" height="100%">
             <LineChart data={points}>

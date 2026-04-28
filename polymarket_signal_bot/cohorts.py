@@ -24,15 +24,17 @@ class CohortConfig:
 
 @dataclass(frozen=True)
 class CohortThresholds:
-    stable_score: float = 0.68
-    candidate_score: float = 0.52
-    watch_score: float = 0.32
-    stable_min_trades: int = 20
-    candidate_min_trades: int = 8
-    watch_min_trades: int = 2
-    stable_min_volume: float = 1_000.0
-    candidate_min_volume: float = 250.0
-    watch_min_volume: float = 25.0
+    stable_min_sharpe: float = 1.5
+    stable_min_win_rate: float = 0.55
+    stable_min_trades: int = 50
+    stable_max_drawdown: float = 20.0
+    stable_min_avg_hold_time: float = 300.0
+    candidate_min_sharpe: float = 1.0
+    candidate_min_win_rate: float = 0.50
+    candidate_min_trades: int = 20
+    candidate_max_drawdown: float = 30.0
+    watch_min_win_rate: float = 0.45
+    watch_min_trades: int = 10
 
 
 def wallet_cohort_report(store: Store, config: CohortConfig | None = None) -> dict[str, Any]:
@@ -77,42 +79,102 @@ def update_cohorts(
             return {"updated": 0, "counts": {}, "thresholds": thresholds.__dict__}
         now = int(time.time())
         wallet_expr = _scored_wallet_address_expression(conn)
+        score_expr = _scored_numeric_expression(conn, "score", "0.0")
+        pnl_expr = _scored_numeric_expression(conn, "pnl", "0.0")
+        sharpe_expr = _scored_numeric_expression(conn, "sharpe", "0.0")
+        volume_expr = _scored_numeric_expression(conn, "volume", "0.0")
+        trade_count_expr = _scored_numeric_expression(conn, "trade_count", "0")
+        win_rate_expr = _scored_numeric_expression(conn, "win_rate", "0.0")
+        profit_factor_expr = _scored_numeric_expression(conn, "profit_factor", "0.0")
+        max_drawdown_expr = _scored_numeric_expression(conn, "max_drawdown", "999999.0")
+        avg_hold_time_expr = _scored_numeric_expression(conn, "avg_hold_time", "0.0")
         conn.execute("DELETE FROM wallet_cohorts")
         conn.execute(
             f"""
+            WITH scored AS (
+                SELECT
+                    {wallet_expr} AS wallet,
+                    {score_expr} AS score,
+                    {pnl_expr} AS pnl,
+                    {sharpe_expr} AS sharpe,
+                    {volume_expr} AS volume,
+                    CAST({trade_count_expr} AS INTEGER) AS trade_count,
+                    {win_rate_expr} AS win_rate,
+                    {profit_factor_expr} AS profit_factor,
+                    ABS({max_drawdown_expr}) AS max_drawdown,
+                    {avg_hold_time_expr} AS avg_hold_time
+                FROM scored_wallets
+                WHERE {wallet_expr} != ''
+            ),
+            assigned AS (
+                SELECT
+                    *,
+                    CASE
+                        WHEN sharpe >= ?
+                             AND win_rate >= ?
+                             AND trade_count >= ?
+                             AND max_drawdown <= ?
+                             AND avg_hold_time >= ?
+                            THEN 'STABLE'
+                        WHEN sharpe >= ?
+                             AND win_rate >= ?
+                             AND trade_count >= ?
+                             AND max_drawdown <= ?
+                            THEN 'CANDIDATE'
+                        WHEN win_rate >= ?
+                             AND trade_count >= ?
+                            THEN 'WATCH'
+                        ELSE 'NOISE'
+                    END AS cohort,
+                    ROUND(
+                        0.30 * MIN(1.0, MAX(0.0, sharpe / ?))
+                        + 0.25 * MIN(1.0, MAX(0.0, win_rate / ?))
+                        + 0.20 * MIN(1.0, MAX(0.0, CAST(trade_count AS REAL) / ?))
+                        + 0.15 * (1.0 - MIN(1.0, MAX(0.0, max_drawdown / ?)))
+                        + 0.10 * MIN(1.0, MAX(0.0, avg_hold_time / ?)),
+                        4
+                    ) AS stability_score
+                FROM scored
+            )
             INSERT INTO wallet_cohorts(
-                wallet, status, stability_score, score, pnl, volume, trade_count,
-                win_rate, profit_factor, max_drawdown, updated_at
+                wallet, user_address, status, cohort, stability_score, score, pnl, sharpe,
+                volume, trade_count, win_rate, profit_factor, max_drawdown, avg_hold_time, updated_at
             )
             SELECT
-                {wallet_expr} AS wallet,
-                CASE
-                    WHEN score >= ? AND trade_count >= ? AND volume >= ? THEN 'STABLE'
-                    WHEN score >= ? AND trade_count >= ? AND volume >= ? THEN 'CANDIDATE'
-                    WHEN score >= ? AND trade_count >= ? AND volume >= ? THEN 'WATCH'
-                    ELSE 'NOISE'
-                END AS status,
-                score AS stability_score,
+                wallet,
+                wallet AS user_address,
+                cohort AS status,
+                cohort,
+                stability_score,
                 score,
                 pnl,
+                sharpe,
                 volume,
                 trade_count,
                 win_rate,
                 profit_factor,
                 max_drawdown,
+                avg_hold_time,
                 ?
-            FROM scored_wallets
+            FROM assigned
             """,
             (
-                thresholds.stable_score,
+                thresholds.stable_min_sharpe,
+                thresholds.stable_min_win_rate,
                 thresholds.stable_min_trades,
-                thresholds.stable_min_volume,
-                thresholds.candidate_score,
+                thresholds.stable_max_drawdown,
+                thresholds.stable_min_avg_hold_time,
+                thresholds.candidate_min_sharpe,
+                thresholds.candidate_min_win_rate,
                 thresholds.candidate_min_trades,
-                thresholds.candidate_min_volume,
-                thresholds.watch_score,
+                thresholds.candidate_max_drawdown,
+                thresholds.watch_min_win_rate,
                 thresholds.watch_min_trades,
-                thresholds.watch_min_volume,
+                max(thresholds.stable_min_sharpe, 0.0001),
+                max(thresholds.stable_min_win_rate, 0.0001),
+                max(float(thresholds.stable_min_trades), 1.0),
+                max(thresholds.candidate_max_drawdown, thresholds.stable_max_drawdown, 0.0001),
+                max(thresholds.stable_min_avg_hold_time, 1.0),
                 now,
             ),
         )
@@ -147,11 +209,16 @@ def load_wallet_cohorts(
     try:
         if not _table_exists(conn, "wallet_cohorts"):
             return {}
+        columns = _table_columns(conn, "wallet_cohorts")
+        wallet_expr = "COALESCE(NULLIF(user_address, ''), wallet)" if "user_address" in columns else "wallet"
+        status_expr = "COALESCE(NULLIF(cohort, ''), status)" if "cohort" in columns else "status"
+        sharpe_expr = "sharpe" if "sharpe" in columns else "0.0"
+        avg_hold_time_expr = "avg_hold_time" if "avg_hold_time" in columns else "0.0"
         clauses = []
         params: list[Any] = []
         if statuses:
             placeholders = ",".join("?" for _ in statuses)
-            clauses.append(f"status IN ({placeholders})")
+            clauses.append(f"{status_expr} IN ({placeholders})")
             params.extend(sorted(statuses))
         where = "WHERE " + " AND ".join(clauses) if clauses else ""
         limit_sql = "LIMIT ?" if limit else ""
@@ -159,8 +226,20 @@ def load_wallet_cohorts(
             params.append(limit)
         rows = conn.execute(
             f"""
-            SELECT wallet, status, stability_score, score, pnl, volume, trade_count,
-                   win_rate, profit_factor, max_drawdown, updated_at
+            SELECT
+                {wallet_expr} AS wallet,
+                {status_expr} AS status,
+                stability_score,
+                score,
+                pnl,
+                {sharpe_expr} AS sharpe,
+                volume,
+                trade_count,
+                win_rate,
+                profit_factor,
+                max_drawdown,
+                {avg_hold_time_expr} AS avg_hold_time,
+                updated_at
             FROM wallet_cohorts
             {where}
             ORDER BY stability_score DESC, volume DESC
@@ -172,14 +251,17 @@ def load_wallet_cohorts(
             str(row["wallet"]): {
                 "wallet": str(row["wallet"]),
                 "status": str(row["status"]),
+                "cohort": str(row["status"]),
                 "stabilityScore": float(row["stability_score"] or 0.0),
                 "score": float(row["score"] or 0.0),
                 "pnl": float(row["pnl"] or 0.0),
+                "sharpe": float(row["sharpe"] or 0.0),
                 "volume": float(row["volume"] or 0.0),
                 "tradeCount": int(row["trade_count"] or 0),
                 "winRate": float(row["win_rate"] or 0.0),
                 "profitFactor": float(row["profit_factor"] or 0.0),
                 "maxDrawdown": float(row["max_drawdown"] or 0.0),
+                "avgHoldTime": float(row["avg_hold_time"] or 0.0),
                 "updatedAt": int(row["updated_at"] or 0),
             }
             for row in rows
@@ -196,17 +278,78 @@ def load_cohort_thresholds(policy_path: str | Path = DEFAULT_POLICY_PATH) -> Coh
         payload = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return CohortThresholds()
-    source = payload.get("cohort_thresholds") if isinstance(payload, dict) else None
-    if not isinstance(source, dict):
-        source = payload.get("thresholds") if isinstance(payload, dict) else None
+    source = _cohort_policy_source(payload)
     if not isinstance(source, dict):
         return CohortThresholds()
     defaults = CohortThresholds()
-    values = {
-        field: type(getattr(defaults, field))(source.get(field, getattr(defaults, field)))
-        for field in defaults.__dict__
-    }
+    values = _threshold_values_from_policy(source, defaults)
     return CohortThresholds(**values)
+
+
+def _cohort_policy_source(payload: Any) -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        return {}
+    for key in ("cohort_thresholds", "cohorts", "thresholds"):
+        source = payload.get(key)
+        if isinstance(source, dict):
+            return source
+    return payload
+
+
+def _threshold_values_from_policy(source: dict[str, Any], defaults: CohortThresholds) -> dict[str, Any]:
+    aliases: dict[str, tuple[str, tuple[str, ...]]] = {
+        "stable_min_sharpe": ("stable", ("min_sharpe", "sharpe")),
+        "stable_min_win_rate": ("stable", ("min_win_rate", "win_rate")),
+        "stable_min_trades": ("stable", ("min_trades", "trade_count", "trades")),
+        "stable_max_drawdown": ("stable", ("max_drawdown", "drawdown")),
+        "stable_min_avg_hold_time": ("stable", ("min_avg_hold_time", "avg_hold_time", "hold_time")),
+        "candidate_min_sharpe": ("candidate", ("min_sharpe", "sharpe")),
+        "candidate_min_win_rate": ("candidate", ("min_win_rate", "win_rate")),
+        "candidate_min_trades": ("candidate", ("min_trades", "trade_count", "trades")),
+        "candidate_max_drawdown": ("candidate", ("max_drawdown", "drawdown")),
+        "watch_min_win_rate": ("watch", ("min_win_rate", "win_rate")),
+        "watch_min_trades": ("watch", ("min_trades", "trade_count", "trades")),
+    }
+    values: dict[str, Any] = {}
+    for field, default in defaults.__dict__.items():
+        cohort, nested_keys = aliases[field]
+        raw_value = _policy_value(source, field, cohort, nested_keys)
+        if raw_value is None:
+            values[field] = default
+            continue
+        try:
+            if isinstance(default, int):
+                values[field] = int(float(raw_value))
+            else:
+                values[field] = float(raw_value)
+        except (TypeError, ValueError):
+            values[field] = default
+    return values
+
+
+def _policy_value(
+    source: dict[str, Any],
+    field: str,
+    cohort: str,
+    nested_keys: tuple[str, ...],
+) -> Any:
+    direct_keys = (
+        field,
+        field.replace("_min_", "_"),
+        field.replace("_max_", "_"),
+    )
+    for key in direct_keys:
+        if key in source:
+            return source[key]
+
+    for section_key in (cohort, cohort.upper(), cohort.capitalize()):
+        section = source.get(section_key)
+        if not isinstance(section, dict):
+            continue
+        for key in nested_keys:
+            if key in section:
+                return section[key]
+    return None
 
 
 def ensure_cohort_schema(conn: sqlite3.Connection) -> None:
@@ -216,19 +359,21 @@ def ensure_cohort_schema(conn: sqlite3.Connection) -> None:
         """
         CREATE TABLE IF NOT EXISTS wallet_cohorts (
             wallet TEXT PRIMARY KEY,
+            user_address TEXT NOT NULL DEFAULT '',
             status TEXT NOT NULL,
+            cohort TEXT NOT NULL DEFAULT '',
             stability_score REAL NOT NULL,
             score REAL NOT NULL,
             pnl REAL NOT NULL,
+            sharpe REAL NOT NULL DEFAULT 0,
             volume REAL NOT NULL,
             trade_count INTEGER NOT NULL,
             win_rate REAL NOT NULL,
             profit_factor REAL NOT NULL,
             max_drawdown REAL NOT NULL,
+            avg_hold_time REAL NOT NULL DEFAULT 0,
             updated_at INTEGER NOT NULL
         );
-        CREATE INDEX IF NOT EXISTS idx_wallet_cohorts_status_score
-            ON wallet_cohorts(status, stability_score DESC);
         CREATE TABLE IF NOT EXISTS training_state (
             key TEXT PRIMARY KEY,
             value TEXT NOT NULL,
@@ -236,7 +381,34 @@ def ensure_cohort_schema(conn: sqlite3.Connection) -> None:
         );
         """
     )
+    _ensure_wallet_cohort_columns(conn)
+    conn.executescript(
+        """
+        CREATE INDEX IF NOT EXISTS idx_wallet_cohorts_status_score
+            ON wallet_cohorts(status, stability_score DESC);
+        CREATE INDEX IF NOT EXISTS idx_wallet_cohorts_cohort_score
+            ON wallet_cohorts(cohort, stability_score DESC);
+        CREATE INDEX IF NOT EXISTS idx_wallet_cohorts_user_address
+            ON wallet_cohorts(user_address);
+        """
+    )
     conn.commit()
+
+
+def _ensure_wallet_cohort_columns(conn: sqlite3.Connection) -> None:
+    columns = _table_columns(conn, "wallet_cohorts")
+    migrations = {
+        "user_address": "TEXT NOT NULL DEFAULT ''",
+        "cohort": "TEXT NOT NULL DEFAULT ''",
+        "sharpe": "REAL NOT NULL DEFAULT 0",
+        "avg_hold_time": "REAL NOT NULL DEFAULT 0",
+    }
+    for column, ddl in migrations.items():
+        if column not in columns:
+            conn.execute(f"ALTER TABLE wallet_cohorts ADD COLUMN {column} {ddl}")
+
+    conn.execute("UPDATE wallet_cohorts SET user_address = wallet WHERE COALESCE(user_address, '') = ''")
+    conn.execute("UPDATE wallet_cohorts SET cohort = status WHERE COALESCE(cohort, '') = ''")
 
 
 def _connect(db_path: str | Path, *, read_only: bool = False) -> sqlite3.Connection:
@@ -265,9 +437,26 @@ def _table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
 
 def _scored_wallet_address_expression(conn: sqlite3.Connection) -> str:
     columns = _table_columns(conn, "scored_wallets")
-    if "address" in columns:
+    if {"user_address", "address", "wallet"}.issubset(columns):
+        return "COALESCE(NULLIF(user_address, ''), NULLIF(address, ''), wallet)"
+    if {"user_address", "wallet"}.issubset(columns):
+        return "COALESCE(NULLIF(user_address, ''), wallet)"
+    if {"address", "wallet"}.issubset(columns):
         return "COALESCE(NULLIF(address, ''), wallet)"
-    return "wallet"
+    if "user_address" in columns:
+        return "user_address"
+    if "address" in columns:
+        return "address"
+    if "wallet" in columns:
+        return "wallet"
+    return "''"
+
+
+def _scored_numeric_expression(conn: sqlite3.Connection, column: str, default: str) -> str:
+    columns = _table_columns(conn, "scored_wallets")
+    if column not in columns:
+        return default
+    return f"COALESCE(CAST({column} AS REAL), {default})"
 
 
 def _wallet_rows(store: Store, since_ts: int, config: CohortConfig) -> list[dict[str, Any]]:

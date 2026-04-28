@@ -21,21 +21,26 @@ only after legal review, exchange access review, and a long paper-trading run.
 ```powershell
 python -m polymarket_signal_bot demo
 python -m polymarket_signal_bot report
-python -m pip install -r requirements-streamlit.txt
-streamlit run dashboard.py
+python -m pip install -r requirements-server.txt
+python server/api.py
+cd crypto-dashboard
+npm install
+npm run dev
 ```
 
 The demo command creates `data/polysignal.db`, loads synthetic trades, scores
 wallets, creates signals, and opens paper positions.
 
-Open the Streamlit dashboard URL printed by Streamlit, usually
-`http://localhost:8501`. It reads the same SQLite data plus
-`data/paper_state.db`. The Indexer tab reads `INDEXER_DB_PATH` or
-`data/indexer.db` and shows raw event ingestion progress toward 86M records.
-The Streamlit app replaces the old HTML/JS control room as the primary dashboard.
-The main screen includes `SYSTEM CONTROL`: `START ALL` launches the indexer,
-monitor, and live paper runner in the background, while `STOP ALL` terminates
-those component PIDs and shows recent per-component logs.
+Open the React control room at `http://127.0.0.1:3000`. It reads state through
+the FastAPI backend at `http://127.0.0.1:8000`. The Indexer panel reads
+`INDEXER_DB_PATH` or `data/indexer.db` and shows raw event ingestion progress
+toward 86M records. The main screen includes `SYSTEM CONTROL`: `START ALL`
+launches the indexer, monitor, and live paper runner in the background, while
+`STOP ALL` terminates those component PIDs and shows recent per-component logs.
+
+Streamlit is no longer an active dashboard. `dashboard.py` is kept only as a
+legacy compatibility module for tests and old helper functions; running it shows
+a redirect notice to the React control room.
 
 FastAPI backend for production-style control:
 
@@ -58,7 +63,37 @@ npm run dev
 
 The Vite app runs on `http://127.0.0.1:3000` and talks to the FastAPI backend
 through `VITE_API_URL` or `http://127.0.0.1:8000` by default. It is the intended
-replacement for the old Streamlit dashboard.
+replacement for the old Streamlit dashboard and is now the primary UI.
+
+## Windows one-click startup
+
+After a PC reboot, use the root launcher:
+
+```powershell
+.\START_POLYSIGNAL.bat
+```
+
+It starts FastAPI, the React dashboard, then calls `/system/start` so the
+indexer, monitor, and live paper runner come up behind the dashboard. It opens
+`http://127.0.0.1:3000` when ready. Logs go to `data/system_logs/`.
+
+To stop the local stack:
+
+```powershell
+.\STOP_POLYSIGNAL.bat
+```
+
+Optional Windows autostart on login:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\install_autostart.ps1
+```
+
+Remove autostart:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\uninstall_autostart.ps1
+```
 
 ## Live public-data run
 
@@ -93,11 +128,13 @@ python -m polymarket_signal_bot reviews --status PENDING
 Then start the local interface:
 
 ```powershell
-streamlit run dashboard.py
+python server/api.py
+cd crypto-dashboard
+npm run dev
 ```
 
-The older `python -m polymarket_signal_bot dashboard` command is retained as a
-legacy compatibility path, but new UI work should target the Streamlit dashboard.
+The old Streamlit entry point is disabled for active use. It remains in the repo
+only for compatibility tests and legacy helper functions.
 
 ## Monitor mode
 
@@ -142,8 +179,9 @@ python -m polymarket_signal_bot monitor --no-auto-retrain
 python -m polymarket_signal_bot monitor --retrain-interval-hours 12 --retrain-min-new-records 100000
 ```
 
-The Streamlit Indexer tab has a `RETRAIN NOW` button and shows the latest
-training time, scored wallet count, cohort counts, and exit-model examples.
+The React Wallet Cohorts panel has a `TRAIN MODEL` button and shows the latest
+training time, scored wallet count, cohort counts, 14K wallet target progress,
+and exit-model examples.
 
 ## Live paper runner
 
@@ -400,12 +438,12 @@ This is the working checklist for the project.
 Done:
 
 - MVP without real trades: public leaderboard/activity collection, local SQLite,
-  wallet scoring, signal generation, paper positions, Streamlit local dashboard.
+  wallet scoring, signal generation, paper positions, React/FastAPI dashboard.
 - Signal engine v1: scored wallets, recent trade filters, minimum trade size,
   suggested entry price, position size, confidence, stop loss, take profit,
   duplicate-position protection.
 - Paper trading v1: simulated entries, conservative slippage, open/closed paper
-  positions, realized/unrealized PnL in the Streamlit dashboard.
+  positions, realized/unrealized PnL in the React dashboard.
 - Monitor v1: recurring scan loop, dashboard heartbeat, Telegram alert router
   with duplicate protection and dry-run mode.
 - Market/order-book v1: public CLOB `/books` sync, best bid/ask, spread, depth,

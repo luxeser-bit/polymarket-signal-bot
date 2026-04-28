@@ -8,6 +8,7 @@ const ORDER = ['indexer', 'monitor', 'live_paper'];
 
 export default function SystemControl({ status, onRefresh }) {
   const [loading, setLoading] = useState(false);
+  const [componentLoading, setComponentLoading] = useState({});
   const components = status?.components || {};
   const allRunning = useMemo(
     () => ORDER.every((key) => components[key]?.running),
@@ -24,6 +25,19 @@ export default function SystemControl({ status, onRefresh }) {
       toast.error(`System command failed: ${err.message || err}`);
     } finally {
       setLoading(false);
+    }
+  }
+
+  async function toggleComponent(key, running) {
+    setComponentLoading((items) => ({ ...items, [key]: true }));
+    try {
+      await postJson(`/system/${key}/${running ? 'stop' : 'start'}`);
+      toast.success(`${components[key]?.name || key} ${running ? 'stopped' : 'started'}`);
+      await onRefresh?.();
+    } catch (err) {
+      toast.error(`Component command failed: ${err.message || err}`);
+    } finally {
+      setComponentLoading((items) => ({ ...items, [key]: false }));
     }
   }
 
@@ -51,16 +65,28 @@ export default function SystemControl({ status, onRefresh }) {
       <div className="space-y-2">
         {ORDER.map((key) => {
           const item = components[key] || {};
+          const rowLoading = Boolean(componentLoading[key]);
+          const actionLabel = item.running ? 'Stop' : 'Start';
           return (
             <div
               key={key}
               className="flex items-center justify-between rounded-lg border border-slate-700/70 bg-slate-950/40 px-3 py-2"
             >
-              <div className="flex items-center gap-2">
+              <div className="flex min-w-0 items-center gap-2">
+                <button
+                  className={`icon-button h-7 min-w-[74px] px-2 py-0 text-[11px] ${item.running ? 'danger-button' : ''}`}
+                  onClick={() => toggleComponent(key, Boolean(item.running))}
+                  disabled={loading || rowLoading}
+                  title={`${actionLabel} ${item.name || key}`}
+                  aria-label={`${actionLabel} ${item.name || key}`}
+                >
+                  {item.running ? <FiSquare aria-hidden="true" /> : <FiPlay aria-hidden="true" />}
+                  {rowLoading ? '...' : actionLabel}
+                </button>
                 <span
                   className={`h-2.5 w-2.5 rounded-full ${item.running ? 'bg-good shadow-[0_0_12px_rgba(34,197,94,0.65)]' : 'bg-slate-500'}`}
                 />
-                <span className="text-sm font-medium text-slate-200">{item.name || key}</span>
+                <span className="truncate text-sm font-medium text-slate-200">{item.name || key}</span>
               </div>
               <div className="text-right text-xs text-slate-500">
                 <div>{item.running ? `PID ${item.pid}` : 'stopped'}</div>

@@ -149,18 +149,17 @@ def train_exit_model(
     limit: int | None = None,
 ) -> dict[str, Any]:
     examples = _exit_examples(Path(db_path), stable_wallets=stable_wallets, limit=limit)
-    stats = _exit_stats(examples)
     model = _fit_exit_model(examples)
+    stats = {**_exit_stats(examples), **_model_stats(model)}
     model_path = Path(model_path)
     stats_path = Path(stats_path)
     examples_path = Path(examples_path)
     model_path.parent.mkdir(parents=True, exist_ok=True)
     stats_path.parent.mkdir(parents=True, exist_ok=True)
     examples_path.parent.mkdir(parents=True, exist_ok=True)
-    with model_path.open("wb") as handle:
-        pickle.dump(model, handle)
+    serializer = _dump_exit_model(model, model_path)
     stats_path.write_text(json.dumps(stats, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
-    sample_examples = examples[:10]
+    sample_examples = [_exit_example_payload(example, model) for example in examples[:10]]
     examples_path.write_text(
         json.dumps(sample_examples, ensure_ascii=False, indent=2, sort_keys=True),
         encoding="utf-8",
@@ -170,6 +169,7 @@ def train_exit_model(
         "saved_examples": len(sample_examples),
         "stats": stats,
         "model_type": model.get("type", "unknown"),
+        "serializer": serializer,
     }
 
 
@@ -181,9 +181,12 @@ def _exit_examples(
 ) -> list[dict[str, Any]]:
     if not db_path.exists() or not stable_wallets:
         return []
-    placeholders = ",".join("?" for _ in stable_wallets)
+    normalized_wallets = {wallet.lower() for wallet in stable_wallets if wallet}
+    if not normalized_wallets:
+        return []
+    placeholders = ",".join("?" for _ in normalized_wallets)
     limit_sql = "LIMIT ?" if limit else ""
-    params: list[Any] = [*sorted(stable_wallets)]
+    params: list[Any] = [*sorted(normalized_wallets)]
     if limit:
         params.append(int(limit))
     query = f"""
@@ -193,6 +196,9 @@ def _exit_examples(
             market_id,
             UPPER(side) AS side,
             timestamp,
+            block_number,
+            log_index,
+            hash,
             ABS(amount) AS amount,
             price,
             CASE WHEN price > 0 THEN ABS(amount) * price ELSE ABS(amount) END AS notional
@@ -205,38 +211,92 @@ def _exit_examples(
           AND ABS(amount) > 0
           AND timestamp > 0
     ),
-    ordered AS (
+    buys AS (
+        SELECT * FROM fills WHERE side = 'BUY'
+    ),
+    sells AS (
+        SELECT * FROM fills WHERE side = 'SELL'
+    ),
+    pairs AS (
         SELECT
-            wallet,
-            market_id,
-            side,
-            timestamp,
-            amount,
-            price,
-            notional,
-            LEAD(timestamp) OVER (PARTITION BY wallet, market_id ORDER BY timestamp) AS exit_ts,
-            LEAD(price) OVER (PARTITION BY wallet, market_id ORDER BY timestamp) AS exit_price,
-            LEAD(side) OVER (PARTITION BY wallet, market_id ORDER BY timestamp) AS exit_side
-        FROM fills
+            b.wallet,
+            b.market_id,
+            b.timestamp AS entry_ts,
+            b.block_number AS entry_block,
+            b.log_index AS entry_log_index,
+            b.hash AS entry_hash,
+            b.amount AS entry_amount,
+            b.price AS entry_price,
+            b.notional AS entry_notional,
+            s.timestamp AS exit_ts,
+            s.block_number AS exit_block,
+            s.log_index AS exit_log_index,
+            s.hash AS exit_hash,
+            s.amount AS exit_amount,
+            s.price AS exit_price,
+            s.notional AS exit_notional
+        FROM buys b
+        JOIN sells s
+          ON s.wallet = b.wallet
+         AND s.market_id = b.market_id
+         AND (
+             s.timestamp > b.timestamp
+             OR (
+                 s.timestamp = b.timestamp
+                 AND (
+                     s.block_number > b.block_number
+                     OR (s.block_number = b.block_number AND s.log_index > b.log_index)
+                 )
+             )
+         )
+        WHERE NOT EXISTS (
+            SELECT 1
+            FROM sells closer
+            WHERE closer.wallet = b.wallet
+              AND closer.market_id = b.market_id
+              AND (
+                  closer.timestamp > b.timestamp
+                  OR (
+                      closer.timestamp = b.timestamp
+                      AND (
+                          closer.block_number > b.block_number
+                          OR (closer.block_number = b.block_number AND closer.log_index > b.log_index)
+                      )
+                  )
+              )
+              AND (
+                  closer.timestamp < s.timestamp
+                  OR (
+                      closer.timestamp = s.timestamp
+                      AND (
+                          closer.block_number < s.block_number
+                          OR (closer.block_number = s.block_number AND closer.log_index < s.log_index)
+                      )
+                  )
+              )
+        )
     ),
     examples AS (
         SELECT
             wallet,
             market_id,
-            timestamp AS entry_ts,
+            entry_ts,
             exit_ts,
-            MAX(0, exit_ts - timestamp) AS hold_seconds,
-            notional AS entry_notional,
-            ABS(COALESCE(exit_price, price) - price) AS volatility_proxy,
-            CAST(strftime('%H', datetime(timestamp, 'unixepoch')) AS INTEGER) AS hour_of_day,
-            CASE
-                WHEN side = 'BUY' THEN COALESCE(exit_price, price) - price
-                WHEN side = 'SELL' THEN price - COALESCE(exit_price, price)
-                ELSE 0
-            END AS pnl_proxy,
-            CASE WHEN exit_side = side THEN 1 ELSE 0 END AS partial_fixation
-        FROM ordered
-        WHERE exit_ts IS NOT NULL AND exit_ts > timestamp
+            MAX(0, exit_ts - entry_ts) AS hold_seconds,
+            entry_notional,
+            ABS(exit_price - entry_price) AS volatility_proxy,
+            CAST(strftime('%H', datetime(entry_ts, 'unixepoch')) AS INTEGER) AS hour_of_day,
+            exit_price - entry_price AS pnl_proxy,
+            0 AS partial_fixation,
+            'BUY' AS entry_side,
+            'SELL' AS exit_side,
+            entry_price,
+            exit_price,
+            entry_amount,
+            exit_amount,
+            entry_hash,
+            exit_hash
+        FROM pairs
     )
     SELECT * FROM examples
     ORDER BY entry_ts DESC
@@ -260,6 +320,14 @@ def _exit_examples(
             "hour_of_day": float(row["hour_of_day"] or 0.0),
             "pnl_proxy": float(row["pnl_proxy"] or 0.0),
             "partial_fixation": float(row["partial_fixation"] or 0.0),
+            "entry_side": str(row["entry_side"] or "BUY"),
+            "exit_side": str(row["exit_side"] or "SELL"),
+            "entry_price": float(row["entry_price"] or 0.0),
+            "exit_price": float(row["exit_price"] or 0.0),
+            "entry_amount": float(row["entry_amount"] or 0.0),
+            "exit_amount": float(row["exit_amount"] or 0.0),
+            "entry_hash": str(row["entry_hash"] or ""),
+            "exit_hash": str(row["exit_hash"] or ""),
         }
         for row in rows
     ]
@@ -289,28 +357,176 @@ def _exit_stats(examples: list[dict[str, Any]]) -> dict[str, Any]:
 
 def _fit_exit_model(examples: list[dict[str, Any]]) -> dict[str, Any]:
     if not examples:
-        return {"type": "rule", "default_hold_seconds": 6 * 3600, "features": []}
+        return {
+            "type": "dummy_median",
+            "default_hold_seconds": 6 * 3600,
+            "features": [],
+            "train_examples": 0,
+            "test_examples": 0,
+            "mae_seconds": None,
+            "r2": None,
+            "fallback_reason": "no_examples",
+        }
     features = ["entry_notional", "volatility_proxy", "hour_of_day"]
+    train_examples, test_examples = _train_test_split(examples)
+    train_holds = sorted(example["hold_seconds"] for example in train_examples)
+    median_hold = _percentile(train_holds, 0.5)
+    if len(train_examples) < 2 or not test_examples:
+        return _dummy_exit_model(
+            train_examples,
+            test_examples,
+            features,
+            fallback_reason="not_enough_train_test_examples",
+        )
     try:
         from sklearn.linear_model import Ridge  # type: ignore
     except ModuleNotFoundError:
-        holds = sorted(example["hold_seconds"] for example in examples)
-        return {
-            "type": "rule",
-            "default_hold_seconds": _percentile(holds, 0.5),
-            "p75_hold_seconds": _percentile(holds, 0.75),
-            "features": features,
-        }
-    x_rows = [[example[feature] for feature in features] for example in examples]
-    y_rows = [example["hold_seconds"] for example in examples]
+        return _dummy_exit_model(
+            train_examples,
+            test_examples,
+            features,
+            fallback_reason="sklearn_unavailable",
+        )
+    x_rows = [[example[feature] for feature in features] for example in train_examples]
+    y_rows = [example["hold_seconds"] for example in train_examples]
     model = Ridge(alpha=1.0)
     model.fit(x_rows, y_rows)
+    test_x = [[example[feature] for feature in features] for example in test_examples]
+    test_y = [example["hold_seconds"] for example in test_examples]
+    predictions = [float(value) for value in model.predict(test_x)]
+    mae = _mean_absolute_error(test_y, predictions)
+    r2 = _r2_score(test_y, predictions)
+    if r2 is not None and r2 < 0:
+        fallback = _dummy_exit_model(
+            train_examples,
+            test_examples,
+            features,
+            fallback_reason="negative_r2",
+        )
+        fallback["rejected_model"] = {
+            "type": "ridge",
+            "mae_seconds": mae,
+            "r2": r2,
+            "intercept": float(model.intercept_),
+            "coef": [float(value) for value in model.coef_],
+        }
+        return fallback
     return {
         "type": "ridge",
         "features": features,
+        "default_hold_seconds": median_hold,
         "intercept": float(model.intercept_),
         "coef": [float(value) for value in model.coef_],
+        "train_examples": len(train_examples),
+        "test_examples": len(test_examples),
+        "mae_seconds": mae,
+        "r2": r2,
     }
+
+
+def _train_test_split(
+    examples: list[dict[str, Any]],
+    *,
+    train_ratio: float = 0.8,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    ordered = sorted(examples, key=lambda example: (float(example.get("entry_ts") or 0), str(example.get("entry_hash") or "")))
+    if len(ordered) <= 1:
+        return ordered, []
+    split_index = int(len(ordered) * train_ratio)
+    split_index = min(len(ordered) - 1, max(1, split_index))
+    return ordered[:split_index], ordered[split_index:]
+
+
+def _dummy_exit_model(
+    train_examples: list[dict[str, Any]],
+    test_examples: list[dict[str, Any]],
+    features: list[str],
+    *,
+    fallback_reason: str,
+) -> dict[str, Any]:
+    train_holds = sorted(example["hold_seconds"] for example in train_examples)
+    if not train_holds:
+        train_holds = sorted(example["hold_seconds"] for example in test_examples)
+    median_hold = _percentile(train_holds, 0.5) if train_holds else 6 * 3600
+    test_y = [example["hold_seconds"] for example in test_examples]
+    predictions = [median_hold for _ in test_y]
+    return {
+        "type": "dummy_median",
+        "features": features,
+        "default_hold_seconds": median_hold,
+        "median_hold_seconds": median_hold,
+        "p75_hold_seconds": _percentile(train_holds, 0.75) if train_holds else median_hold,
+        "train_examples": len(train_examples),
+        "test_examples": len(test_examples),
+        "mae_seconds": _mean_absolute_error(test_y, predictions) if test_y else None,
+        "r2": _r2_score(test_y, predictions) if test_y else None,
+        "fallback_reason": fallback_reason,
+    }
+
+
+def _model_stats(model: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "model_type": model.get("type", "unknown"),
+        "train_examples": int(model.get("train_examples") or 0),
+        "test_examples": int(model.get("test_examples") or 0),
+        "mae_seconds": model.get("mae_seconds"),
+        "r2": model.get("r2"),
+        "fallback_reason": model.get("fallback_reason", ""),
+    }
+
+
+def _mean_absolute_error(y_true: list[float], y_pred: list[float]) -> float | None:
+    if not y_true:
+        return None
+    return round(sum(abs(actual - predicted) for actual, predicted in zip(y_true, y_pred)) / len(y_true), 4)
+
+
+def _r2_score(y_true: list[float], y_pred: list[float]) -> float | None:
+    if not y_true:
+        return None
+    mean_y = sum(y_true) / len(y_true)
+    ss_tot = sum((actual - mean_y) ** 2 for actual in y_true)
+    ss_res = sum((actual - predicted) ** 2 for actual, predicted in zip(y_true, y_pred))
+    if ss_tot <= 0:
+        return 1.0 if ss_res <= 1e-9 else 0.0
+    return round(1.0 - (ss_res / ss_tot), 4)
+
+
+def _dump_exit_model(model: dict[str, Any], model_path: Path) -> str:
+    try:
+        import joblib  # type: ignore
+    except ModuleNotFoundError:
+        LOGGER.warning("joblib is not installed; falling back to pickle for exit model persistence")
+        with model_path.open("wb") as handle:
+            pickle.dump(model, handle)
+        return "pickle"
+    joblib.dump(model, model_path)
+    return "joblib"
+
+
+def _exit_example_payload(example: dict[str, Any], model: dict[str, Any]) -> dict[str, Any]:
+    entry_price = float(example.get("entry_price") or 0.0)
+    exit_price = float(example.get("exit_price") or 0.0)
+    pnl_percent = ((exit_price - entry_price) / entry_price * 100.0) if entry_price else 0.0
+    return {
+        "whale_address": str(example.get("wallet") or ""),
+        "market_id": str(example.get("market_id") or ""),
+        "entry_time": int(example.get("entry_ts") or 0),
+        "exit_time": int(example.get("exit_ts") or 0),
+        "pnl_percent": round(pnl_percent, 4),
+        "predicted_time": round(_predict_exit_time(example, model), 4),
+    }
+
+
+def _predict_exit_time(example: dict[str, Any], model: dict[str, Any]) -> float:
+    if model.get("type") == "ridge":
+        features = [str(feature) for feature in model.get("features", [])]
+        coefs = [float(value) for value in model.get("coef", [])]
+        prediction = float(model.get("intercept") or 0.0)
+        for feature, coef in zip(features, coefs):
+            prediction += coef * float(example.get(feature) or 0.0)
+        return max(0.0, prediction)
+    return max(0.0, float(model.get("default_hold_seconds") or model.get("median_hold_seconds") or 0.0))
 
 
 def _percentile(values: list[float], pct: float) -> float:

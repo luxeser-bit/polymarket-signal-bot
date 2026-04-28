@@ -429,11 +429,12 @@ class PolygonRpcClient:
                 last_error = exc
                 delay = min(30.0, 0.5 * (2**attempt))
                 LOGGER.warning(
-                    "RPC %s failed on attempt %s/%s: %s",
+                    "RPC %s failed on attempt %s/%s: %s: %s",
                     method,
                     attempt + 1,
                     self.max_retries,
-                    exc,
+                    type(exc).__name__,
+                    str(exc) or repr(exc),
                 )
                 await asyncio.sleep(delay)
         raise RuntimeError(f"RPC {method} failed after retries: {last_error}")

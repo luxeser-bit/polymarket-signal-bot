@@ -82,6 +82,9 @@ def calculate_all_from_connection(conn: sqlite3.Connection, *, config: SQLScorin
     sample_sql = "ORDER BY timestamp DESC LIMIT ?" if config.limit else ""
     if config.limit:
         params.append(int(config.limit))
+    raw_columns = _table_columns(conn, config.table)
+    block_number_expr = "CAST(COALESCE(block_number, 0) AS INTEGER)" if "block_number" in raw_columns else "0"
+    log_index_expr = "CAST(COALESCE(log_index, 0) AS INTEGER)" if "log_index" in raw_columns else "0"
 
     query = f"""
     WITH raw_source AS (
@@ -96,6 +99,8 @@ def calculate_all_from_connection(conn: sqlite3.Connection, *, config: SQLScorin
             COALESCE(NULLIF(market_id, ''), contract) AS market_id,
             UPPER(side) AS side,
             CAST(timestamp AS INTEGER) AS timestamp,
+            {block_number_expr} AS block_number,
+            {log_index_expr} AS log_index,
             CAST(timestamp / 86400 AS INTEGER) AS trade_day,
             CAST(amount AS REAL) AS amount,
             CAST(price AS REAL) AS price,
@@ -110,6 +115,8 @@ def calculate_all_from_connection(conn: sqlite3.Connection, *, config: SQLScorin
             END AS pnl_proxy
         FROM raw_source
     ),
+    -- wallet_base keeps the original broad activity metrics: total proxy PnL,
+    -- volume, trade_count, market coverage and drawdown inputs.
     wallet_base AS (
         SELECT
             wallet,
@@ -122,13 +129,27 @@ def calculate_all_from_connection(conn: sqlite3.Connection, *, config: SQLScorin
             MAX(timestamp) AS last_trade_ts,
             SUM(notional) AS volume,
             AVG(notional) AS avg_trade_size,
-            SUM(pnl_proxy) AS pnl,
-            SUM(CASE WHEN pnl_proxy > 0 THEN pnl_proxy ELSE 0 END) AS gross_profit,
-            ABS(SUM(CASE WHEN pnl_proxy < 0 THEN pnl_proxy ELSE 0 END)) AS gross_loss,
-            AVG(CASE WHEN pnl_proxy > 0 THEN 1.0 ELSE 0.0 END) AS win_rate
+            SUM(pnl_proxy) AS pnl
         FROM filtered
         GROUP BY wallet
         HAVING COUNT(*) >= ?
+    ),
+    -- consistency is the share of active calendar months with positive monthly
+    -- proxy PnL. Technical/non-OrderFilled events are already removed above.
+    monthly AS (
+        SELECT
+            wallet,
+            strftime('%Y-%m', datetime(timestamp, 'unixepoch')) AS trade_month,
+            SUM(pnl_proxy) AS monthly_pnl
+        FROM filtered
+        GROUP BY wallet, strftime('%Y-%m', datetime(timestamp, 'unixepoch'))
+    ),
+    monthly_stats AS (
+        SELECT
+            wallet,
+            AVG(CASE WHEN monthly_pnl > 0 THEN 1.0 ELSE 0.0 END) AS consistency
+        FROM monthly
+        GROUP BY wallet
     ),
     daily AS (
         SELECT wallet, trade_day, SUM(pnl_proxy) AS daily_pnl
@@ -174,18 +195,52 @@ def calculate_all_from_connection(conn: sqlite3.Connection, *, config: SQLScorin
         FROM equity_with_peak
         GROUP BY wallet
     ),
-    hold_pairs AS (
+    -- strict_pairs is the realized BUY -> SELL sequence used by win_rate,
+    -- profit_factor, avg_hold_time and Sharpe. A BUY only counts when the
+    -- immediate next event for the same wallet and market is a SELL, which
+    -- excludes entries with intermediate fills before exit.
+    ordered_fills AS (
         SELECT
             wallet,
             market_id,
+            side,
             timestamp,
-            LEAD(timestamp) OVER (PARTITION BY wallet, market_id ORDER BY timestamp) AS next_ts
+            block_number,
+            log_index,
+            ABS(amount) AS amount,
+            price,
+            LEAD(side) OVER (PARTITION BY wallet, market_id ORDER BY timestamp, block_number, log_index) AS next_side,
+            LEAD(timestamp) OVER (PARTITION BY wallet, market_id ORDER BY timestamp, block_number, log_index) AS next_ts,
+            LEAD(ABS(amount)) OVER (PARTITION BY wallet, market_id ORDER BY timestamp, block_number, log_index) AS next_amount,
+            LEAD(price) OVER (PARTITION BY wallet, market_id ORDER BY timestamp, block_number, log_index) AS next_price
         FROM filtered
     ),
-    hold_stats AS (
-        SELECT wallet, AVG(next_ts - timestamp) AS avg_hold_time
-        FROM hold_pairs
-        WHERE next_ts IS NOT NULL AND next_ts > timestamp
+    strict_pairs AS (
+        SELECT
+            wallet,
+            market_id,
+            timestamp AS entry_ts,
+            next_ts AS exit_ts,
+            MAX(0, next_ts - timestamp) AS hold_seconds,
+            (next_price - price) * MIN(amount, next_amount) AS pair_pnl
+        FROM ordered_fills
+        WHERE side = 'BUY'
+          AND next_side = 'SELL'
+          AND next_ts IS NOT NULL
+    ),
+    -- pair_stats computes realized performance metrics from strict BUY -> SELL
+    -- pairs: win rate, profit factor, average hold time and Sharpe.
+    pair_stats AS (
+        SELECT
+            wallet,
+            COUNT(*) AS pair_count,
+            AVG(CASE WHEN pair_pnl > 0 THEN 1.0 ELSE 0.0 END) AS win_rate,
+            SUM(CASE WHEN pair_pnl > 0 THEN pair_pnl ELSE 0 END) AS pair_gross_profit,
+            ABS(SUM(CASE WHEN pair_pnl < 0 THEN pair_pnl ELSE 0 END)) AS pair_gross_loss,
+            AVG(hold_seconds) AS avg_hold_time,
+            AVG(pair_pnl) AS avg_pair_pnl,
+            AVG(pair_pnl * pair_pnl) AS avg_pair_pnl_sq
+        FROM strict_pairs
         GROUP BY wallet
     )
     SELECT
@@ -201,23 +256,26 @@ def calculate_all_from_connection(conn: sqlite3.Connection, *, config: SQLScorin
         COALESCE(b.avg_trade_size, 0.0) AS avg_trade_size,
         COALESCE(b.pnl, 0.0) AS pnl,
         CASE
-            WHEN COALESCE(b.gross_loss, 0.0) <= 0 THEN COALESCE(b.gross_profit, 0.0)
-            ELSE COALESCE(b.gross_profit, 0.0) / b.gross_loss
+            WHEN COALESCE(p.pair_gross_loss, 0.0) <= 0 THEN COALESCE(p.pair_gross_profit, 0.0)
+            ELSE COALESCE(p.pair_gross_profit, 0.0) / p.pair_gross_loss
         END AS profit_factor,
-        COALESCE(b.win_rate, 0.0) AS win_rate,
-        COALESCE(h.avg_hold_time, 0.0) AS avg_hold_time,
+        COALESCE(p.win_rate, 0.0) AS win_rate,
+        COALESCE(p.avg_hold_time, 0.0) AS avg_hold_time,
+        CASE
+            WHEN COALESCE(p.pair_count, 0) <= 1 THEN 0.0
+            WHEN (COALESCE(p.avg_pair_pnl_sq, 0.0) - COALESCE(p.avg_pair_pnl, 0.0) * COALESCE(p.avg_pair_pnl, 0.0)) <= 0 THEN 0.0
+            ELSE COALESCE(p.avg_pair_pnl, 0.0) / SQRT(p.avg_pair_pnl_sq - p.avg_pair_pnl * p.avg_pair_pnl)
+        END AS sharpe,
         COALESCE(d.max_drawdown, 0.0) AS max_drawdown,
         COALESCE(s.avg_daily_pnl, 0.0) AS avg_daily_pnl,
         COALESCE(s.avg_daily_pnl_sq, 0.0) AS avg_daily_pnl_sq,
         COALESCE(s.daily_count, 0) AS daily_count,
-        CASE
-            WHEN b.active_days <= 0 THEN 0.0
-            ELSE MIN(1.0, CAST(b.active_days AS REAL) / MAX(1.0, ((b.last_trade_ts - b.first_trade_ts) / 86400.0) + 1.0))
-        END AS consistency
+        COALESCE(m.consistency, 0.0) AS consistency
     FROM wallet_base b
     LEFT JOIN daily_stats s ON s.wallet = b.wallet
     LEFT JOIN drawdowns d ON d.wallet = b.wallet
-    LEFT JOIN hold_stats h ON h.wallet = b.wallet
+    LEFT JOIN pair_stats p ON p.wallet = b.wallet
+    LEFT JOIN monthly_stats m ON m.wallet = b.wallet
     ORDER BY volume DESC, trade_count DESC
     """
     query_params = [*params, int(config.min_trades)]
@@ -254,9 +312,11 @@ def save_scored_wallets_to_connection(
     rows = []
     for _, row in df.iterrows():
         address = str(row.get("address", row.get("wallet", "")))
+        user_address = str(row.get("user_address", address))
         calculated_at = int(row.get("calculated_at", row.get("computed_at", int(time.time()))))
         rows.append(
             (
+                user_address,
                 address,
                 str(row.get("wallet", address)),
                 calculated_at,
@@ -284,13 +344,14 @@ def save_scored_wallets_to_connection(
     conn.executemany(
         f"""
         INSERT INTO {scored_table}(
-            address, wallet, calculated_at, computed_at, score, pnl, sharpe, max_drawdown, profit_factor,
+            user_address, address, wallet, calculated_at, computed_at, score, pnl, sharpe, max_drawdown, profit_factor,
             win_rate, avg_hold_time, volume, trade_count, consistency, active_days,
             market_count, buy_count, sell_count, avg_trade_size, first_trade_ts,
             last_trade_ts, reason
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(wallet) DO UPDATE SET
+            user_address = excluded.user_address,
             address = excluded.address,
             calculated_at = excluded.calculated_at,
             computed_at = excluded.computed_at,
@@ -325,6 +386,7 @@ def ensure_scoring_schema(conn: sqlite3.Connection, *, scored_table: str = "scor
     conn.executescript(
         f"""
         CREATE TABLE IF NOT EXISTS {scored_table} (
+            user_address TEXT NOT NULL DEFAULT '',
             address TEXT NOT NULL DEFAULT '',
             wallet TEXT PRIMARY KEY,
             calculated_at INTEGER NOT NULL DEFAULT 0,
@@ -352,10 +414,13 @@ def ensure_scoring_schema(conn: sqlite3.Connection, *, scored_table: str = "scor
         CREATE INDEX IF NOT EXISTS idx_{scored_table}_computed ON {scored_table}(computed_at DESC);
         """
     )
+    _ensure_column(conn, scored_table, "user_address", "TEXT NOT NULL DEFAULT ''")
     _ensure_column(conn, scored_table, "address", "TEXT NOT NULL DEFAULT ''")
     _ensure_column(conn, scored_table, "calculated_at", "INTEGER NOT NULL DEFAULT 0")
+    conn.execute(f"CREATE INDEX IF NOT EXISTS idx_{scored_table}_user_address ON {scored_table}(user_address)")
     conn.execute(f"CREATE INDEX IF NOT EXISTS idx_{scored_table}_address ON {scored_table}(address)")
     conn.execute(f"CREATE INDEX IF NOT EXISTS idx_{scored_table}_calculated ON {scored_table}(calculated_at DESC)")
+    conn.execute(f"UPDATE {scored_table} SET user_address = wallet WHERE user_address = ''")
     conn.execute(f"UPDATE {scored_table} SET address = wallet WHERE address = ''")
     conn.execute(f"UPDATE {scored_table} SET calculated_at = computed_at WHERE calculated_at = 0")
     conn.commit()
@@ -387,12 +452,16 @@ def _ensure_raw_transaction_indexes(conn: sqlite3.Connection, table: str) -> Non
 
 
 def _ensure_column(conn: sqlite3.Connection, table: str, column: str, definition: str) -> None:
-    columns = {
+    columns = _table_columns(conn, table)
+    if column not in columns:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+
+
+def _table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
+    return {
         str(row["name"])
         for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
     }
-    if column not in columns:
-        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
 
 def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
@@ -410,10 +479,6 @@ def _finalize_score_frame(df: Any, *, computed_at: int) -> Any:
     volume_denominator = max(1.0, float(df["volume"].quantile(0.95) or df["volume"].max() or 1.0))
     trade_denominator = max(1.0, float(df["trade_count"].quantile(0.95) or df["trade_count"].max() or 1.0))
     hold_denominator = max(1.0, float(df["avg_hold_time"].quantile(0.75) or 3600.0))
-    variance = (df["avg_daily_pnl_sq"] - df["avg_daily_pnl"] * df["avg_daily_pnl"]).clip(lower=0)
-    df["sharpe"] = 0.0
-    valid_sharpe = (df["daily_count"] > 1) & (variance > 0)
-    df.loc[valid_sharpe, "sharpe"] = df.loc[valid_sharpe, "avg_daily_pnl"] / (variance[valid_sharpe] ** 0.5)
     df["score"] = (
         0.18 * df["win_rate"].clip(0, 1)
         + 0.14 * (df["profit_factor"] / 3.0).clip(0, 1)
@@ -428,6 +493,7 @@ def _finalize_score_frame(df: Any, *, computed_at: int) -> Any:
     df["computed_at"] = int(computed_at)
     df["calculated_at"] = int(computed_at)
     df["address"] = df["wallet"]
+    df["user_address"] = df["wallet"]
     df["reason"] = (
         "sql_metrics pnl="
         + df["pnl"].round(4).astype(str)
@@ -450,6 +516,7 @@ def _empty_scores_df() -> Any:
 def _score_columns() -> list[str]:
     return [
         "address",
+        "user_address",
         "wallet",
         "calculated_at",
         "computed_at",
@@ -486,6 +553,7 @@ def _numeric_score_inputs() -> list[str]:
         "volume",
         "avg_trade_size",
         "pnl",
+        "sharpe",
         "profit_factor",
         "win_rate",
         "avg_hold_time",

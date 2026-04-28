@@ -9,7 +9,7 @@ Run locally:
 The server is intentionally a thin orchestration layer. Existing modules remain
 the source of indexing, monitoring, scoring, cohorts, and paper trading logic;
 this file starts those workers as subprocesses and exposes their SQLite-backed
-state over HTTP/WebSocket for Streamlit today and a React control room later.
+state over HTTP/WebSocket for the React control room.
 """
 
 import asyncio
@@ -63,7 +63,14 @@ PROCESS_LOCK = threading.RLock()
 PROCESS_REGISTRY: dict[str, "ManagedProcess"] = {}
 TRAINING_LOCK = threading.RLock()
 TRAINING_PROCESS: "ManagedTrainingProcess | None" = None
-METRICS_CURSOR: dict[str, float] = {"last_block": 0.0, "seen_at": 0.0}
+METRICS_LOCK = threading.RLock()
+METRICS_CURSOR: dict[str, float] = {
+    "last_block": 0.0,
+    "seen_at": 0.0,
+    "current_speed": 0.0,
+    "speed_at": 0.0,
+}
+METRICS_SPEED_STALE_SECONDS = 30.0
 LIVE_PAYLOAD_CACHE: dict[str, Any] = {"payload": None, "expires_at": 0.0}
 LIVE_PAYLOAD_LOCK = threading.RLock()
 
@@ -74,6 +81,7 @@ class ServerSettings:
     indexer_db: Path = ROOT / "data" / "indexer.db"
     paper_state_db: Path = ROOT / "data" / "paper_state.db"
     exit_examples_path: Path = ROOT / "data" / "exit_examples.json"
+    exit_stats_path: Path = ROOT / "data" / "exit_stats.json"
     host: str = "127.0.0.1"
     port: int = 8000
     monitor_interval_seconds: int = 60
@@ -174,6 +182,20 @@ def create_app() -> Any:
         results = stop_all(settings, timeout_seconds=10.0)
         return {"ok": True, "components": results}
 
+    @api.post("/system/{component_key}/start")
+    async def system_component_start(component_key: str) -> dict[str, Any]:
+        settings = settings_from_env()
+        spec = component_spec(settings, component_key)
+        result = start_component(spec)
+        return {"ok": True, "component": result}
+
+    @api.post("/system/{component_key}/stop")
+    async def system_component_stop(component_key: str) -> dict[str, Any]:
+        settings = settings_from_env()
+        spec = component_spec(settings, component_key)
+        result = stop_component(spec, timeout_seconds=10.0)
+        return {"ok": True, "component": result}
+
     @api.get("/system/status")
     async def system_status() -> dict[str, Any]:
         settings = settings_from_env()
@@ -254,6 +276,7 @@ def settings_from_env() -> ServerSettings:
         indexer_db=_env_path("INDEXER_DB_PATH", ROOT / "data" / "indexer.db"),
         paper_state_db=_env_path("POLYSIGNAL_PAPER_STATE_DB", _env_path("PAPER_STATE_DB", ROOT / "data" / "paper_state.db")),
         exit_examples_path=_env_path("EXIT_EXAMPLES_PATH", ROOT / "data" / "exit_examples.json"),
+        exit_stats_path=_env_path("EXIT_STATS_PATH", ROOT / "data" / "exit_stats.json"),
         host=os.environ.get("API_HOST", os.environ.get("SERVER_HOST", "127.0.0.1")),
         port=_env_int("API_PORT", _env_int("SERVER_PORT", 8000)),
         monitor_interval_seconds=_env_int("MONITOR_INTERVAL_SECONDS", monitor_defaults.interval_seconds),
@@ -349,6 +372,22 @@ def start_all(settings: ServerSettings) -> dict[str, dict[str, Any]]:
 def stop_all(settings: ServerSettings, *, timeout_seconds: float = 10.0) -> dict[str, dict[str, Any]]:
     specs = component_specs(settings)
     return {key: stop_component(specs[key], timeout_seconds=timeout_seconds) for key in reversed(COMPONENT_KEYS)}
+
+
+def component_spec(settings: ServerSettings, key: str) -> ComponentSpec:
+    normalized = key.strip().lower().replace("-", "_")
+    aliases = {
+        "paper": "live_paper",
+        "live": "live_paper",
+        "livepaper": "live_paper",
+        "live_paper_runner": "live_paper",
+    }
+    normalized = aliases.get(normalized, normalized)
+    specs = component_specs(settings)
+    if normalized not in specs:
+        valid = ", ".join(specs)
+        raise HTTPException(status_code=404, detail=f"Unknown component '{key}'. Valid components: {valid}")
+    return specs[normalized]
 
 
 def start_training(
@@ -453,7 +492,7 @@ def training_command(
         "--model-path",
         str(ROOT / "data" / "exit_model.pkl"),
         "--stats-path",
-        str(ROOT / "data" / "exit_stats.json"),
+        str(settings.exit_stats_path),
         "--examples-path",
         str(settings.exit_examples_path),
         "--policy-path",
@@ -528,7 +567,7 @@ def start_component(spec: ComponentSpec) -> dict[str, Any]:
             return {**running, "started": False, "message": "already running"}
 
         spec.log_path.parent.mkdir(parents=True, exist_ok=True)
-        log_handle = spec.log_path.open("ab")
+        log_handle = spec.log_path.open("wb")
         creationflags = 0
         startupinfo = None
         if os.name == "nt":
@@ -753,13 +792,19 @@ def indexer_metrics(settings: ServerSettings, *, include_process: bool = True) -
 
 
 def wallet_metrics(settings: ServerSettings) -> dict[str, Any]:
+    model_metrics = exit_stats_snapshot(settings.exit_stats_path)
     result: dict[str, Any] = {
         "counts": {},
         "top_wallets": [],
+        "scored_wallet_rows": [],
         "scored_wallets": 0,
         "db_path": str(settings.indexer_db),
         "last_training": latest_training_summary(settings.indexer_db),
-        "exit_examples": exit_examples_snapshot(settings.exit_examples_path),
+        "exit_examples": exit_examples_snapshot(
+            settings.exit_examples_path,
+            default_predicted_time=float(model_metrics.get("median_hold_time") or 0.0),
+        ),
+        "model_metrics": model_metrics,
         "error": "",
     }
     if not settings.indexer_db.exists():
@@ -767,18 +812,24 @@ def wallet_metrics(settings: ServerSettings) -> dict[str, Any]:
         return result
     try:
         # Prefer the production cohort loader; it is backed by wallet_cohorts.
-        cohorts = load_wallet_cohorts(settings.indexer_db, limit=10)
+        cohorts = load_wallet_cohorts(settings.indexer_db, limit=50)
         with sqlite_connect(settings.indexer_db) as conn:
             if table_exists(conn, "wallet_cohorts"):
-                rows = conn.execute("SELECT status, COUNT(*) AS wallets FROM wallet_cohorts GROUP BY status").fetchall()
-                result["counts"] = {str(row["status"]): int(row["wallets"] or 0) for row in rows}
+                status_expr = cohort_status_expression(conn, alias="")
+                rows = conn.execute(
+                    f"SELECT {status_expr} AS cohort, COUNT(*) AS wallets FROM wallet_cohorts GROUP BY {status_expr}"
+                ).fetchall()
+                result["counts"] = {str(row["cohort"]): int(row["wallets"] or 0) for row in rows}
             if table_exists(conn, "scored_wallets"):
                 result["scored_wallets"] = int(conn.execute("SELECT COUNT(*) FROM scored_wallets").fetchone()[0] or 0)
                 result["top_wallets"] = top_wallet_rows(conn, include_cohorts=table_exists(conn, "wallet_cohorts"))
+                result["scored_wallet_rows"] = result["top_wallets"]
             elif raw_transaction_count(conn) <= settings.scoring_fallback_max_rows:
                 result["top_wallets"] = scoring_fallback_rows(settings.indexer_db)
+                result["scored_wallet_rows"] = result["top_wallets"]
         if not result["top_wallets"] and cohorts:
-            result["top_wallets"] = list(cohorts.values())[:10]
+            result["top_wallets"] = list(cohorts.values())[:50]
+            result["scored_wallet_rows"] = result["top_wallets"]
         return result
     except Exception as exc:  # noqa: BLE001 - dashboard can show partial data.
         result["error"] = str(exc)
@@ -912,15 +963,13 @@ def build_live_payload(settings: ServerSettings) -> dict[str, Any]:
 def registry_component_snapshot(settings: ServerSettings) -> dict[str, dict[str, Any]]:
     specs = component_specs(settings)
     snapshot: dict[str, dict[str, Any]] = {}
-    with PROCESS_LOCK:
-        for key, spec in specs.items():
-            managed = PROCESS_REGISTRY.get(key)
-            running = bool(managed and managed.process.poll() is None)
-            snapshot[key] = {
-                "running": running,
-                "pid": int(managed.process.pid) if running and managed else 0,
-                "name": spec.label,
-            }
+    for key, spec in specs.items():
+        status = component_status(spec)
+        snapshot[key] = {
+            "running": bool(status.get("running")),
+            "pid": int(status.get("pid") or 0),
+            "name": spec.label,
+        }
     return snapshot
 
 
@@ -949,17 +998,23 @@ def signals_count(db_path: Path) -> int:
 
 def top_wallet_rows(conn: sqlite3.Connection, *, include_cohorts: bool) -> list[dict[str, Any]]:
     columns = table_columns(conn, "scored_wallets")
-    wallet_expr = "COALESCE(NULLIF(s.address, ''), s.wallet)" if "address" in columns else "s.wallet"
+    wallet_expr = scored_wallet_expression(columns, alias="s")
     computed_expr = (
         "COALESCE(NULLIF(s.calculated_at, 0), s.computed_at)"
         if "calculated_at" in columns
         else "s.computed_at"
     )
+    avg_hold_expr = "s.avg_hold_time" if "avg_hold_time" in columns else "0.0"
+    consistency_expr = "s.consistency" if "consistency" in columns else "0.0"
     if include_cohorts:
+        cohort_wallet_expr = cohort_wallet_expression(conn, alias="c")
+        cohort_status_expr = cohort_status_expression(conn, alias="c")
         query = f"""
             SELECT
+                {wallet_expr} AS user_address,
                 {wallet_expr} AS wallet,
-                COALESCE(c.status, '') AS status,
+                {cohort_status_expr} AS cohort,
+                {cohort_status_expr} AS status,
                 s.score,
                 s.pnl,
                 s.sharpe,
@@ -968,16 +1023,20 @@ def top_wallet_rows(conn: sqlite3.Connection, *, include_cohorts: bool) -> list[
                 s.win_rate,
                 s.profit_factor,
                 s.max_drawdown,
+                {avg_hold_expr} AS avg_hold_time,
+                {consistency_expr} AS consistency,
                 {computed_expr} AS computed_at
             FROM scored_wallets s
-            LEFT JOIN wallet_cohorts c ON c.wallet = {wallet_expr}
-            ORDER BY s.score DESC, s.volume DESC
-            LIMIT 10
+            LEFT JOIN wallet_cohorts c ON {cohort_wallet_expr} = {wallet_expr}
+            ORDER BY s.sharpe DESC, s.pnl DESC, s.volume DESC
+            LIMIT 50
         """
     else:
         query = f"""
             SELECT
+                {wallet_expr} AS user_address,
                 {wallet_expr} AS wallet,
+                '' AS cohort,
                 '' AS status,
                 s.score,
                 s.pnl,
@@ -987,16 +1046,55 @@ def top_wallet_rows(conn: sqlite3.Connection, *, include_cohorts: bool) -> list[
                 s.win_rate,
                 s.profit_factor,
                 s.max_drawdown,
+                {avg_hold_expr} AS avg_hold_time,
+                {consistency_expr} AS consistency,
                 {computed_expr} AS computed_at
             FROM scored_wallets s
-            ORDER BY score DESC, volume DESC
-            LIMIT 10
+            ORDER BY sharpe DESC, pnl DESC, volume DESC
+            LIMIT 50
         """
     rows = conn.execute(query).fetchall()
     return [dict(row) for row in rows]
 
 
-def exit_examples_snapshot(path: Path) -> dict[str, Any]:
+def scored_wallet_expression(columns: set[str], *, alias: str) -> str:
+    prefix = f"{alias}." if alias else ""
+    if {"user_address", "address", "wallet"}.issubset(columns):
+        return f"COALESCE(NULLIF({prefix}user_address, ''), NULLIF({prefix}address, ''), {prefix}wallet)"
+    if {"user_address", "wallet"}.issubset(columns):
+        return f"COALESCE(NULLIF({prefix}user_address, ''), {prefix}wallet)"
+    if {"address", "wallet"}.issubset(columns):
+        return f"COALESCE(NULLIF({prefix}address, ''), {prefix}wallet)"
+    if "user_address" in columns:
+        return f"{prefix}user_address"
+    if "address" in columns:
+        return f"{prefix}address"
+    return f"{prefix}wallet"
+
+
+def cohort_wallet_expression(conn: sqlite3.Connection, *, alias: str) -> str:
+    columns = table_columns(conn, "wallet_cohorts")
+    prefix = f"{alias}." if alias else ""
+    if {"user_address", "wallet"}.issubset(columns):
+        return f"COALESCE(NULLIF({prefix}user_address, ''), {prefix}wallet)"
+    if "user_address" in columns:
+        return f"{prefix}user_address"
+    return f"{prefix}wallet"
+
+
+def cohort_status_expression(conn: sqlite3.Connection, *, alias: str) -> str:
+    columns = table_columns(conn, "wallet_cohorts")
+    prefix = f"{alias}." if alias else ""
+    if {"cohort", "status"}.issubset(columns):
+        return f"COALESCE(NULLIF({prefix}cohort, ''), {prefix}status)"
+    if "cohort" in columns:
+        return f"{prefix}cohort"
+    if "status" in columns:
+        return f"{prefix}status"
+    return "'NOISE'"
+
+
+def exit_examples_snapshot(path: Path, *, default_predicted_time: float = 0.0) -> dict[str, Any]:
     if not path.exists():
         return {"count": 0, "examples": [], "path": str(path), "updated_at": 0}
     try:
@@ -1012,10 +1110,73 @@ def exit_examples_snapshot(path: Path) -> dict[str, Any]:
         updated_at = 0
     return {
         "count": len(examples),
-        "examples": examples[:10],
+        "examples": [
+            normalize_exit_example(example, default_predicted_time=default_predicted_time)
+            for example in examples[:10]
+            if isinstance(example, dict)
+        ],
         "path": str(path),
         "updated_at": updated_at,
     }
+
+
+def normalize_exit_example(example: dict[str, Any], *, default_predicted_time: float = 0.0) -> dict[str, Any]:
+    entry_time = _number_value(example.get("entry_time", example.get("entry_ts", 0)))
+    exit_time = _number_value(example.get("exit_time", example.get("exit_ts", 0)))
+    entry_price = _number_value(example.get("entry_price", 0.0))
+    exit_price = _number_value(example.get("exit_price", 0.0))
+    pnl_proxy = _number_value(example.get("pnl_proxy", 0.0))
+    entry_notional = _number_value(example.get("entry_notional", 0.0))
+    pnl_percent = example.get("pnl_percent")
+    if pnl_percent is None:
+        if entry_price:
+            pnl_percent = (exit_price - entry_price) / entry_price * 100.0
+        elif entry_notional:
+            pnl_percent = pnl_proxy / entry_notional * 100.0
+        else:
+            pnl_percent = 0.0
+    return {
+        "whale_address": str(example.get("whale_address") or example.get("user_address") or example.get("wallet") or ""),
+        "market_id": str(example.get("market_id") or ""),
+        "entry_time": int(entry_time or 0),
+        "exit_time": int(exit_time or 0),
+        "pnl_percent": round(float(pnl_percent or 0.0), 4),
+        "predicted_time": round(
+            float(example.get("predicted_time") or example.get("predicted_hold_seconds") or default_predicted_time or 0.0),
+            4,
+        ),
+    }
+
+
+def exit_stats_snapshot(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {"path": str(path), "updated_at": 0, "model_type": "", "median_hold_time": 0, "mae": None, "r2": None}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        return {"path": str(path), "updated_at": 0, "model_type": "", "median_hold_time": 0, "mae": None, "r2": None, "error": str(exc)}
+    try:
+        updated_at = int(path.stat().st_mtime)
+    except OSError:
+        updated_at = 0
+    return {
+        "path": str(path),
+        "updated_at": updated_at,
+        "model_type": str(payload.get("model_type") or payload.get("type") or ""),
+        "median_hold_time": _number_value(payload.get("median_hold_time", payload.get("median_hold_seconds", 0))),
+        "mae": payload.get("mae", payload.get("mae_seconds")),
+        "r2": payload.get("r2"),
+        "train_examples": int(payload.get("train_examples") or 0),
+        "test_examples": int(payload.get("test_examples") or 0),
+        "fallback_reason": str(payload.get("fallback_reason") or ""),
+    }
+
+
+def _number_value(value: Any) -> float:
+    try:
+        return float(value or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
 
 
 def scoring_fallback_rows(db_path: Path) -> list[dict[str, Any]]:
@@ -1039,14 +1200,34 @@ def raw_transaction_count(conn: sqlite3.Connection) -> int:
 
 def block_speed(last_block: float) -> float:
     now = time.time()
-    previous_block = METRICS_CURSOR.get("last_block", 0.0)
-    previous_at = METRICS_CURSOR.get("seen_at", 0.0)
-    METRICS_CURSOR["last_block"] = float(last_block)
-    METRICS_CURSOR["seen_at"] = now
-    if previous_block <= 0 or previous_at <= 0:
+    block = float(last_block)
+    with METRICS_LOCK:
+        previous_block = METRICS_CURSOR.get("last_block", 0.0)
+        previous_at = METRICS_CURSOR.get("seen_at", 0.0)
+        current_speed = METRICS_CURSOR.get("current_speed", 0.0)
+        speed_at = METRICS_CURSOR.get("speed_at", 0.0)
+
+        if previous_block <= 0 or previous_at <= 0 or block < previous_block:
+            METRICS_CURSOR["last_block"] = block
+            METRICS_CURSOR["seen_at"] = now
+            METRICS_CURSOR["current_speed"] = 0.0
+            METRICS_CURSOR["speed_at"] = 0.0
+            return 0.0
+
+        if block > previous_block:
+            elapsed = max(0.001, now - previous_at)
+            speed = round(max(0.0, (block - previous_block) / elapsed), 4)
+            METRICS_CURSOR["last_block"] = block
+            METRICS_CURSOR["seen_at"] = now
+            METRICS_CURSOR["current_speed"] = speed
+            METRICS_CURSOR["speed_at"] = now
+            return speed
+
+        if current_speed > 0 and speed_at > 0 and now - speed_at <= METRICS_SPEED_STALE_SECONDS:
+            return round(current_speed, 4)
+
+        METRICS_CURSOR["current_speed"] = 0.0
         return 0.0
-    elapsed = max(0.001, now - previous_at)
-    return round(max(0.0, (float(last_block) - previous_block) / elapsed), 4)
 
 
 @contextlib.contextmanager

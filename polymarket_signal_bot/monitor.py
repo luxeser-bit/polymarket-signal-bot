@@ -246,6 +246,15 @@ class Monitor:
         if not path.exists():
             return None
         try:
+            import joblib  # type: ignore
+
+            model = joblib.load(path)
+            return model if isinstance(model, dict) else {"type": type(model).__name__, "model": model}
+        except ModuleNotFoundError:
+            pass
+        except Exception:
+            pass
+        try:
             with path.open("rb") as handle:
                 model = pickle.load(handle)
         except Exception:  # noqa: BLE001 - a bad model file must not stop monitoring.

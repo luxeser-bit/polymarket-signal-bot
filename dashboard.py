@@ -51,35 +51,52 @@ SYSTEM_COMPONENT_KEYS = ("indexer", "monitor", "live_paper")
 
 
 def main() -> None:
-    _require_dashboard_dependencies()
-    st.set_page_config(page_title="PolySignal 200 Seed", layout="wide", page_icon="*")
+    _require_streamlit_runtime()
+    st.set_page_config(page_title="PolySignal Legacy Dashboard", layout="wide", page_icon="*")
     _inject_style()
-    _init_session_state()
+    _render_streamlit_disabled_notice()
 
-    main_db = DEFAULT_MAIN_DB
-    state_db = DEFAULT_STATE_DB
-    indexer_db = _indexer_db_path()
-    state = _terminal_state(main_db, state_db)
 
-    _render_terminal_header(state)
-    active_tab = _render_dashboard_tabs(indexer_db)
-    _render_system_control(main_db, state_db, indexer_db)
+def _require_streamlit_runtime() -> None:
+    if st is None:
+        raise RuntimeError(
+            "The Streamlit dashboard is disabled. Use the React control room: "
+            "start FastAPI with `python server/api.py`, then run "
+            "`cd crypto-dashboard; npm run dev`."
+        )
 
-    if active_tab == "overview":
-        _render_terminal_actions(main_db, state_db)
-        state = _terminal_state(main_db, state_db)
-        _render_terminal_shell(state)
-        _render_equity_chart(state_db)
-    elif active_tab == "scan":
-        _render_scan_tab(main_db, state)
-    elif active_tab == "paper":
-        _render_paper_tab(main_db, state_db, state)
-    elif active_tab == "indexer":
-        _render_indexer_tab(indexer_db)
 
-    if active_tab != "indexer" and _paper_process_running():
-        time.sleep(2)
-        st.rerun()
+def _render_streamlit_disabled_notice() -> None:
+    st.markdown(
+        """
+        <div class="terminal-shell top-only">
+          <header class="topbar">
+            <div class="brand"><span class="led"></span><span>POLYMARKET 200 SEED</span></div>
+            <div class="topline">
+              <span>CONTROL ROOM <b>REACT</b></span>
+              <span>STREAMLIT <b>DISABLED</b></span>
+              <span class="live">PAPER ONLY</span>
+            </div>
+          </header>
+          <section class="cyclebar">
+            <div><span>STATUS</span> <b>LEGACY UI OFF</b></div>
+            <div class="progress-track"><span style="width:100%"></span></div>
+            <div><b>USE REACT</b></div>
+            <div class="mode-chip">FASTAPI + REACT</div>
+          </section>
+        </div>
+        <div class="legacy-disabled">
+          <h2>STREAMLIT DASHBOARD DISABLED</h2>
+          <p>Primary dashboard is now React: <code>http://127.0.0.1:3000</code></p>
+          <p>Backend API: <code>http://127.0.0.1:8000</code></p>
+          <p>Start stack:</p>
+          <pre>python server/api.py
+cd crypto-dashboard
+npm run dev</pre>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
 
 def _render_terminal_header(state: dict[str, Any]) -> None:
@@ -1554,6 +1571,15 @@ def _inject_style() -> None:
         .dashboard-tab:hover {color:var(--hot); border-color:var(--line);}
         .dashboard-tab.active {color:var(--hot); border-color:var(--line); box-shadow:0 0 12px rgba(53,230,242,.16);}
         .live-dot {color:#37ff7d; font-weight:900; text-shadow:0 0 8px rgba(55,255,125,.72);}
+        .legacy-disabled {
+          margin-top:18px; border:1px solid var(--line-soft); background:rgba(3,13,17,.88);
+          padding:18px 20px; color:var(--text); font-family:"Cascadia Mono",Consolas,"Courier New",monospace;
+        }
+        .legacy-disabled h2 {margin:0 0 12px; color:var(--hot); font-size:18px; text-shadow:0 0 12px rgba(53,230,242,.35);}
+        .legacy-disabled p {margin:8px 0; color:var(--muted);}
+        .legacy-disabled code,.legacy-disabled pre {color:var(--hot); background:#02080b; border:1px solid var(--line-soft);}
+        .legacy-disabled code {padding:2px 5px;}
+        .legacy-disabled pre {margin-top:8px; padding:12px; white-space:pre-wrap;}
         .terminal-shell {position:relative; color:var(--text); font-family:"Cascadia Mono",Consolas,"Courier New",monospace; font-size:13px;}
         .terminal-shell::before {
           content:""; position:fixed; inset:0; pointer-events:none;
