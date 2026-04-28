@@ -826,7 +826,7 @@ def main() -> int:
         print(_missing_dependency_message(), file=sys.stderr)
         return 2
     settings = settings_from_env()
-    uvicorn.run(app, host=settings.host, port=settings.port)
+    uvicorn.run(app, host=settings.host, port=settings.port, ws="wsproto")
     return 0
 
 
