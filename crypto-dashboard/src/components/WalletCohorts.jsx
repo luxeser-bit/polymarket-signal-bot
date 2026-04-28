@@ -10,6 +10,7 @@ const COHORTS = [
   ['WATCH', 'text-amber-300'],
   ['NOISE', 'text-slate-500'],
 ];
+const TARGET_WALLETS = 14000;
 
 export default function WalletCohorts({ data, training, onRefreshTraining, onRefreshWallets }) {
   const [loading, setLoading] = useState(false);
@@ -20,6 +21,10 @@ export default function WalletCohorts({ data, training, onRefreshTraining, onRef
   const trainingRunning = Boolean(training?.running);
   const exitExamples =
     training?.exit_examples?.count ?? data?.exit_examples?.count ?? lastRun?.exit_examples ?? 0;
+  const scoredWallets = Number(data?.scored_wallets || 0);
+  const walletProgress = Math.min(1, scoredWallets / TARGET_WALLETS);
+  const walletProgressPct = walletProgress * 100;
+  const walletsRemaining = Math.max(0, TARGET_WALLETS - scoredWallets);
 
   async function trainModel() {
     setLoading(true);
@@ -50,7 +55,7 @@ export default function WalletCohorts({ data, training, onRefreshTraining, onRef
         <div>
           <p className="panel-title">Wallet cohorts</p>
           <h2 className="mt-1 text-lg font-semibold text-slate-50">
-            {numberFull(data?.scored_wallets || 0)} scored wallets
+            {numberFull(scoredWallets)} scored wallets
           </h2>
         </div>
         <div className="flex items-center gap-2">
@@ -64,6 +69,26 @@ export default function WalletCohorts({ data, training, onRefreshTraining, onRef
             {loading ? 'Working' : trainingRunning ? 'Stop Training' : 'Train Model'}
           </button>
           <FiUsers className="text-cyan-300" size={22} aria-hidden="true" />
+        </div>
+      </div>
+
+      <div className="mb-3 border border-cyan-500/60 bg-cyan-950/20 p-3">
+        <div className="mb-2 flex items-center justify-between gap-3 text-xs uppercase">
+          <span className="font-semibold text-cyanLive">Wallet target // market movement map</span>
+          <span className="text-slate-400">
+            {numberFull(scoredWallets)} / {numberFull(TARGET_WALLETS)}
+          </span>
+        </div>
+        <div className="h-2 overflow-hidden bg-slate-950">
+          <div
+            className="h-full bg-cyanLive shadow-[0_0_14px_rgba(34,211,238,0.65)] transition-all duration-300"
+            style={{ width: `${Math.max(0.6, walletProgressPct)}%` }}
+          />
+        </div>
+        <div className="mt-2 grid gap-2 text-[10px] font-semibold uppercase tracking-wide text-slate-500 sm:grid-cols-3">
+          <span>Coverage {walletProgressPct.toFixed(2)}%</span>
+          <span>Remaining {numberFull(walletsRemaining)}</span>
+          <span>Target smart-flow wallets</span>
         </div>
       </div>
 
