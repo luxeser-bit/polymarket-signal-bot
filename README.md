@@ -37,6 +37,17 @@ The main screen includes `SYSTEM CONTROL`: `START ALL` launches the indexer,
 monitor, and live paper runner in the background, while `STOP ALL` terminates
 those component PIDs and shows recent per-component logs.
 
+FastAPI backend for production-style control:
+
+```powershell
+python -m pip install -r requirements-server.txt
+python server/api.py
+```
+
+The API listens on `http://127.0.0.1:8000` by default and exposes system
+start/stop/status, indexer metrics, wallet/cohort summaries, paper positions,
+paper runner controls, and `/ws/live` for 500ms live updates.
+
 ## Live public-data run
 
 Network access is required for these commands.
