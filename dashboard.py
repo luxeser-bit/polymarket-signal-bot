@@ -57,11 +57,11 @@ def main() -> None:
     main_db = DEFAULT_MAIN_DB
     state_db = DEFAULT_STATE_DB
     indexer_db = _indexer_db_path()
-    _render_system_control(main_db, state_db, indexer_db)
     state = _terminal_state(main_db, state_db)
 
     _render_terminal_header(state)
     active_tab = _render_dashboard_tabs(indexer_db)
+    _render_system_control(main_db, state_db, indexer_db)
 
     if active_tab == "overview":
         _render_terminal_actions(main_db, state_db)
@@ -155,21 +155,26 @@ def _active_tab_from_query() -> str:
 def _render_system_control(main_db: Path, state_db: Path, indexer_db: Path) -> None:
     specs = _system_component_specs(main_db, state_db, indexer_db)
     status = _system_component_statuses(specs)
-    all_running = all(item["running"] for item in status.values())
-    st.sidebar.markdown("<div class='side-title'>SYSTEM CONTROL</div>", unsafe_allow_html=True)
+    all_running = _system_all_running(status)
+    st.markdown("<div class='system-control-title'>SYSTEM CONTROL // START ALL COMPONENTS</div>", unsafe_allow_html=True)
+    cols = st.columns([1.1, 1.1, 4.8])
     autostart_default = bool(st.session_state.get("system_autostart", _dashboard_autostart_requested()))
-    st.session_state.system_autostart = st.sidebar.checkbox(
-        "Autostart",
-        value=autostart_default,
-        key="system_autostart_checkbox",
-    )
-    button_label = "STOP ALL" if all_running else "START ALL"
-    if st.sidebar.button(button_label, width="stretch", type="primary", key="system_toggle"):
-        if all_running:
-            _stop_all_system(specs)
-        else:
-            _start_all_system(specs)
-        st.rerun()
+    with cols[0]:
+        button_label = _system_button_label(status)
+        if st.button(button_label, width="stretch", type="primary", key="system_toggle"):
+            if all_running:
+                _stop_all_system(specs)
+            else:
+                _start_all_system(specs)
+            st.rerun()
+    with cols[1]:
+        st.session_state.system_autostart = st.checkbox(
+            "Autostart",
+            value=autostart_default,
+            key="system_autostart_checkbox",
+        )
+    with cols[2]:
+        st.markdown(_system_status_html(status), unsafe_allow_html=True)
 
     if st.session_state.system_autostart and not st.session_state.get("system_autostart_done"):
         st.session_state.system_autostart_done = True
@@ -177,12 +182,19 @@ def _render_system_control(main_db: Path, state_db: Path, indexer_db: Path) -> N
             _start_all_system(specs)
             st.rerun()
 
-    st.sidebar.markdown(_system_status_html(status), unsafe_allow_html=True)
-    with st.sidebar.expander("System Logs", expanded=False):
+    with st.expander("SYSTEM LOGS", expanded=False):
         for key in SYSTEM_COMPONENT_KEYS:
             spec = specs[key]
             st.caption(str(spec["label"]))
             st.code(_tail_file(Path(spec["log_path"]), max_lines=80) or "No log yet", language="text")
+
+
+def _system_all_running(status: dict[str, dict[str, Any]]) -> bool:
+    return bool(status) and all(bool(item.get("running")) for item in status.values())
+
+
+def _system_button_label(status: dict[str, dict[str, Any]]) -> str:
+    return "STOP ALL" if _system_all_running(status) else "START ALL"
 
 
 def _render_terminal_actions(main_db: Path, state_db: Path) -> None:
@@ -1493,10 +1505,11 @@ def _inject_style() -> None:
         section[data-testid="stSidebar"] [data-testid="stMarkdownContainer"],
         section[data-testid="stSidebar"] label,
         section[data-testid="stSidebar"] span {font-family:"Cascadia Mono",Consolas,"Courier New",monospace;}
-        .side-title {height:30px; display:flex; align-items:center; color:var(--hot); font-weight:900; border:1px solid var(--line-soft); background:rgba(3,13,17,.88); padding:0 10px; margin-bottom:8px;}
-        .system-status {border:1px solid var(--line-soft); background:rgba(3,13,17,.88); margin-top:8px;}
-        .system-row {display:grid; grid-template-columns:16px minmax(0,1fr) auto; gap:8px; align-items:center; min-height:28px; padding:5px 8px; border-bottom:1px solid rgba(37,123,132,.22); color:var(--text);}
-        .system-row:last-child {border-bottom:0;}
+        .side-title,.system-control-title {height:30px; display:flex; align-items:center; color:var(--hot); font-weight:900; border:1px solid var(--line-soft); background:rgba(3,13,17,.88); padding:0 10px; margin-bottom:8px;}
+        .system-control-title {margin-top:8px;}
+        .system-status {display:grid; grid-template-columns:repeat(3,minmax(150px,1fr)); border:1px solid var(--line-soft); background:rgba(3,13,17,.88); min-height:38px;}
+        .system-row {display:grid; grid-template-columns:16px minmax(0,1fr) auto; gap:8px; align-items:center; min-height:38px; padding:5px 8px; border-right:1px solid rgba(37,123,132,.22); color:var(--text);}
+        .system-row:last-child {border-right:0;}
         .system-row b {color:var(--muted); font-size:11px;}
         .system-dot {width:8px; height:8px; border-radius:50%; display:inline-block; background:#59656a;}
         .system-dot.on {background:#37ff7d; box-shadow:0 0 8px rgba(55,255,125,.72);}
@@ -1572,7 +1585,7 @@ def _inject_style() -> None:
         .indexer-progress {margin:0 12px 12px; height:12px;}
         .indexer-path {padding:0 12px 14px; color:var(--muted); overflow:hidden; text-overflow:ellipsis; white-space:nowrap;}
         .empty {padding:22px 4px; color:var(--dim);}
-        @media (max-width:1080px) {.topbar,.cyclebar{grid-template-columns:1fr}.topline{justify-content:flex-start;flex-wrap:wrap}.dashboard-tabs{flex-wrap:wrap}.metrics{grid-template-columns:repeat(2,minmax(130px,1fr))}.grid,.scan-grid,.paper-grid{grid-template-columns:1fr;grid-template-rows:none}.panel,.curve,.depth,.risk,.votes,.exits,.whales,.reviews,.scale,.alerts{grid-column:auto;grid-row:auto;min-height:280px}}
+        @media (max-width:1080px) {.topbar,.cyclebar{grid-template-columns:1fr}.topline{justify-content:flex-start;flex-wrap:wrap}.dashboard-tabs{flex-wrap:wrap}.system-status{grid-template-columns:1fr}.system-row{border-right:0;border-bottom:1px solid rgba(37,123,132,.22)}.system-row:last-child{border-bottom:0}.metrics{grid-template-columns:repeat(2,minmax(130px,1fr))}.grid,.scan-grid,.paper-grid{grid-template-columns:1fr;grid-template-rows:none}.panel,.curve,.depth,.risk,.votes,.exits,.whales,.reviews,.scale,.alerts{grid-column:auto;grid-row:auto;min-height:280px}}
         </style>
         """,
         unsafe_allow_html=True,

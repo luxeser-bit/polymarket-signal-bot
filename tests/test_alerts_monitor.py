@@ -62,6 +62,7 @@ class AlertMonitorTests(unittest.TestCase):
                         min_trade_usdc=20,
                         lookback_minutes=24 * 60,
                         live_sync=False,
+                        sync_books=False,
                     ),
                     telegram=TelegramConfig(),
                 )

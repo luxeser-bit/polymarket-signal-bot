@@ -178,6 +178,21 @@ class StreamlitDashboardIndexerTests(unittest.TestCase):
         self.assertIn("PID 11", html)
         self.assertIn("STOPPED", html)
 
+    def test_system_button_label_stops_only_when_all_components_run(self) -> None:
+        partial = {
+            "indexer": {"running": True},
+            "monitor": {"running": False},
+            "live_paper": {"running": True},
+        }
+        all_running = {
+            "indexer": {"running": True},
+            "monitor": {"running": True},
+            "live_paper": {"running": True},
+        }
+
+        self.assertEqual(dashboard._system_button_label(partial), "START ALL")
+        self.assertEqual(dashboard._system_button_label(all_running), "STOP ALL")
+
     def test_dashboard_autostart_accepts_cli_flag(self) -> None:
         with patch.object(sys, "argv", ["streamlit", "--autostart"]):
             self.assertTrue(dashboard._dashboard_autostart_requested())
