@@ -9,3 +9,5 @@ htmlcov/
 data/
 *.db
 *.sqlite
+node_modules/
+crypto-dashboard/dist/

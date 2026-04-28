@@ -48,6 +48,18 @@ The API listens on `http://127.0.0.1:8000` by default and exposes system
 start/stop/status, indexer metrics, wallet/cohort summaries, paper positions,
 paper runner controls, and `/ws/live` for 500ms live updates.
 
+React control room:
+
+```powershell
+cd crypto-dashboard
+npm install
+npm run dev
+```
+
+The Vite app runs on `http://127.0.0.1:3000` and talks to the FastAPI backend
+through `VITE_API_URL` or `http://localhost:8000` by default. It is the intended
+replacement for the old Streamlit dashboard.
+
 ## Live public-data run
 
 Network access is required for these commands.

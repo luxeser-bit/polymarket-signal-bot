@@ -140,6 +140,7 @@ class ServerApiTests(unittest.TestCase):
         self.assertEqual(result["scored_wallets"], 1)
         self.assertEqual(result["top_wallets"][0]["wallet"], "0xaaa")
         self.assertEqual(result["top_wallets"][0]["status"], "STABLE")
+        self.assertEqual(result["top_wallets"][0]["sharpe"], 1)
 
 
 if __name__ == "__main__":
