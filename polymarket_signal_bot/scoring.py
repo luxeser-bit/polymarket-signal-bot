@@ -68,6 +68,7 @@ def calculate_all_from_connection(conn: sqlite3.Connection, *, config: SQLScorin
         return pd.DataFrame(columns=_score_columns())
 
     where = [
+        "event_type = 'OrderFilled'",
         "user_address != ''",
         "UPPER(side) IN ('BUY', 'SELL')",
         "CAST(price AS REAL) > 0",
@@ -246,14 +247,20 @@ def save_scored_wallets_to_connection(
     *,
     scored_table: str = "scored_wallets",
 ) -> int:
+    conn.execute(f"DELETE FROM {scored_table}")
     if df is None or df.empty:
+        conn.commit()
         return 0
     rows = []
     for _, row in df.iterrows():
+        address = str(row.get("address", row.get("wallet", "")))
+        calculated_at = int(row.get("calculated_at", row.get("computed_at", int(time.time()))))
         rows.append(
             (
-                str(row["wallet"]),
-                int(row["computed_at"]),
+                address,
+                str(row.get("wallet", address)),
+                calculated_at,
+                int(row.get("computed_at", calculated_at)),
                 float(row["score"]),
                 float(row["pnl"]),
                 float(row["sharpe"]),
@@ -277,13 +284,15 @@ def save_scored_wallets_to_connection(
     conn.executemany(
         f"""
         INSERT INTO {scored_table}(
-            wallet, computed_at, score, pnl, sharpe, max_drawdown, profit_factor,
+            address, wallet, calculated_at, computed_at, score, pnl, sharpe, max_drawdown, profit_factor,
             win_rate, avg_hold_time, volume, trade_count, consistency, active_days,
             market_count, buy_count, sell_count, avg_trade_size, first_trade_ts,
             last_trade_ts, reason
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(wallet) DO UPDATE SET
+            address = excluded.address,
+            calculated_at = excluded.calculated_at,
             computed_at = excluded.computed_at,
             score = excluded.score,
             pnl = excluded.pnl,
@@ -316,7 +325,9 @@ def ensure_scoring_schema(conn: sqlite3.Connection, *, scored_table: str = "scor
     conn.executescript(
         f"""
         CREATE TABLE IF NOT EXISTS {scored_table} (
+            address TEXT NOT NULL DEFAULT '',
             wallet TEXT PRIMARY KEY,
+            calculated_at INTEGER NOT NULL DEFAULT 0,
             computed_at INTEGER NOT NULL,
             score REAL NOT NULL,
             pnl REAL NOT NULL,
@@ -341,6 +352,12 @@ def ensure_scoring_schema(conn: sqlite3.Connection, *, scored_table: str = "scor
         CREATE INDEX IF NOT EXISTS idx_{scored_table}_computed ON {scored_table}(computed_at DESC);
         """
     )
+    _ensure_column(conn, scored_table, "address", "TEXT NOT NULL DEFAULT ''")
+    _ensure_column(conn, scored_table, "calculated_at", "INTEGER NOT NULL DEFAULT 0")
+    conn.execute(f"CREATE INDEX IF NOT EXISTS idx_{scored_table}_address ON {scored_table}(address)")
+    conn.execute(f"CREATE INDEX IF NOT EXISTS idx_{scored_table}_calculated ON {scored_table}(calculated_at DESC)")
+    conn.execute(f"UPDATE {scored_table} SET address = wallet WHERE address = ''")
+    conn.execute(f"UPDATE {scored_table} SET calculated_at = computed_at WHERE calculated_at = 0")
     conn.commit()
 
 
@@ -361,10 +378,21 @@ def _ensure_raw_transaction_indexes(conn: sqlite3.Connection, table: str) -> Non
         CREATE INDEX IF NOT EXISTS idx_{table}_market_time ON {table}(market_id, timestamp);
         CREATE INDEX IF NOT EXISTS idx_{table}_timestamp ON {table}(timestamp);
         CREATE INDEX IF NOT EXISTS idx_{table}_event_user_time ON {table}(event_type, user_address, timestamp);
+        CREATE INDEX IF NOT EXISTS idx_{table}_orderfilled_wallet_time ON {table}(event_type, user_address, timestamp)
+            WHERE event_type = 'OrderFilled';
         CREATE INDEX IF NOT EXISTS idx_{table}_side_user_time ON {table}(side, user_address, timestamp);
         """
     )
     conn.commit()
+
+
+def _ensure_column(conn: sqlite3.Connection, table: str, column: str, definition: str) -> None:
+    columns = {
+        str(row["name"])
+        for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
+    }
+    if column not in columns:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
 
 def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
@@ -398,6 +426,8 @@ def _finalize_score_frame(df: Any, *, computed_at: int) -> Any:
         + 0.04 * (df["avg_hold_time"] / hold_denominator).clip(0, 1)
     ).round(4)
     df["computed_at"] = int(computed_at)
+    df["calculated_at"] = int(computed_at)
+    df["address"] = df["wallet"]
     df["reason"] = (
         "sql_metrics pnl="
         + df["pnl"].round(4).astype(str)
@@ -419,7 +449,9 @@ def _empty_scores_df() -> Any:
 
 def _score_columns() -> list[str]:
     return [
+        "address",
         "wallet",
+        "calculated_at",
         "computed_at",
         "score",
         "pnl",

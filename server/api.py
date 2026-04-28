@@ -73,6 +73,7 @@ class ServerSettings:
     main_db: Path = ROOT / DEFAULT_DB_PATH
     indexer_db: Path = ROOT / "data" / "indexer.db"
     paper_state_db: Path = ROOT / "data" / "paper_state.db"
+    exit_examples_path: Path = ROOT / "data" / "exit_examples.json"
     host: str = "127.0.0.1"
     port: int = 8000
     monitor_interval_seconds: int = 60
@@ -252,6 +253,7 @@ def settings_from_env() -> ServerSettings:
         main_db=main_db,
         indexer_db=_env_path("INDEXER_DB_PATH", ROOT / "data" / "indexer.db"),
         paper_state_db=_env_path("POLYSIGNAL_PAPER_STATE_DB", _env_path("PAPER_STATE_DB", ROOT / "data" / "paper_state.db")),
+        exit_examples_path=_env_path("EXIT_EXAMPLES_PATH", ROOT / "data" / "exit_examples.json"),
         host=os.environ.get("API_HOST", os.environ.get("SERVER_HOST", "127.0.0.1")),
         port=_env_int("API_PORT", _env_int("SERVER_PORT", 8000)),
         monitor_interval_seconds=_env_int("MONITOR_INTERVAL_SECONDS", monitor_defaults.interval_seconds),
@@ -452,6 +454,8 @@ def training_command(
         str(ROOT / "data" / "exit_model.pkl"),
         "--stats-path",
         str(ROOT / "data" / "exit_stats.json"),
+        "--examples-path",
+        str(settings.exit_examples_path),
         "--policy-path",
         str(ROOT / "data" / "best_policy.json"),
     ]
@@ -480,6 +484,7 @@ def training_status_snapshot(settings: ServerSettings) -> dict[str, Any]:
     return {
         **status,
         "last_run": latest_training_summary(settings.indexer_db),
+        "exit_examples": exit_examples_snapshot(settings.exit_examples_path),
         "log_path": str(log_path),
         "log_tail": tail_file(log_path),
     }
@@ -754,6 +759,7 @@ def wallet_metrics(settings: ServerSettings) -> dict[str, Any]:
         "scored_wallets": 0,
         "db_path": str(settings.indexer_db),
         "last_training": latest_training_summary(settings.indexer_db),
+        "exit_examples": exit_examples_snapshot(settings.exit_examples_path),
         "error": "",
     }
     if not settings.indexer_db.exists():
@@ -942,10 +948,17 @@ def signals_count(db_path: Path) -> int:
 
 
 def top_wallet_rows(conn: sqlite3.Connection, *, include_cohorts: bool) -> list[dict[str, Any]]:
+    columns = table_columns(conn, "scored_wallets")
+    wallet_expr = "COALESCE(NULLIF(s.address, ''), s.wallet)" if "address" in columns else "s.wallet"
+    computed_expr = (
+        "COALESCE(NULLIF(s.calculated_at, 0), s.computed_at)"
+        if "calculated_at" in columns
+        else "s.computed_at"
+    )
     if include_cohorts:
-        query = """
+        query = f"""
             SELECT
-                s.wallet,
+                {wallet_expr} AS wallet,
                 COALESCE(c.status, '') AS status,
                 s.score,
                 s.pnl,
@@ -955,32 +968,54 @@ def top_wallet_rows(conn: sqlite3.Connection, *, include_cohorts: bool) -> list[
                 s.win_rate,
                 s.profit_factor,
                 s.max_drawdown,
-                s.computed_at
+                {computed_expr} AS computed_at
             FROM scored_wallets s
-            LEFT JOIN wallet_cohorts c ON c.wallet = s.wallet
+            LEFT JOIN wallet_cohorts c ON c.wallet = {wallet_expr}
             ORDER BY s.score DESC, s.volume DESC
             LIMIT 10
         """
     else:
-        query = """
+        query = f"""
             SELECT
-                wallet,
+                {wallet_expr} AS wallet,
                 '' AS status,
-                score,
-                pnl,
-                sharpe,
-                volume,
-                trade_count,
-                win_rate,
-                profit_factor,
-                max_drawdown,
-                computed_at
-            FROM scored_wallets
+                s.score,
+                s.pnl,
+                s.sharpe,
+                s.volume,
+                s.trade_count,
+                s.win_rate,
+                s.profit_factor,
+                s.max_drawdown,
+                {computed_expr} AS computed_at
+            FROM scored_wallets s
             ORDER BY score DESC, volume DESC
             LIMIT 10
         """
     rows = conn.execute(query).fetchall()
     return [dict(row) for row in rows]
+
+
+def exit_examples_snapshot(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {"count": 0, "examples": [], "path": str(path), "updated_at": 0}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        return {"count": 0, "examples": [], "path": str(path), "updated_at": 0, "error": str(exc)}
+    examples = payload if isinstance(payload, list) else payload.get("examples", []) if isinstance(payload, dict) else []
+    if not isinstance(examples, list):
+        examples = []
+    try:
+        updated_at = int(path.stat().st_mtime)
+    except OSError:
+        updated_at = 0
+    return {
+        "count": len(examples),
+        "examples": examples[:10],
+        "path": str(path),
+        "updated_at": updated_at,
+    }
 
 
 def scoring_fallback_rows(db_path: Path) -> list[dict[str, Any]]:
@@ -1032,6 +1067,12 @@ def table_exists(conn: sqlite3.Connection, table: str) -> bool:
         (table,),
     ).fetchone()
     return row is not None
+
+
+def table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
+    if not table_exists(conn, table):
+        return set()
+    return {str(row["name"]) for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
 
 
 def tail_file(path: Path, *, lines: int = 20) -> str:

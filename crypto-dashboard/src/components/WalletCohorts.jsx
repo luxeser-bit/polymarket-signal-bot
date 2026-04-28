@@ -18,6 +18,8 @@ export default function WalletCohorts({ data, training, onRefreshTraining, onRef
   const topWallets = Array.isArray(data?.top_wallets) ? data.top_wallets : [];
   const lastRun = training?.last_run || data?.last_training || null;
   const trainingRunning = Boolean(training?.running);
+  const exitExamples =
+    training?.exit_examples?.count ?? data?.exit_examples?.count ?? lastRun?.exit_examples ?? 0;
 
   async function trainModel() {
     setLoading(true);
@@ -77,6 +79,7 @@ export default function WalletCohorts({ data, training, onRefreshTraining, onRef
             ) : (
               <span> - no training run yet</span>
             )}
+            <span> - exit examples {numberFull(exitExamples)}</span>
           </div>
         </div>
         <label className="flex items-center gap-2 text-slate-400">

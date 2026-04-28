@@ -21,6 +21,7 @@ LOGGER = logging.getLogger(__name__)
 DEFAULT_INDEXER_DB_PATH = Path("data/indexer.db")
 DEFAULT_MODEL_PATH = Path("data/exit_model.pkl")
 DEFAULT_STATS_PATH = Path("data/exit_stats.json")
+DEFAULT_EXAMPLES_PATH = Path("data/exit_examples.json")
 DEFAULT_POLICY_PATH = Path("data/best_policy.json")
 
 
@@ -29,6 +30,7 @@ class AutoTrainerConfig:
     db_path: Path = DEFAULT_INDEXER_DB_PATH
     model_path: Path = DEFAULT_MODEL_PATH
     stats_path: Path = DEFAULT_STATS_PATH
+    examples_path: Path = DEFAULT_EXAMPLES_PATH
     policy_path: Path = DEFAULT_POLICY_PATH
     test: bool = False
     limit: int | None = None
@@ -41,6 +43,7 @@ def run_full_training_cycle(
     db_path: str | Path = DEFAULT_INDEXER_DB_PATH,
     model_path: str | Path = DEFAULT_MODEL_PATH,
     stats_path: str | Path = DEFAULT_STATS_PATH,
+    examples_path: str | Path = DEFAULT_EXAMPLES_PATH,
     policy_path: str | Path = DEFAULT_POLICY_PATH,
     test: bool = False,
     limit: int | None = None,
@@ -51,6 +54,7 @@ def run_full_training_cycle(
         db_path=Path(db_path),
         model_path=Path(model_path),
         stats_path=Path(stats_path),
+        examples_path=Path(examples_path),
         policy_path=Path(policy_path),
         test=test,
         limit=limit or (10_000 if test else None),
@@ -59,9 +63,13 @@ def run_full_training_cycle(
     )
     started = time.time()
     config.db_path.parent.mkdir(parents=True, exist_ok=True)
+    LOGGER.info("training cycle started db=%s test=%s limit=%s", config.db_path, config.test, config.limit)
+    LOGGER.info("ensuring training schema")
     _ensure_training_schema(config.db_path)
     before_count = _raw_count(config.db_path)
+    LOGGER.info("raw_transactions count=%s", before_count)
     if not force and not _has_enough_new_records(config.db_path, before_count, min_new_records):
+        LOGGER.info("training skipped: not enough new records min_new_records=%s", min_new_records)
         return {
             "ok": True,
             "skipped": True,
@@ -70,20 +78,35 @@ def run_full_training_cycle(
         }
 
     try:
+        LOGGER.info("scoring wallets from OrderFilled rows")
         scores = calculate_all(config.db_path, limit=config.limit, min_trades=1)
+        LOGGER.info("scoring produced rows=%s", int(getattr(scores, "shape", [0])[0] if scores is not None else 0))
+        LOGGER.info("saving scored_wallets")
         saved_scores = save_scored_wallets(scores, config.db_path)
+        LOGGER.info("saved scored_wallets=%s", saved_scores)
+        LOGGER.info("updating wallet_cohorts via cohorts.update_cohorts")
         cohort_result = update_cohorts(config.db_path, policy_path=config.policy_path)
+        LOGGER.info("wallet_cohorts updated=%s counts=%s", cohort_result.get("updated"), cohort_result.get("counts"))
         stable_cohorts = load_wallet_cohorts(
             config.db_path,
             statuses={"STABLE", "CANDIDATE"},
             limit=50_000 if not test else 1_000,
         )
+        LOGGER.info("stable/candidate wallets for exit model=%s", len(stable_cohorts))
+        LOGGER.info("training exit model")
         exit_result = train_exit_model(
             config.db_path,
             stable_wallets=set(stable_cohorts),
             model_path=config.model_path,
             stats_path=config.stats_path,
+            examples_path=config.examples_path,
             limit=config.limit,
+        )
+        LOGGER.info(
+            "exit model trained type=%s examples=%s saved_examples=%s",
+            exit_result.get("model_type"),
+            exit_result.get("examples"),
+            exit_result.get("saved_examples"),
         )
         elapsed = time.time() - started
         summary = {
@@ -97,9 +120,12 @@ def run_full_training_cycle(
             "exit_examples": int(exit_result.get("examples", 0)),
             "exit_model": str(config.model_path),
             "exit_stats": str(config.stats_path),
+            "exit_examples_path": str(config.examples_path),
             "elapsed_seconds": round(elapsed, 3),
         }
+        LOGGER.info("recording training run summary")
         _record_training_run(config.db_path, summary, before_count)
+        LOGGER.info("training cycle finished elapsed=%.3fs", elapsed)
         return summary
     except Exception as exc:  # noqa: BLE001 - keep previous model/cohorts on failure.
         LOGGER.exception("Auto training failed")
@@ -119,6 +145,7 @@ def train_exit_model(
     stable_wallets: set[str],
     model_path: str | Path = DEFAULT_MODEL_PATH,
     stats_path: str | Path = DEFAULT_STATS_PATH,
+    examples_path: str | Path = DEFAULT_EXAMPLES_PATH,
     limit: int | None = None,
 ) -> dict[str, Any]:
     examples = _exit_examples(Path(db_path), stable_wallets=stable_wallets, limit=limit)
@@ -126,12 +153,24 @@ def train_exit_model(
     model = _fit_exit_model(examples)
     model_path = Path(model_path)
     stats_path = Path(stats_path)
+    examples_path = Path(examples_path)
     model_path.parent.mkdir(parents=True, exist_ok=True)
     stats_path.parent.mkdir(parents=True, exist_ok=True)
+    examples_path.parent.mkdir(parents=True, exist_ok=True)
     with model_path.open("wb") as handle:
         pickle.dump(model, handle)
     stats_path.write_text(json.dumps(stats, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
-    return {"examples": len(examples), "stats": stats, "model_type": model.get("type", "unknown")}
+    sample_examples = examples[:10]
+    examples_path.write_text(
+        json.dumps(sample_examples, ensure_ascii=False, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+    return {
+        "examples": len(examples),
+        "saved_examples": len(sample_examples),
+        "stats": stats,
+        "model_type": model.get("type", "unknown"),
+    }
 
 
 def _exit_examples(
@@ -139,7 +178,7 @@ def _exit_examples(
     *,
     stable_wallets: set[str],
     limit: int | None = None,
-) -> list[dict[str, float]]:
+) -> list[dict[str, Any]]:
     if not db_path.exists() or not stable_wallets:
         return []
     placeholders = ",".join("?" for _ in stable_wallets)
@@ -160,6 +199,7 @@ def _exit_examples(
         FROM raw_transactions
         WHERE LOWER(user_address) IN ({placeholders})
           AND market_id != ''
+          AND event_type = 'OrderFilled'
           AND UPPER(side) IN ('BUY', 'SELL')
           AND price > 0
           AND ABS(amount) > 0
@@ -210,6 +250,10 @@ def _exit_examples(
         conn.close()
     return [
         {
+            "wallet": str(row["wallet"] or ""),
+            "market_id": str(row["market_id"] or ""),
+            "entry_ts": int(row["entry_ts"] or 0),
+            "exit_ts": int(row["exit_ts"] or 0),
             "hold_seconds": float(row["hold_seconds"] or 0.0),
             "entry_notional": float(row["entry_notional"] or 0.0),
             "volatility_proxy": float(row["volatility_proxy"] or 0.0),
@@ -221,7 +265,7 @@ def _exit_examples(
     ]
 
 
-def _exit_stats(examples: list[dict[str, float]]) -> dict[str, Any]:
+def _exit_stats(examples: list[dict[str, Any]]) -> dict[str, Any]:
     if not examples:
         return {
             "examples": 0,
@@ -243,7 +287,7 @@ def _exit_stats(examples: list[dict[str, float]]) -> dict[str, Any]:
     }
 
 
-def _fit_exit_model(examples: list[dict[str, float]]) -> dict[str, Any]:
+def _fit_exit_model(examples: list[dict[str, Any]]) -> dict[str, Any]:
     if not examples:
         return {"type": "rule", "default_hold_seconds": 6 * 3600, "features": []}
     features = ["entry_notional", "volatility_proxy", "hour_of_day"]
@@ -391,6 +435,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--db", default=os.environ.get("INDEXER_DB_PATH", str(DEFAULT_INDEXER_DB_PATH)))
     parser.add_argument("--model-path", default=str(DEFAULT_MODEL_PATH))
     parser.add_argument("--stats-path", default=str(DEFAULT_STATS_PATH))
+    parser.add_argument("--examples-path", default=str(DEFAULT_EXAMPLES_PATH))
     parser.add_argument("--policy-path", default=str(DEFAULT_POLICY_PATH))
     parser.add_argument("--test", action="store_true", help="Train on a limited sample and print a report.")
     parser.add_argument("--limit", type=int, default=0)
@@ -411,6 +456,7 @@ def main(argv: list[str] | None = None) -> int:
         db_path=args.db,
         model_path=args.model_path,
         stats_path=args.stats_path,
+        examples_path=args.examples_path,
         policy_path=args.policy_path,
         test=args.test,
         limit=args.limit or None,

@@ -17,15 +17,25 @@ class AutoTrainerTests(unittest.TestCase):
             db_path = Path(tmp) / "indexer.db"
             model_path = Path(tmp) / "exit_model.pkl"
             stats_path = Path(tmp) / "exit_stats.json"
+            examples_path = Path(tmp) / "exit_examples.json"
             _seed_raw_transactions(db_path)
 
             scores = calculate_all(db_path)
             self.assertEqual(set(scores["wallet"]), {"0xaaa", "0xbbb"})
+            self.assertEqual(set(scores["address"]), {"0xaaa", "0xbbb"})
+            self.assertIn("calculated_at", scores.columns)
             self.assertIn("sharpe", scores.columns)
-            self.assertGreater(int(scores.iloc[0]["trade_count"]), 0)
+            self.assertEqual(int(scores["trade_count"].sum()), 32)
 
             saved = save_scored_wallets(scores, db_path)
             self.assertEqual(saved, 2)
+            conn = sqlite3.connect(db_path)
+            try:
+                columns = {row[1] for row in conn.execute("PRAGMA table_info(scored_wallets)").fetchall()}
+                self.assertIn("address", columns)
+                self.assertIn("calculated_at", columns)
+            finally:
+                conn.close()
             cohort_result = update_cohorts(db_path)
             self.assertEqual(cohort_result["updated"], 2)
             self.assertIn("0xaaa", load_wallet_cohorts(db_path, statuses={"STABLE", "CANDIDATE", "WATCH"}))
@@ -34,14 +44,16 @@ class AutoTrainerTests(unittest.TestCase):
                 db_path=db_path,
                 model_path=model_path,
                 stats_path=stats_path,
+                examples_path=examples_path,
                 test=True,
                 limit=100,
             )
 
             self.assertTrue(summary["ok"])
-            self.assertEqual(summary["raw_transactions"], 32)
+            self.assertEqual(summary["raw_transactions"], 33)
             self.assertTrue(model_path.exists())
             self.assertTrue(stats_path.exists())
+            self.assertTrue(examples_path.exists())
             conn = sqlite3.connect(db_path)
             try:
                 self.assertIsNotNone(conn.execute("SELECT 1 FROM training_runs LIMIT 1").fetchone())
@@ -101,6 +113,16 @@ def _seed_raw_transactions(db_path: Path) -> None:
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         rows,
+    )
+    conn.execute(
+        """
+        INSERT INTO raw_transactions(
+            hash, log_index, block_number, timestamp, user_address, market_id,
+            side, price, amount, event_type, inserted_at
+        )
+        VALUES ('0xnoise', 999, 999, ?, '0xnoise', 'market-noise', 'BUY', 0.50, 500, 'TransferSingle', ?)
+        """,
+        (now, now),
     )
     conn.commit()
     conn.close()

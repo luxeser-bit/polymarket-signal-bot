@@ -76,15 +76,16 @@ def update_cohorts(
         if scored_count <= 0:
             return {"updated": 0, "counts": {}, "thresholds": thresholds.__dict__}
         now = int(time.time())
+        wallet_expr = _scored_wallet_address_expression(conn)
         conn.execute("DELETE FROM wallet_cohorts")
         conn.execute(
-            """
+            f"""
             INSERT INTO wallet_cohorts(
                 wallet, status, stability_score, score, pnl, volume, trade_count,
                 win_rate, profit_factor, max_drawdown, updated_at
             )
             SELECT
-                wallet,
+                {wallet_expr} AS wallet,
                 CASE
                     WHEN score >= ? AND trade_count >= ? AND volume >= ? THEN 'STABLE'
                     WHEN score >= ? AND trade_count >= ? AND volume >= ? THEN 'CANDIDATE'
@@ -256,6 +257,17 @@ def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
         (table,),
     ).fetchone()
     return row is not None
+
+
+def _table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
+    return {str(row["name"]) for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+
+
+def _scored_wallet_address_expression(conn: sqlite3.Connection) -> str:
+    columns = _table_columns(conn, "scored_wallets")
+    if "address" in columns:
+        return "COALESCE(NULLIF(address, ''), wallet)"
+    return "wallet"
 
 
 def _wallet_rows(store: Store, since_ts: int, config: CohortConfig) -> list[dict[str, Any]]:

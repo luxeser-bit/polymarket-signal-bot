@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import datetime as dt
 import html
+import json
 import os
 import signal
 import sqlite3
@@ -39,6 +40,7 @@ DEFAULT_STATE_DB = ROOT / "data" / "paper_state.db"
 DEFAULT_INDEXER_DB = ROOT / "data" / "indexer.db"
 DEFAULT_LOG_PATH = ROOT / "data" / "streamlit_live_paper.log"
 DEFAULT_TRAINER_LOG_PATH = ROOT / "data" / "auto_trainer_dashboard.log"
+DEFAULT_EXIT_EXAMPLES_PATH = ROOT / "data" / "exit_examples.json"
 DEFAULT_SYSTEM_LOG_DIR = ROOT / "data" / "system_logs"
 DEFAULT_BANKROLL = 200.0
 INDEXER_TARGET_RECORDS = 86_000_000
@@ -336,7 +338,7 @@ def _render_indexer_tab(indexer_db: Path) -> None:
         manual_refresh = st.button("REFRESH INDEXER", width="stretch", key="indexer_refresh")
     with cols[1]:
         retrain_running = _retrain_process_running()
-        if st.button("RETRAIN NOW", width="stretch", key="indexer_retrain", disabled=retrain_running):
+        if st.button("TRAIN MODEL", width="stretch", key="indexer_retrain", disabled=retrain_running):
             try:
                 _start_retrain_process(indexer_db)
             except Exception as exc:  # noqa: BLE001 - keep dashboard visible.
@@ -1135,6 +1137,14 @@ def _start_retrain_process(indexer_db: Path) -> None:
         "src.auto_trainer",
         "--db",
         str(indexer_db),
+        "--model-path",
+        str((indexer_db.parent / "exit_model.pkl").resolve()),
+        "--stats-path",
+        str((indexer_db.parent / "exit_stats.json").resolve()),
+        "--examples-path",
+        str((indexer_db.parent / "exit_examples.json").resolve()),
+        "--policy-path",
+        str((indexer_db.parent / "best_policy.json").resolve()),
     ]
     env = os.environ.copy()
     env.setdefault("PYTHONUTF8", "1")
@@ -1301,7 +1311,7 @@ def _indexer_snapshot(db_path: Path) -> dict[str, Any]:
         if state_row:
             snapshot["last_block"] = int(state_row["last_block"] or 0)
             snapshot["updated_at"] = int(state_row["updated_at"] or 0)
-        training = _training_snapshot(conn)
+        training = _training_snapshot(conn, db_path=db_path)
         snapshot.update(training)
         snapshot["has_data"] = bool(snapshot["records"] or snapshot["last_block"])
         if snapshot["updated_at"]:
@@ -1315,13 +1325,13 @@ def _indexer_snapshot(db_path: Path) -> dict[str, Any]:
             conn.close()
 
 
-def _training_snapshot(conn: sqlite3.Connection) -> dict[str, Any]:
+def _training_snapshot(conn: sqlite3.Connection, *, db_path: Path | None = None) -> dict[str, Any]:
     tables = {
         str(row["name"])
         for row in conn.execute(
             """
             SELECT name FROM sqlite_master
-            WHERE type = 'table' AND name IN ('training_runs', 'wallet_cohorts')
+            WHERE type = 'table' AND name IN ('training_runs', 'wallet_cohorts', 'scored_wallets')
             """
         ).fetchall()
     }
@@ -1352,10 +1362,31 @@ def _training_snapshot(conn: sqlite3.Connection) -> dict[str, Any]:
                     "exit_examples": int(row["exit_examples"] or 0),
                 }
             )
+    if "scored_wallets" in tables:
+        row = conn.execute("SELECT COUNT(*) AS wallets FROM scored_wallets").fetchone()
+        snapshot["training_scored_wallets"] = int(row["wallets"] or 0) if row else 0
     if "wallet_cohorts" in tables:
         rows = conn.execute("SELECT status, COUNT(*) AS wallets FROM wallet_cohorts GROUP BY status").fetchall()
         snapshot["cohort_counts"] = {str(row["status"]): int(row["wallets"] or 0) for row in rows}
+    examples_path = (db_path.parent / "exit_examples.json") if db_path else DEFAULT_EXIT_EXAMPLES_PATH
+    examples_count = _exit_examples_count(examples_path)
+    if examples_count is not None:
+        snapshot["exit_examples"] = examples_count
     return snapshot
+
+
+def _exit_examples_count(path: Path) -> int | None:
+    if not path.exists():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if isinstance(payload, list):
+        return len(payload)
+    if isinstance(payload, dict) and isinstance(payload.get("examples"), list):
+        return len(payload["examples"])
+    return 0
 
 
 def _indexer_speed(snapshot: dict[str, Any], previous: Any) -> float:
