@@ -172,9 +172,10 @@ class IndexerTests(unittest.TestCase):
 
     def test_default_contracts_use_current_exchange_addresses(self) -> None:
         addresses = {spec.normalized_address for spec in default_contract_specs()}
+        self.assertIn("0x4bfb41d5b3570defd03c39a9a4d8de6bd8b8982e", addresses)
+        self.assertIn("0xc5d563a36ae78145c45a50134d48a1215220f80a", addresses)
         self.assertIn("0xe111180000d2663c0091e4f400237545b87b996b", addresses)
         self.assertIn("0xe2222d279d744050d28e00520010520000310f59", addresses)
-        self.assertNotIn("0x4bfb41d5b3570defd03c39a9a4d8de6bd8b8982e", addresses)
 
     def test_contract_topics_are_explicit(self) -> None:
         for contract in default_contract_specs():
@@ -236,6 +237,30 @@ class AdaptiveLogFetchTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(logs), 4)
         self.assertIn((1, 25, tuple(topics_for_contract(contract))), rpc.calls)
         self.assertTrue(all(call[2] for call in rpc.calls))
+
+    async def test_legacy_exchange_contract_can_verify_with_bytecode_only(self) -> None:
+        class FakeRpc:
+            async def get_code(self, address: str) -> str:
+                return "0x6000"
+
+            async def eth_call(self, address: str, data: str) -> str:
+                return "0x"
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with IndexerStore(Path(tmp) / "state.db") as store:
+                indexer = PolygonEventIndexer(
+                    IndexerConfig(rpc_url="http://rpc"),
+                    store=store,
+                    contracts=[
+                        ContractSpec(
+                            "LegacyNegRiskCLOBExchange",
+                            "0xc5d563a36ae78145c45a50134d48a1215220f80a",
+                            ("OrderFilledV1",),
+                        )
+                    ],
+                )
+
+                await indexer._verify_contracts(FakeRpc())
 
 
 if __name__ == "__main__":

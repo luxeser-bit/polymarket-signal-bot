@@ -34,6 +34,8 @@ USDC_ASSET_ID = 0
 TOKEN_DECIMALS = 1_000_000
 
 CONDITIONAL_TOKENS_ADDRESS = "0x4d97dcd97ec945f40cf65f87097ace5ea0476045"
+LEGACY_CTF_EXCHANGE_ADDRESS = "0x4bfb41d5b3570defd03c39a9a4d8de6bd8b8982e"
+LEGACY_NEG_RISK_CTF_EXCHANGE_ADDRESS = "0xc5d563a36ae78145c45a50134d48a1215220f80a"
 CTF_EXCHANGE_ADDRESS = "0xe111180000d2663c0091e4f400237545b87b996b"
 NEG_RISK_CTF_EXCHANGE_ADDRESS = "0xe2222d279d744050d28e00520010520000310f59"
 
@@ -790,6 +792,13 @@ class PolygonEventIndexer:
 
             probes = await self._exchange_probe_results(rpc, contract)
             if not any(result for result in probes.values()):
+                if contract.name.lower().startswith("legacy"):
+                    LOGGER.info(
+                        "Verified %s at %s via bytecode only; legacy contract probes unavailable",
+                        contract.name,
+                        contract.normalized_address,
+                    )
+                    continue
                 raise RuntimeError(
                     f"{contract.name} at {contract.normalized_address} did not respond "
                     "to exchange probes getCtf()/owner()/getOracle(). Use --skip-contract-check "
@@ -1191,6 +1200,7 @@ def _decode_generic_order_placed(context: _LogContext) -> RawTransaction:
 
 
 def default_contract_specs() -> list[ContractSpec]:
+    legacy_exchange_events = ("OrderFilledV1", "OrderCancelled", "OrderPlaced")
     exchange_events = ("OrderFilledV2", "OrdersMatchedV2", "OrderCancelled", "OrderPlaced")
     return [
         ContractSpec(
@@ -1202,6 +1212,16 @@ def default_contract_specs() -> list[ContractSpec]:
                 "ConditionPreparation",
                 "PayoutRedemption",
             ),
+        ),
+        ContractSpec(
+            name="LegacyCLOBExchange",
+            address=LEGACY_CTF_EXCHANGE_ADDRESS,
+            event_names=legacy_exchange_events,
+        ),
+        ContractSpec(
+            name="LegacyNegRiskCLOBExchange",
+            address=LEGACY_NEG_RISK_CTF_EXCHANGE_ADDRESS,
+            event_names=legacy_exchange_events,
         ),
         ContractSpec(name="CLOBExchange", address=CTF_EXCHANGE_ADDRESS, event_names=exchange_events),
         ContractSpec(
