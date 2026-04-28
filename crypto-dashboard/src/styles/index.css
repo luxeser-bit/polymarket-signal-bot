@@ -4,10 +4,9 @@
 
 :root {
   color-scheme: dark;
-  background: #0f172a;
+  background: #02070a;
   font-family:
-    Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI",
-    sans-serif;
+    "Cascadia Mono", Consolas, "Courier New", ui-monospace, monospace;
 }
 
 body {
@@ -15,10 +14,16 @@ body {
   min-width: 320px;
   min-height: 100vh;
   background:
-    radial-gradient(circle at top left, rgba(34, 211, 238, 0.14), transparent 32rem),
-    radial-gradient(circle at top right, rgba(14, 165, 233, 0.1), transparent 28rem),
-    #0f172a;
-  color: #e2e8f0;
+    repeating-linear-gradient(
+      to bottom,
+      rgba(255, 255, 255, 0.025),
+      rgba(255, 255, 255, 0.025) 1px,
+      transparent 1px,
+      transparent 5px
+    ),
+    radial-gradient(circle at 50% 0%, rgba(21, 93, 103, 0.24), transparent 36rem),
+    #02070a;
+  color: #8af7ff;
 }
 
 * {
@@ -27,19 +32,20 @@ body {
 
 @layer components {
   .panel-card {
-    @apply rounded-xl border border-slate-700/80 bg-panel/95 shadow-glow backdrop-blur;
+    @apply rounded-sm border border-slate-700/90 bg-panel/95 shadow-glow backdrop-blur;
   }
 
   .panel-title {
-    @apply text-xs font-semibold uppercase tracking-wide text-slate-400;
+    @apply text-xs font-bold uppercase tracking-wide text-cyanLive;
   }
 
   .metric-value {
-    @apply text-2xl font-semibold text-slate-50 transition-all duration-300;
+    @apply text-2xl font-bold text-cyanLive transition-all duration-300;
+    text-shadow: 0 0 14px rgba(53, 230, 242, 0.44);
   }
 
   .icon-button {
-    @apply inline-flex items-center justify-center gap-2 rounded-lg border border-cyan-400/30 bg-cyan-400/10 px-4 py-2 text-sm font-semibold text-cyan-100 transition hover:border-cyan-300 hover:bg-cyan-400/20 disabled:cursor-not-allowed disabled:opacity-60;
+    @apply inline-flex items-center justify-center gap-2 rounded-sm border border-cyanLive/50 bg-cyanLive/10 px-4 py-2 text-sm font-bold text-cyanLive transition hover:border-cyanLive hover:bg-cyanLive/20 disabled:cursor-not-allowed disabled:opacity-60;
   }
 
   .danger-button {
@@ -47,6 +53,6 @@ body {
   }
 
   .table-head {
-    @apply border-b border-slate-700 text-left text-[11px] font-semibold uppercase tracking-wide text-slate-500;
+    @apply border-b border-slate-700 text-left text-[11px] font-bold uppercase tracking-wide text-slate-400;
   }
 }
