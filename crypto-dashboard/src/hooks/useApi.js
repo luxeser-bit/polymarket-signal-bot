@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from 'react';
 
-export const API_BASE = (import.meta.env.VITE_API_URL || 'http://localhost:8000').replace(/\/$/, '');
+export const API_BASE = (import.meta.env.VITE_API_URL || 'http://127.0.0.1:8000').replace(/\/$/, '');
 
 export function apiUrl(path) {
   if (/^https?:\/\//i.test(path)) return path;

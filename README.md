@@ -57,7 +57,7 @@ npm run dev
 ```
 
 The Vite app runs on `http://127.0.0.1:3000` and talks to the FastAPI backend
-through `VITE_API_URL` or `http://localhost:8000` by default. It is the intended
+through `VITE_API_URL` or `http://127.0.0.1:8000` by default. It is the intended
 replacement for the old Streamlit dashboard.
 
 ## Live public-data run

@@ -61,6 +61,8 @@ SERVER_LOG_DIR = ROOT / "data" / "server_logs"
 PROCESS_LOCK = threading.RLock()
 PROCESS_REGISTRY: dict[str, "ManagedProcess"] = {}
 METRICS_CURSOR: dict[str, float] = {"last_block": 0.0, "seen_at": 0.0}
+LIVE_PAYLOAD_CACHE: dict[str, Any] = {"payload": None, "expires_at": 0.0}
+LIVE_PAYLOAD_LOCK = threading.RLock()
 
 
 @dataclass(frozen=True)
@@ -502,7 +504,7 @@ def discover_pid(patterns: tuple[str, ...]) -> int:
         return 0
 
 
-def indexer_metrics(settings: ServerSettings) -> dict[str, Any]:
+def indexer_metrics(settings: ServerSettings, *, include_process: bool = True) -> dict[str, Any]:
     snapshot = {
         "raw_events": 0,
         "last_block": 0,
@@ -511,7 +513,7 @@ def indexer_metrics(settings: ServerSettings) -> dict[str, Any]:
         "target": TARGET_RAW_EVENTS,
         "updated_at": 0,
         "db_path": str(settings.indexer_db),
-        "running": component_status(component_specs(settings)["indexer"])["running"],
+        "running": component_status(component_specs(settings)["indexer"])["running"] if include_process else False,
         "error": "",
     }
     if not settings.indexer_db.exists():
@@ -632,23 +634,49 @@ def paper_status_snapshot(settings: ServerSettings) -> dict[str, Any]:
 
 
 def live_payload(settings: ServerSettings) -> dict[str, Any]:
-    metrics = indexer_metrics(settings)
-    paper = paper_status_snapshot(settings)
+    now = time.time()
+    with LIVE_PAYLOAD_LOCK:
+        cached = LIVE_PAYLOAD_CACHE.get("payload")
+        if cached is not None and float(LIVE_PAYLOAD_CACHE.get("expires_at") or 0) > now:
+            return dict(cached)
+    payload = build_live_payload(settings)
+    with LIVE_PAYLOAD_LOCK:
+        LIVE_PAYLOAD_CACHE["payload"] = dict(payload)
+        LIVE_PAYLOAD_CACHE["expires_at"] = now + 1.0
+    return payload
+
+
+def build_live_payload(settings: ServerSettings) -> dict[str, Any]:
+    metrics = indexer_metrics(settings, include_process=False)
+    positions = positions_snapshot(settings)
+    main_summary = main_paper_summary(settings)
     return {
         "raw_events": metrics["raw_events"],
         "last_block": metrics["last_block"],
         "indexer_speed": metrics["blocks_per_second"],
         "progress": metrics["progress"],
-        "balance": paper["balance"],
-        "pnl": paper["pnl"],
-        "open_positions": paper["open_positions"],
+        "balance": positions["balance"] or main_summary.get("balance", 0.0),
+        "pnl": positions["pnl"] or main_summary.get("total_pnl", 0.0),
+        "open_positions": positions["open_positions_count"] or main_summary.get("open_positions", 0),
         "signals_count": signals_count(settings.main_db),
-        "components": {
-            key: {"running": value["running"], "pid": value["pid"]}
-            for key, value in component_statuses(settings).items()
-        },
+        "components": registry_component_snapshot(settings),
         "time": int(time.time()),
     }
+
+
+def registry_component_snapshot(settings: ServerSettings) -> dict[str, dict[str, Any]]:
+    specs = component_specs(settings)
+    snapshot: dict[str, dict[str, Any]] = {}
+    with PROCESS_LOCK:
+        for key, spec in specs.items():
+            managed = PROCESS_REGISTRY.get(key)
+            running = bool(managed and managed.process.poll() is None)
+            snapshot[key] = {
+                "running": running,
+                "pid": int(managed.process.pid) if running and managed else 0,
+                "name": spec.label,
+            }
+    return snapshot
 
 
 def main_paper_summary(settings: ServerSettings) -> dict[str, Any]:

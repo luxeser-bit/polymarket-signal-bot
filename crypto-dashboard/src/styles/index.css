@@ -26,8 +26,119 @@ body {
   color: #8af7ff;
 }
 
+#root {
+  min-height: 100vh;
+}
+
+.terminal-screen {
+  background:
+    repeating-linear-gradient(
+      to bottom,
+      rgba(70, 230, 242, 0.045),
+      rgba(70, 230, 242, 0.045) 1px,
+      transparent 1px,
+      transparent 4px
+    ),
+    linear-gradient(180deg, #02080a 0%, #010506 100%);
+}
+
 * {
   box-sizing: border-box;
+}
+
+.terminal-topbar,
+.terminal-strip,
+.panel-card {
+  border-color: rgba(39, 158, 174, 0.58) !important;
+  border-radius: 0 !important;
+  background:
+    linear-gradient(180deg, rgba(4, 18, 22, 0.96), rgba(2, 9, 12, 0.98)) !important;
+  box-shadow: none !important;
+}
+
+.terminal-topbar h1,
+.panel-card h2,
+.panel-card .metric-value {
+  color: #35e6f2 !important;
+  text-shadow: 0 0 14px rgba(53, 230, 242, 0.5);
+}
+
+.terminal-meta b {
+  color: #35e6f2;
+  font-weight: 800;
+}
+
+.terminal-led {
+  color: #35e6f2;
+  filter: drop-shadow(0 0 8px rgba(53, 230, 242, 0.9));
+}
+
+.terminal-progress {
+  border: 1px solid rgba(39, 158, 174, 0.62);
+  background: #021012;
+  overflow: hidden;
+}
+
+.terminal-progress > div {
+  height: 100%;
+  background: linear-gradient(90deg, rgba(53, 230, 242, 0.45), #35e6f2);
+  box-shadow: 0 0 18px rgba(53, 230, 242, 0.68);
+  transition: width 0.25s ease;
+}
+
+[class*="bg-slate-950"],
+[class*="bg-slate-900"],
+[class*="bg-slate-800"],
+[class*="bg-panel"] {
+  background-color: rgba(2, 8, 11, 0.92) !important;
+}
+
+[class*="border-slate-"],
+[class*="border-cyanLive"] {
+  border-color: rgba(39, 158, 174, 0.52) !important;
+}
+
+[class*="shadow-"] {
+  box-shadow: none !important;
+}
+
+[class*="rounded-lg"],
+[class*="rounded-xl"],
+[class*="rounded-full"],
+[class*="rounded-sm"] {
+  border-radius: 0 !important;
+}
+
+[class*="text-slate-50"],
+[class*="text-slate-100"],
+[class*="text-slate-200"],
+[class*="text-cyan"] {
+  color: #8af7ff !important;
+}
+
+[class*="text-slate-300"],
+[class*="text-slate-400"],
+[class*="text-slate-500"] {
+  color: #4f9ea8 !important;
+}
+
+[class*="text-emerald"] {
+  color: #37ff7d !important;
+}
+
+button,
+input,
+select,
+textarea {
+  font: inherit;
+}
+
+button {
+  text-transform: uppercase;
+}
+
+svg {
+  color: currentColor;
 }
 
 @layer components {
