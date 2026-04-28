@@ -27,13 +27,18 @@ export default function DashboardLayout({
 }) {
   const componentStatus = systemStatus?.components || {};
   const monitorRunning = Boolean(componentStatus.monitor?.running);
+  const componentUptimes = Object.values(componentStatus)
+    .filter((component) => component?.running)
+    .map((component) => Number(component?.uptime_seconds || 0));
+  const systemUptimeSeconds = Math.max(0, ...componentUptimes);
+  const runwayDay = Math.floor(systemUptimeSeconds / 86400);
+  const runwayProgress = (systemUptimeSeconds % 86400) / 86400;
   const walletsCount = Number(
     wallets?.scored_wallets
       || Object.values(wallets?.counts || {}).reduce((total, value) => total + Number(value || 0), 0),
   );
   const tradesCount = Number(metrics?.raw_events || live?.raw_events || 0);
-  const progress = Math.max(0.02, Math.min(1, Number(metrics?.progress || live?.progress || 0)));
-  const runwayDay = Math.floor(Date.now() / 86400000) % 20000;
+  const runwayProgressWidth = systemUptimeSeconds > 0 ? Math.max(0.6, runwayProgress * 100) : 0;
 
   return (
     <div className="terminal-screen min-h-screen px-1 py-4 lg:px-2">
@@ -61,7 +66,7 @@ export default function DashboardLayout({
       <div className="terminal-strip mb-3 flex items-center gap-4 border px-3 py-2 text-xs uppercase">
         <span>RUNWAY <b>DAY {runwayDay}</b></span>
         <div className="terminal-progress h-2 flex-1">
-          <div style={{ width: `${progress * 100}%` }} />
+          <div style={{ width: `${runwayProgressWidth}%` }} />
         </div>
         <span className={socket.connected ? 'text-good' : 'text-slate-500'}>{socket.connected ? 'LIVE SCAN' : 'WAITING'}</span>
       </div>
