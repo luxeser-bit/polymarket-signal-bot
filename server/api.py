@@ -22,6 +22,7 @@ import subprocess
 import sys
 import threading
 import time
+from datetime import datetime, timezone
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -49,6 +50,11 @@ except ModuleNotFoundError:  # pragma: no cover - surfaced by main().
     CORSMiddleware = None  # type: ignore[assignment]
     BaseModel = object  # type: ignore[assignment,misc]
 
+try:
+    from web3 import Web3
+except ModuleNotFoundError:  # pragma: no cover - optional for indexer progress RPC.
+    Web3 = None  # type: ignore[assignment]
+
 from polymarket_signal_bot.cohorts import load_wallet_cohorts
 from polymarket_signal_bot.live_paper_runner import _portfolio_snapshot
 from polymarket_signal_bot.monitor import Monitor, MonitorConfig
@@ -61,6 +67,9 @@ COMPONENT_KEYS = ("indexer", "monitor", "live_paper")
 SERVER_LOG_DIR = ROOT / "data" / "server_logs"
 PROCESS_LOCK = threading.RLock()
 PROCESS_REGISTRY: dict[str, "ManagedProcess"] = {}
+ADOPTED_PROCESS_REGISTRY: dict[str, "AdoptedProcess"] = {}
+COMPONENT_STATUS_CACHE: dict[str, Any] = {"components": None, "expires_at": 0.0}
+COMPONENT_STATUS_CACHE_SECONDS = 5.0
 TRAINING_LOCK = threading.RLock()
 TRAINING_PROCESS: "ManagedTrainingProcess | None" = None
 METRICS_LOCK = threading.RLock()
@@ -73,6 +82,9 @@ METRICS_CURSOR: dict[str, float] = {
 METRICS_SPEED_STALE_SECONDS = 30.0
 LIVE_PAYLOAD_CACHE: dict[str, Any] = {"payload": None, "expires_at": 0.0}
 LIVE_PAYLOAD_LOCK = threading.RLock()
+INDEXER_PROGRESS_LOCK = threading.RLock()
+INDEXER_PROGRESS_SAMPLES: list[tuple[float, int]] = []
+POLYGON_BLOCK_CACHE: dict[str, Any] = {"block": None, "expires_at": 0.0}
 
 
 @dataclass(frozen=True)
@@ -87,6 +99,11 @@ class ServerSettings:
     monitor_interval_seconds: int = 60
     paper_poll_interval_seconds: int = 60
     paper_price_interval_seconds: int = 15
+    indexer_chunk_size: int = 250
+    indexer_max_workers: int = 4
+    indexer_rpc_rps: float = 10.0
+    indexer_skip_contract_check: bool = True
+    polygon_rpc_url: str = ""
     dry_run: bool = True
     scoring_fallback_max_rows: int = 50_000
 
@@ -107,6 +124,13 @@ class ManagedProcess:
     process: subprocess.Popen[Any]
     started_at: float
     log_handle: Any
+    dry_run: bool = False
+
+
+@dataclass
+class AdoptedProcess:
+    pid: int
+    started_at: float
     dry_run: bool = False
 
 
@@ -199,11 +223,15 @@ def create_app() -> Any:
     @api.get("/system/status")
     async def system_status() -> dict[str, Any]:
         settings = settings_from_env()
-        return {"components": component_statuses(settings), "time": int(time.time())}
+        return {"components": cached_component_statuses(settings), "time": int(time.time())}
 
     @api.get("/api/metrics")
     async def api_metrics() -> dict[str, Any]:
         return indexer_metrics(settings_from_env())
+
+    @api.get("/api/indexer/progress")
+    async def api_indexer_progress() -> dict[str, Any]:
+        return await asyncio.to_thread(indexer_progress_snapshot, settings_from_env())
 
     @api.get("/api/wallets")
     async def api_wallets() -> dict[str, Any]:
@@ -256,7 +284,14 @@ def create_app() -> Any:
         try:
             while True:
                 settings = settings_from_env()
-                await websocket.send_json(live_payload(settings))
+                try:
+                    payload = await asyncio.wait_for(
+                        asyncio.to_thread(live_payload, settings),
+                        timeout=2.5,
+                    )
+                except TimeoutError:
+                    payload = {"error": "live payload timeout", "time": int(time.time())}
+                await websocket.send_json(payload)
                 await asyncio.sleep(0.5)
         except WebSocketDisconnect:
             return
@@ -282,6 +317,11 @@ def settings_from_env() -> ServerSettings:
         monitor_interval_seconds=_env_int("MONITOR_INTERVAL_SECONDS", monitor_defaults.interval_seconds),
         paper_poll_interval_seconds=_env_int("POLYSIGNAL_POLL_INTERVAL", 60),
         paper_price_interval_seconds=_env_int("POLYSIGNAL_PRICE_INTERVAL", 15),
+        indexer_chunk_size=_env_int("INDEXER_CHUNK_SIZE", _env_int("CHUNK_SIZE", 250)),
+        indexer_max_workers=_env_int("INDEXER_MAX_WORKERS", _env_int("MAX_WORKERS", 4)),
+        indexer_rpc_rps=_env_float("INDEXER_RPC_RPS", 10.0),
+        indexer_skip_contract_check=_env_bool("INDEXER_SKIP_CONTRACT_CHECK", True),
+        polygon_rpc_url=os.environ.get("POLYGON_RPC_URL", ""),
         dry_run=_env_bool("DRY_RUN", True),
         scoring_fallback_max_rows=_env_int("API_SCORING_FALLBACK_MAX_ROWS", 50_000),
     )
@@ -318,18 +358,28 @@ def component_specs(settings: ServerSettings, *, paper_dry_run: bool | None = No
     if dry_run:
         paper_command.append("--dry-run")
 
+    indexer_command: list[str] = [
+        sys.executable,
+        "-m",
+        "src.indexer",
+        "--sync",
+        "--db",
+        str(settings.indexer_db),
+        "--chunk-size",
+        str(settings.indexer_chunk_size),
+        "--max-workers",
+        str(settings.indexer_max_workers),
+        "--rpc-rps",
+        str(settings.indexer_rpc_rps),
+    ]
+    if settings.indexer_skip_contract_check:
+        indexer_command.append("--skip-contract-check")
+
     return {
         "indexer": ComponentSpec(
             key="indexer",
             label="Indexer",
-            command=(
-                sys.executable,
-                "-m",
-                "src.indexer",
-                "--sync",
-                "--db",
-                str(settings.indexer_db),
-            ),
+            command=tuple(indexer_command),
             log_path=SERVER_LOG_DIR / "indexer.log",
             patterns=("*src.indexer*", "*polymarket_signal_bot.indexer*"),
             env=env,
@@ -562,7 +612,7 @@ def cleanup_training_process() -> None:
 
 def start_component(spec: ComponentSpec) -> dict[str, Any]:
     with PROCESS_LOCK:
-        running = component_status(spec)
+        running = component_status(spec, discover=True)
         if running["running"]:
             return {**running, "started": False, "message": "already running"}
 
@@ -590,6 +640,7 @@ def start_component(spec: ComponentSpec) -> dict[str, Any]:
             log_handle=log_handle,
             dry_run=spec.dry_run,
         )
+        clear_component_status_cache()
         return {
             "name": spec.label,
             "running": True,
@@ -604,7 +655,14 @@ def start_component(spec: ComponentSpec) -> dict[str, Any]:
 def stop_component(spec: ComponentSpec, *, timeout_seconds: float = 10.0) -> dict[str, Any]:
     with PROCESS_LOCK:
         managed = PROCESS_REGISTRY.get(spec.key)
-        pid = managed.process.pid if managed and managed.process.poll() is None else discover_pid(spec.patterns)
+        adopted = ADOPTED_PROCESS_REGISTRY.get(spec.key)
+        pid = (
+            managed.process.pid
+            if managed and managed.process.poll() is None
+            else adopted.pid
+            if adopted and pid_running(adopted.pid)
+            else discover_pid(spec.patterns)
+        )
         if not pid:
             cleanup_component(spec.key)
             return {
@@ -618,6 +676,8 @@ def stop_component(spec: ComponentSpec, *, timeout_seconds: float = 10.0) -> dic
 
         terminated = terminate_pid(pid, timeout_seconds=timeout_seconds, process=managed.process if managed else None)
         cleanup_component(spec.key)
+        ADOPTED_PROCESS_REGISTRY.pop(spec.key, None)
+        clear_component_status_cache()
         return {
             "name": spec.label,
             "running": not terminated,
@@ -632,7 +692,26 @@ def component_statuses(settings: ServerSettings) -> dict[str, dict[str, Any]]:
     return {key: component_status(spec) for key, spec in component_specs(settings).items()}
 
 
-def component_status(spec: ComponentSpec) -> dict[str, Any]:
+def cached_component_statuses(settings: ServerSettings) -> dict[str, dict[str, Any]]:
+    now = time.time()
+    with PROCESS_LOCK:
+        cached = COMPONENT_STATUS_CACHE.get("components")
+        if cached is not None and float(COMPONENT_STATUS_CACHE.get("expires_at") or 0) > now:
+            return dict(cached)
+    components = component_statuses(settings)
+    with PROCESS_LOCK:
+        COMPONENT_STATUS_CACHE["components"] = dict(components)
+        COMPONENT_STATUS_CACHE["expires_at"] = now + COMPONENT_STATUS_CACHE_SECONDS
+    return components
+
+
+def clear_component_status_cache() -> None:
+    with PROCESS_LOCK:
+        COMPONENT_STATUS_CACHE["components"] = None
+        COMPONENT_STATUS_CACHE["expires_at"] = 0.0
+
+
+def component_status(spec: ComponentSpec, *, discover: bool = False) -> dict[str, Any]:
     with PROCESS_LOCK:
         managed = PROCESS_REGISTRY.get(spec.key)
         if managed and managed.process.poll() is None:
@@ -641,9 +720,22 @@ def component_status(spec: ComponentSpec) -> dict[str, Any]:
             dry_run = managed.dry_run
         else:
             cleanup_component(spec.key)
-            pid = discover_pid(spec.patterns)
-            started_at = 0.0
-            dry_run = spec.dry_run
+            adopted = ADOPTED_PROCESS_REGISTRY.get(spec.key)
+            if adopted and pid_running(adopted.pid):
+                pid = adopted.pid
+                started_at = adopted.started_at
+                dry_run = adopted.dry_run
+            else:
+                ADOPTED_PROCESS_REGISTRY.pop(spec.key, None)
+                pid = discover_pid(spec.patterns) if discover else 0
+                started_at = time.time() if pid else 0.0
+                dry_run = spec.dry_run
+                if pid:
+                    ADOPTED_PROCESS_REGISTRY[spec.key] = AdoptedProcess(
+                        pid=int(pid),
+                        started_at=started_at,
+                        dry_run=spec.dry_run,
+                    )
         running = bool(pid and pid_running(pid))
         return {
             "name": spec.label,
@@ -660,13 +752,15 @@ def component_status(spec: ComponentSpec) -> dict[str, Any]:
 
 def cleanup_component(key: str) -> None:
     managed = PROCESS_REGISTRY.get(key)
-    if not managed:
-        return
-    if managed.process.poll() is None:
-        return
-    with contextlib.suppress(Exception):
-        managed.log_handle.close()
-    PROCESS_REGISTRY.pop(key, None)
+    if managed:
+        if managed.process.poll() is None:
+            return
+        with contextlib.suppress(Exception):
+            managed.log_handle.close()
+        PROCESS_REGISTRY.pop(key, None)
+    adopted = ADOPTED_PROCESS_REGISTRY.get(key)
+    if adopted and not pid_running(adopted.pid):
+        ADOPTED_PROCESS_REGISTRY.pop(key, None)
 
 
 def terminate_pid(pid: int, *, timeout_seconds: float, process: subprocess.Popen[Any] | None = None) -> bool:
@@ -789,6 +883,118 @@ def indexer_metrics(settings: ServerSettings, *, include_process: bool = True) -
     except Exception as exc:  # noqa: BLE001 - API should stay up during SQLite writes.
         snapshot["error"] = str(exc)
         return snapshot
+
+
+def indexer_progress_snapshot(settings: ServerSettings) -> dict[str, Any]:
+    metrics = indexer_metrics(settings, include_process=False)
+    last_block = int(metrics.get("last_block") or 0)
+    speed = indexer_average_speed(last_block)
+    if speed <= 0:
+        speed = float(metrics.get("blocks_per_second") or 0.0)
+    current_block = polygon_current_block(settings)
+    eta_seconds: int | None = None
+    if current_block is not None and last_block > 0 and current_block > last_block and speed > 0:
+        eta_seconds = int((int(current_block) - last_block) / speed)
+    return {
+        "last_block": last_block,
+        "last_block_date": last_block_date(settings.indexer_db, last_block),
+        "current_block_polygon": current_block,
+        "estimated_completion_seconds": eta_seconds,
+        "speed_blocks_per_second": round(float(speed), 4),
+        "updated_at": int(time.time()),
+        "error": metrics.get("error", ""),
+    }
+
+
+def last_block_date(db_path: Path, last_block: int) -> str | None:
+    if last_block <= 0 or not db_path.exists():
+        return None
+    try:
+        with sqlite_connect(db_path) as conn:
+            timestamp: int | None = None
+            if table_exists(conn, "raw_transactions"):
+                row = conn.execute(
+                    """
+                    SELECT MAX(timestamp) AS timestamp
+                    FROM raw_transactions
+                    WHERE block_number = ?
+                    """,
+                    (last_block,),
+                ).fetchone()
+                timestamp = int(row["timestamp"] or 0) if row and row["timestamp"] is not None else None
+            if not timestamp and table_exists(conn, "indexer_blocks"):
+                row = conn.execute(
+                    "SELECT timestamp FROM indexer_blocks WHERE block_number = ? LIMIT 1",
+                    (last_block,),
+                ).fetchone()
+                timestamp = int(row["timestamp"] or 0) if row and row["timestamp"] is not None else None
+            if not timestamp and table_exists(conn, "indexer_blocks"):
+                row = conn.execute(
+                    """
+                    SELECT timestamp
+                    FROM indexer_blocks
+                    WHERE block_number <= ?
+                    ORDER BY block_number DESC
+                    LIMIT 1
+                    """,
+                    (last_block,),
+                ).fetchone()
+                timestamp = int(row["timestamp"] or 0) if row and row["timestamp"] is not None else None
+            if not timestamp and table_exists(conn, "raw_transactions"):
+                row = conn.execute(
+                    """
+                    SELECT timestamp
+                    FROM raw_transactions
+                    WHERE block_number <= ?
+                    ORDER BY block_number DESC
+                    LIMIT 1
+                    """,
+                    (last_block,),
+                ).fetchone()
+                timestamp = int(row["timestamp"] or 0) if row and row["timestamp"] is not None else None
+        if not timestamp:
+            return None
+        return datetime.fromtimestamp(timestamp, timezone.utc).isoformat().replace("+00:00", "Z")
+    except Exception:
+        return None
+
+
+def polygon_current_block(settings: ServerSettings) -> int | None:
+    if Web3 is None or not settings.polygon_rpc_url:
+        return None
+    now = time.time()
+    with INDEXER_PROGRESS_LOCK:
+        cached = POLYGON_BLOCK_CACHE.get("block")
+        if cached is not None and float(POLYGON_BLOCK_CACHE.get("expires_at") or 0) > now:
+            return int(cached)
+    try:
+        provider = Web3.HTTPProvider(settings.polygon_rpc_url, request_kwargs={"timeout": 5})
+        current = int(Web3(provider).eth.block_number)
+    except Exception:
+        return None
+    with INDEXER_PROGRESS_LOCK:
+        POLYGON_BLOCK_CACHE["block"] = current
+        POLYGON_BLOCK_CACHE["expires_at"] = now + 15.0
+    return current
+
+
+def indexer_average_speed(last_block: int) -> float:
+    now = time.time()
+    if last_block <= 0:
+        return 0.0
+    with INDEXER_PROGRESS_LOCK:
+        INDEXER_PROGRESS_SAMPLES.append((now, int(last_block)))
+        cutoff = now - 3600.0
+        while INDEXER_PROGRESS_SAMPLES and (
+            INDEXER_PROGRESS_SAMPLES[0][0] < cutoff or len(INDEXER_PROGRESS_SAMPLES) > 720
+        ):
+            INDEXER_PROGRESS_SAMPLES.pop(0)
+        if len(INDEXER_PROGRESS_SAMPLES) < 2:
+            return 0.0
+        first_time, first_block = INDEXER_PROGRESS_SAMPLES[0]
+        last_time, latest_block = INDEXER_PROGRESS_SAMPLES[-1]
+    elapsed = max(0.001, last_time - first_time)
+    return max(0.0, float(latest_block - first_block) / elapsed)
 
 
 def wallet_metrics(settings: ServerSettings) -> dict[str, Any]:
@@ -962,9 +1168,10 @@ def build_live_payload(settings: ServerSettings) -> dict[str, Any]:
 
 def registry_component_snapshot(settings: ServerSettings) -> dict[str, dict[str, Any]]:
     specs = component_specs(settings)
+    statuses = cached_component_statuses(settings)
     snapshot: dict[str, dict[str, Any]] = {}
     for key, spec in specs.items():
-        status = component_status(spec)
+        status = statuses.get(key) or {}
         snapshot[key] = {
             "running": bool(status.get("running")),
             "pid": int(status.get("pid") or 0),
@@ -1010,26 +1217,44 @@ def top_wallet_rows(conn: sqlite3.Connection, *, include_cohorts: bool) -> list[
         cohort_wallet_expr = cohort_wallet_expression(conn, alias="c")
         cohort_status_expr = cohort_status_expression(conn, alias="c")
         query = f"""
+            WITH top_scored AS (
+                SELECT
+                    {wallet_expr} AS user_address,
+                    {wallet_expr} AS wallet,
+                    s.score,
+                    s.pnl,
+                    s.sharpe,
+                    s.volume,
+                    s.trade_count,
+                    s.win_rate,
+                    s.profit_factor,
+                    s.max_drawdown,
+                    {avg_hold_expr} AS avg_hold_time,
+                    {consistency_expr} AS consistency,
+                    {computed_expr} AS computed_at
+                FROM scored_wallets s
+                ORDER BY s.sharpe DESC, s.pnl DESC, s.volume DESC
+                LIMIT 50
+            )
             SELECT
-                {wallet_expr} AS user_address,
-                {wallet_expr} AS wallet,
-                {cohort_status_expr} AS cohort,
-                {cohort_status_expr} AS status,
-                s.score,
-                s.pnl,
-                s.sharpe,
-                s.volume,
-                s.trade_count,
-                s.win_rate,
-                s.profit_factor,
-                s.max_drawdown,
-                {avg_hold_expr} AS avg_hold_time,
-                {consistency_expr} AS consistency,
-                {computed_expr} AS computed_at
-            FROM scored_wallets s
-            LEFT JOIN wallet_cohorts c ON {cohort_wallet_expr} = {wallet_expr}
-            ORDER BY s.sharpe DESC, s.pnl DESC, s.volume DESC
-            LIMIT 50
+                top_scored.user_address,
+                top_scored.wallet,
+                COALESCE({cohort_status_expr}, '') AS cohort,
+                COALESCE({cohort_status_expr}, '') AS status,
+                top_scored.score,
+                top_scored.pnl,
+                top_scored.sharpe,
+                top_scored.volume,
+                top_scored.trade_count,
+                top_scored.win_rate,
+                top_scored.profit_factor,
+                top_scored.max_drawdown,
+                top_scored.avg_hold_time,
+                top_scored.consistency,
+                top_scored.computed_at
+            FROM top_scored
+            LEFT JOIN wallet_cohorts c ON {cohort_wallet_expr} = top_scored.user_address
+            ORDER BY top_scored.sharpe DESC, top_scored.pnl DESC, top_scored.volume DESC
         """
     else:
         query = f"""
@@ -1277,6 +1502,13 @@ def _env_path(name: str, default: Path) -> Path:
 def _env_int(name: str, default: int) -> int:
     try:
         return int(os.environ.get(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, str(default)))
     except (TypeError, ValueError):
         return default
 

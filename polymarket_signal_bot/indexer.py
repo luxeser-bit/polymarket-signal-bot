@@ -115,14 +115,14 @@ class IndexerConfig:
     sync: bool = False
     dry_run: bool = False
     batch_size: int = 1_000
-    max_workers: int = 2
-    block_chunk_size: int = 100
+    max_workers: int = 4
+    block_chunk_size: int = 250
     min_log_chunk_size: int = 10
     poll_seconds: float = 12.0
     log_every: int = 1_000
     reorg_depth: int = 1_000
     default_start_block: int = 0
-    rpc_rps: float = 5.0
+    rpc_rps: float = 10.0
     verify_contracts: bool = True
     test: bool = False
     dry_run_print_limit: int | None = None
@@ -1521,18 +1521,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--max-workers",
         type=int,
-        default=int(os.getenv("MAX_WORKERS", "2")),
+        default=int(os.getenv("MAX_WORKERS", "4")),
     )
     parser.add_argument(
         "--rpc-rps",
         type=float,
-        default=float(os.getenv("RPC_RPS", "5")),
+        default=float(os.getenv("RPC_RPS", "10")),
         help="Max JSON-RPC request starts per second. Use 0 to disable throttling.",
     )
     parser.add_argument(
         "--chunk-size",
         type=int,
-        default=int(os.getenv("CHUNK_SIZE", os.getenv("BLOCK_CHUNK_SIZE", "100"))),
+        default=int(os.getenv("CHUNK_SIZE", os.getenv("BLOCK_CHUNK_SIZE", "250"))),
     )
     parser.add_argument("--poll-seconds", type=float, default=12.0)
     parser.add_argument(

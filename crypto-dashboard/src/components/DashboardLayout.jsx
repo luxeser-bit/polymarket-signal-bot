@@ -15,6 +15,7 @@ export default function DashboardLayout({
   systemStatus,
   onRefreshSystem,
   metrics,
+  indexerProgress,
   wallets,
   positions,
   paperStatus,
@@ -82,7 +83,7 @@ export default function DashboardLayout({
           <SystemControl status={systemStatus} onRefresh={onRefreshSystem} />
         </section>
         <section className="col-span-12 xl:col-span-4">
-          <IndexerMetrics metrics={metrics} live={live} />
+          <IndexerMetrics metrics={metrics} live={live} progress={indexerProgress} />
         </section>
         <section className="col-span-12 xl:col-span-4">
           <PaperTradingControl status={paperStatus} live={live} onRefresh={onRefreshPaper} />

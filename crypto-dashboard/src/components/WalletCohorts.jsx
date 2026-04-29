@@ -29,9 +29,10 @@ export default function WalletCohorts({ data, training, onRefreshTraining, onRef
   const exitRows = Array.isArray(data?.exit_examples?.examples) ? data.exit_examples.examples : [];
   const modelMetrics = data?.model_metrics || {};
   const scoredWallets = Number(data?.scored_wallets || 0);
-  const walletProgress = Math.min(1, scoredWallets / TARGET_WALLETS);
+  const smartFlowWallets = Number(counts.STABLE || 0) + Number(counts.CANDIDATE || 0);
+  const walletProgress = Math.min(1, smartFlowWallets / TARGET_WALLETS);
   const walletProgressPct = walletProgress * 100;
-  const walletsRemaining = Math.max(0, TARGET_WALLETS - scoredWallets);
+  const walletsRemaining = Math.max(0, TARGET_WALLETS - smartFlowWallets);
 
   async function trainModel() {
     setLoading(true);
@@ -47,8 +48,8 @@ export default function WalletCohorts({ data, training, onRefreshTraining, onRef
         });
         toast.success(sampleMode ? 'Sample training started' : 'Model training started');
       }
-      await onRefreshTraining?.();
-      await onRefreshWallets?.();
+      onRefreshTraining?.().catch(() => {});
+      onRefreshWallets?.().catch(() => {});
     } catch (err) {
       toast.error(`Training failed: ${err.message || err}`);
     } finally {
@@ -83,7 +84,7 @@ export default function WalletCohorts({ data, training, onRefreshTraining, onRef
         <div className="mb-2 flex items-center justify-between gap-3 text-xs uppercase">
           <span className="font-semibold text-cyanLive">Wallet target // market movement map</span>
           <span className="text-slate-400">
-            {numberFull(scoredWallets)} / {numberFull(TARGET_WALLETS)}
+            {numberFull(smartFlowWallets)} / {numberFull(TARGET_WALLETS)}
           </span>
         </div>
         <div className="h-2 overflow-hidden bg-slate-950">
@@ -95,7 +96,7 @@ export default function WalletCohorts({ data, training, onRefreshTraining, onRef
         <div className="mt-2 grid gap-2 text-[10px] font-semibold uppercase tracking-wide text-slate-500 sm:grid-cols-3">
           <span>Coverage {walletProgressPct.toFixed(2)}%</span>
           <span>Remaining {numberFull(walletsRemaining)}</span>
-          <span>Target smart-flow wallets</span>
+          <span>Stable + candidate wallets</span>
         </div>
       </div>
 

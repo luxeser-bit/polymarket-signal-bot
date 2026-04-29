@@ -11,6 +11,7 @@ export default function App() {
   const [live, setLive] = useState(null);
   const [systemStatus, setSystemStatus] = useState(null);
   const [metrics, setMetrics] = useState(null);
+  const [indexerProgress, setIndexerProgress] = useState(null);
   const [wallets, setWallets] = useState(null);
   const [positions, setPositions] = useState(null);
   const [paperStatus, setPaperStatus] = useState(null);
@@ -99,16 +100,30 @@ export default function App() {
     }
   }, [rememberError]);
 
+  const refreshIndexerProgress = useCallback(async () => {
+    try {
+      const payload = await getJson('/api/indexer/progress');
+      setIndexerProgress(payload);
+      return payload;
+    } catch (err) {
+      const message = `Indexer progress unavailable: ${err.message || err}`;
+      rememberError(message);
+      throw err;
+    }
+  }, [rememberError]);
+
   useEffect(() => {
     refreshSystem().catch(() => {});
     refreshPaper().catch(() => {});
     refreshTraining().catch(() => {});
+    refreshIndexerProgress().catch(() => {});
     refreshData().catch(() => {});
-  }, [refreshData, refreshPaper, refreshSystem, refreshTraining]);
+  }, [refreshData, refreshIndexerProgress, refreshPaper, refreshSystem, refreshTraining]);
 
   useInterval(() => refreshSystem().catch(() => {}), 4000);
   useInterval(() => refreshPaper().catch(() => {}), 3000);
   useInterval(() => refreshTraining().catch(() => {}), 3000);
+  useInterval(() => refreshIndexerProgress().catch(() => {}), 5000);
   useInterval(() => refreshData().catch(() => {}), 3000);
 
   useEffect(() => {
@@ -125,13 +140,31 @@ export default function App() {
     };
   }, [live, metrics]);
 
+  const mergedSystemStatus = useMemo(() => {
+    if (!live?.components) return systemStatus;
+    const baseComponents = systemStatus?.components || {};
+    const components = { ...baseComponents };
+    Object.entries(live.components).forEach(([key, value]) => {
+      components[key] = {
+        ...(baseComponents[key] || {}),
+        ...value,
+        status: value?.running ? 'running' : 'stopped',
+      };
+    });
+    return {
+      ...(systemStatus || {}),
+      components,
+    };
+  }, [live?.components, systemStatus]);
+
   return (
     <DashboardLayout
       live={live}
       socket={socket}
-      systemStatus={systemStatus}
+      systemStatus={mergedSystemStatus}
       onRefreshSystem={refreshSystem}
       metrics={mergedMetrics}
+      indexerProgress={indexerProgress}
       wallets={wallets}
       positions={positions}
       paperStatus={paperStatus}
