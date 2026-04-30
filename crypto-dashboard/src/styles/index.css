@@ -86,6 +86,16 @@ body {
   transition: width 0.25s ease;
 }
 
+.trade-tape-row {
+  transition:
+    background-color 0.16s ease,
+    color 0.16s ease;
+}
+
+.trade-tape-row:hover {
+  background: rgba(53, 230, 242, 0.08) !important;
+}
+
 [class*="bg-slate-950"],
 [class*="bg-slate-900"],
 [class*="bg-slate-800"],

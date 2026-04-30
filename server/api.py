@@ -111,9 +111,9 @@ class ServerSettings:
     monitor_interval_seconds: int = 60
     paper_poll_interval_seconds: int = 60
     paper_price_interval_seconds: int = 15
-    indexer_chunk_size: int = 150
-    indexer_max_workers: int = 8
-    indexer_rpc_rps: float = 45.0
+    indexer_chunk_size: int = 100
+    indexer_max_workers: int = 5
+    indexer_rpc_rps: float = 25.0
     indexer_skip_contract_check: bool = True
     indexer_watchdog_enabled: bool = True
     indexer_stall_seconds: int = 300
@@ -354,9 +354,9 @@ def settings_from_env() -> ServerSettings:
         monitor_interval_seconds=_env_int("MONITOR_INTERVAL_SECONDS", monitor_defaults.interval_seconds),
         paper_poll_interval_seconds=_env_int("POLYSIGNAL_POLL_INTERVAL", 60),
         paper_price_interval_seconds=_env_int("POLYSIGNAL_PRICE_INTERVAL", 15),
-        indexer_chunk_size=_env_int("INDEXER_CHUNK_SIZE", _env_int("CHUNK_SIZE", 150)),
-        indexer_max_workers=_env_int("INDEXER_MAX_WORKERS", _env_int("MAX_WORKERS", 8)),
-        indexer_rpc_rps=_env_float("INDEXER_RPC_RPS", _env_float("RPC_RPS", 45.0)),
+        indexer_chunk_size=_env_int("INDEXER_CHUNK_SIZE", _env_int("CHUNK_SIZE", 100)),
+        indexer_max_workers=_env_int("INDEXER_MAX_WORKERS", _env_int("MAX_WORKERS", 5)),
+        indexer_rpc_rps=_env_float("INDEXER_RPC_RPS", _env_float("RPC_RPS", 25.0)),
         indexer_skip_contract_check=_env_bool("INDEXER_SKIP_CONTRACT_CHECK", True),
         indexer_watchdog_enabled=_env_bool("INDEXER_WATCHDOG_ENABLED", True),
         indexer_stall_seconds=_env_int("INDEXER_STALL_SECONDS", 300),
@@ -680,6 +680,18 @@ def start_component(spec: ComponentSpec) -> dict[str, Any]:
             log_handle=log_handle,
             dry_run=spec.dry_run,
         )
+        if spec.key == "indexer":
+            with INDEXER_WATCHDOG_LOCK:
+                INDEXER_WATCHDOG_STATE.update(
+                    {
+                        "pid": int(process.pid),
+                        "raw_events": -1,
+                        "last_block": -1,
+                        "last_progress_at": time.time(),
+                        "last_check_at": time.time(),
+                        "last_action": "started",
+                    }
+                )
         clear_component_status_cache()
         return {
             "name": spec.label,
@@ -693,13 +705,18 @@ def start_component(spec: ComponentSpec) -> dict[str, Any]:
 
 
 def restart_component(spec: ComponentSpec, *, timeout_seconds: float = 10.0) -> dict[str, Any]:
-    stopped = stop_component(spec, timeout_seconds=timeout_seconds)
+    stopped = stop_component(spec, timeout_seconds=timeout_seconds, manual=False)
     time.sleep(1.0)
     started = start_component(spec)
     return {"stopped": stopped, "started": started}
 
 
-def stop_component(spec: ComponentSpec, *, timeout_seconds: float = 10.0) -> dict[str, Any]:
+def stop_component(
+    spec: ComponentSpec,
+    *,
+    timeout_seconds: float = 10.0,
+    manual: bool = True,
+) -> dict[str, Any]:
     with PROCESS_LOCK:
         managed = PROCESS_REGISTRY.get(spec.key)
         adopted = ADOPTED_PROCESS_REGISTRY.get(spec.key)
@@ -712,6 +729,8 @@ def stop_component(spec: ComponentSpec, *, timeout_seconds: float = 10.0) -> dic
         )
         if not pid:
             cleanup_component(spec.key)
+            if manual and spec.key == "indexer":
+                reset_indexer_watchdog("manual_stop")
             return {
                 "name": spec.label,
                 "running": False,
@@ -724,6 +743,8 @@ def stop_component(spec: ComponentSpec, *, timeout_seconds: float = 10.0) -> dic
         terminated = terminate_pid(pid, timeout_seconds=timeout_seconds, process=managed.process if managed else None)
         cleanup_component(spec.key)
         ADOPTED_PROCESS_REGISTRY.pop(spec.key, None)
+        if manual and spec.key == "indexer":
+            reset_indexer_watchdog("manual_stop")
         clear_component_status_cache()
         return {
             "name": spec.label,
@@ -759,6 +780,20 @@ def clear_component_status_cache() -> None:
     with PROCESS_LOCK:
         COMPONENT_STATUS_CACHE["components"] = None
         COMPONENT_STATUS_CACHE["expires_at"] = 0.0
+
+
+def reset_indexer_watchdog(reason: str) -> None:
+    with INDEXER_WATCHDOG_LOCK:
+        INDEXER_WATCHDOG_STATE.update(
+            {
+                "pid": 0,
+                "raw_events": -1,
+                "last_block": -1,
+                "last_progress_at": 0.0,
+                "last_check_at": time.time(),
+                "last_action": reason,
+            }
+        )
 
 
 def component_status(spec: ComponentSpec, *, discover: bool = False) -> dict[str, Any]:
@@ -811,12 +846,58 @@ def indexer_watchdog_status(
     if not settings.indexer_watchdog_enabled:
         return status
 
-    if not status.get("running"):
-        status.update({"health": "stopped", "stalled": False, "stalled_seconds": 0})
-        return status
-
     now = time.time()
     pid = int(status.get("pid") or 0)
+    if not status.get("running"):
+        should_restart = False
+        restart_count = 0
+        last_restart_at = 0.0
+        with INDEXER_WATCHDOG_LOCK:
+            state_pid = int(INDEXER_WATCHDOG_STATE.get("pid") or 0)
+            last_action = str(INDEXER_WATCHDOG_STATE.get("last_action") or "")
+            restart_count = int(INDEXER_WATCHDOG_STATE.get("restart_count") or 0)
+            last_restart_at = float(INDEXER_WATCHDOG_STATE.get("last_restart_at") or 0.0)
+            cooldown_ready = now - last_restart_at >= max(1, settings.indexer_restart_cooldown_seconds)
+            should_restart = state_pid > 0 and last_action != "manual_stop" and cooldown_ready
+            INDEXER_WATCHDOG_STATE["last_check_at"] = now
+            if should_restart:
+                INDEXER_WATCHDOG_STATE["last_restart_at"] = now
+                INDEXER_WATCHDOG_STATE["restart_count"] = restart_count + 1
+                INDEXER_WATCHDOG_STATE["last_action"] = "restart_missing_requested"
+
+        if not should_restart:
+            status.update({"health": "stopped", "stalled": False, "stalled_seconds": 0})
+            return status
+
+        restart_result = restart_component(spec, timeout_seconds=10.0)
+        restarted_status = component_status(spec, discover=True)
+        with INDEXER_WATCHDOG_LOCK:
+            INDEXER_WATCHDOG_STATE.update(
+                {
+                    "pid": int(restarted_status.get("pid") or 0),
+                    "raw_events": -1,
+                    "last_block": -1,
+                    "last_progress_at": time.time(),
+                    "last_check_at": time.time(),
+                    "last_action": "restarted_missing",
+                }
+            )
+        clear_component_status_cache()
+        restarted_status.update(
+            {
+                "health": "restarted" if restarted_status.get("running") else "stopped",
+                "stalled": False,
+                "stalled_seconds": 0,
+                "last_progress_at": int(time.time()),
+                "watchdog_enabled": True,
+                "watchdog_action": "restarted_missing",
+                "watchdog_restart_count": restart_count + 1,
+                "watchdog_last_restart_at": int(time.time()),
+                "restart": restart_result,
+            }
+        )
+        return restarted_status
+
     counters = indexer_counter_snapshot(settings.indexer_db)
     raw_events = int(counters.get("raw_events") or 0)
     last_block = int(counters.get("last_block") or 0)
@@ -1279,6 +1360,8 @@ def latest_training_summary(db_path: Path) -> dict[str, Any] | None:
 
 
 def positions_snapshot(settings: ServerSettings) -> dict[str, Any]:
+    max_hold_hours = _env_int("POLYSIGNAL_PAPER_MAX_HOLD_HOURS", 36)
+    stale_price_hours = _env_int("POLYSIGNAL_PAPER_STALE_PRICE_HOURS", 48)
     result = {
         "balance": 0.0,
         "pnl": 0.0,
@@ -1287,43 +1370,251 @@ def positions_snapshot(settings: ServerSettings) -> dict[str, Any]:
         "open_positions": [],
         "total_positions": 0,
         "db_path": str(settings.paper_state_db),
+        "source": "paper_state",
         "error": "",
     }
-    if not settings.paper_state_db.exists():
-        result["error"] = "paper state db not found"
-        return result
     try:
-        with sqlite_connect(settings.paper_state_db) as conn:
-            if table_exists(conn, "balance_history"):
-                latest = conn.execute(
-                    "SELECT timestamp, balance, pnl FROM balance_history ORDER BY timestamp DESC LIMIT 1"
-                ).fetchone()
-                if latest:
-                    result["balance"] = float(latest["balance"] or 0)
-                    result["pnl"] = float(latest["pnl"] or 0)
-                since = int(time.time()) - 86400
-                daily = conn.execute(
-                    "SELECT COALESCE(MAX(pnl) - MIN(pnl), 0) AS daily_pnl FROM balance_history WHERE timestamp >= ?",
-                    (since,),
-                ).fetchone()
-                result["daily_pnl"] = float(daily["daily_pnl"] or 0) if daily else 0.0
-            if table_exists(conn, "positions"):
-                rows = conn.execute(
-                    """
-                    SELECT *
-                    FROM positions
-                    WHERE UPPER(status) = 'OPEN'
-                    ORDER BY opened_at DESC
-                    LIMIT 100
-                    """
-                ).fetchall()
-                result["open_positions"] = [dict(row) for row in rows]
-                result["open_positions_count"] = len(rows)
-                result["total_positions"] = int(conn.execute("SELECT COUNT(*) FROM positions").fetchone()[0] or 0)
+        if settings.paper_state_db.exists():
+            with sqlite_connect(settings.paper_state_db) as conn:
+                if table_exists(conn, "balance_history"):
+                    latest = conn.execute(
+                        "SELECT timestamp, balance, pnl FROM balance_history ORDER BY timestamp DESC LIMIT 1"
+                    ).fetchone()
+                    if latest:
+                        result["balance"] = float(latest["balance"] or 0)
+                        result["pnl"] = float(latest["pnl"] or 0)
+                    since = int(time.time()) - 86400
+                    daily = conn.execute(
+                        "SELECT COALESCE(MAX(pnl) - MIN(pnl), 0) AS daily_pnl FROM balance_history WHERE timestamp >= ?",
+                        (since,),
+                    ).fetchone()
+                    result["daily_pnl"] = float(daily["daily_pnl"] or 0) if daily else 0.0
+
+        if settings.main_db.parent.resolve() == settings.paper_state_db.parent.resolve():
+            main_positions = main_open_positions_snapshot(
+                settings.main_db,
+                max_hold_hours=max_hold_hours,
+                stale_price_hours=stale_price_hours,
+            )
+            if main_positions:
+                result["open_positions"] = main_positions["rows"]
+                result["open_positions_count"] = len(main_positions["rows"])
+                result["total_positions"] = main_positions["total"]
+                result["source"] = "paper_positions"
+                result["db_path"] = str(settings.main_db)
+                return result
+
+        if settings.paper_state_db.exists():
+            with sqlite_connect(settings.paper_state_db) as conn:
+                if table_exists(conn, "positions"):
+                    rows = conn.execute(
+                        """
+                        SELECT *
+                        FROM positions
+                        WHERE UPPER(status) = 'OPEN'
+                        ORDER BY opened_at DESC
+                        LIMIT 100
+                        """
+                    ).fetchall()
+                    result["open_positions"] = [
+                        normalize_state_position_row(
+                            row,
+                            max_hold_hours=max_hold_hours,
+                            stale_price_hours=stale_price_hours,
+                        )
+                        for row in rows
+                    ]
+                    result["open_positions_count"] = len(rows)
+                    result["total_positions"] = int(conn.execute("SELECT COUNT(*) FROM positions").fetchone()[0] or 0)
+        else:
+            result["error"] = "paper state db not found"
         return result
     except Exception as exc:  # noqa: BLE001
         result["error"] = str(exc)
         return result
+
+
+def main_open_positions_snapshot(
+    db_path: Path,
+    *,
+    max_hold_hours: int,
+    stale_price_hours: int,
+) -> dict[str, Any] | None:
+    if not db_path.exists():
+        return None
+    now = int(time.time())
+    with sqlite_connect(db_path) as conn:
+        if not table_exists(conn, "paper_positions"):
+            return None
+        rows = conn.execute(
+            """
+            SELECT
+                p.position_id AS id,
+                p.position_id,
+                p.signal_id,
+                p.opened_at,
+                p.wallet,
+                p.condition_id AS market_id,
+                p.condition_id,
+                p.asset,
+                p.outcome,
+                p.title AS market,
+                p.title,
+                p.entry_price,
+                p.size_usdc AS size,
+                p.size_usdc,
+                p.shares,
+                p.stop_loss,
+                p.take_profit,
+                p.status,
+                p.closed_at,
+                p.realized_pnl,
+                ob.best_bid,
+                ob.mid,
+                ob.last_trade_price AS book_last_trade_price,
+                ob.timestamp AS book_timestamp,
+                (
+                    SELECT t.price
+                    FROM trades t
+                    WHERE t.asset = p.asset
+                    ORDER BY t.timestamp DESC
+                    LIMIT 1
+                ) AS trade_price,
+                (
+                    SELECT t.timestamp
+                    FROM trades t
+                    WHERE t.asset = p.asset
+                    ORDER BY t.timestamp DESC
+                    LIMIT 1
+                ) AS trade_timestamp
+            FROM paper_positions p
+            LEFT JOIN order_books_latest ob ON ob.asset = p.asset
+            WHERE UPPER(p.status) = 'OPEN'
+            ORDER BY p.opened_at DESC
+            LIMIT 100
+            """
+        ).fetchall()
+        total = int(conn.execute("SELECT COUNT(*) FROM paper_positions").fetchone()[0] or 0)
+    return {
+        "rows": [
+            normalize_main_position_row(
+                row,
+                now=now,
+                max_hold_hours=max_hold_hours,
+                stale_price_hours=stale_price_hours,
+            )
+            for row in rows
+        ],
+        "total": total,
+    }
+
+
+def normalize_main_position_row(
+    row: sqlite3.Row,
+    *,
+    now: int,
+    max_hold_hours: int,
+    stale_price_hours: int,
+) -> dict[str, Any]:
+    entry = float(row["entry_price"] or 0.0)
+    current, price_ts, price_source = position_mark_from_row(row, entry)
+    size = float(row["size_usdc"] or row["size"] or 0.0)
+    shares = float(row["shares"] or (size / entry if entry > 0 else 0.0))
+    pnl = shares * current - size
+    opened_at = int(row["opened_at"] or 0)
+    open_seconds = max(0, now - opened_at)
+    price_age = max(0, now - int(price_ts or opened_at or now))
+    stop_loss = float(row["stop_loss"] or 0.0)
+    take_profit = float(row["take_profit"] or 0.0)
+    return {
+        "id": str(row["id"] or row["position_id"] or ""),
+        "position_id": str(row["position_id"] or row["id"] or ""),
+        "signal_id": str(row["signal_id"] or ""),
+        "market_id": str(row["market_id"] or row["condition_id"] or ""),
+        "condition_id": str(row["condition_id"] or row["market_id"] or ""),
+        "asset": str(row["asset"] or ""),
+        "market": str(row["market"] or row["title"] or row["condition_id"] or ""),
+        "title": str(row["title"] or row["market"] or ""),
+        "outcome": str(row["outcome"] or ""),
+        "wallet": str(row["wallet"] or ""),
+        "side": "BUY",
+        "size": round(size, 4),
+        "size_usdc": round(size, 4),
+        "entry_price": round(entry, 6),
+        "current_price": round(current, 6),
+        "stop_loss": round(stop_loss, 6),
+        "take_profit": round(take_profit, 6),
+        "tp_pct": round((take_profit - entry) / entry, 6) if entry > 0 else 0.0,
+        "sl_pct": round((entry - stop_loss) / entry, 6) if entry > 0 else 0.0,
+        "status": str(row["status"] or "OPEN"),
+        "opened_at": opened_at,
+        "closed_at": row["closed_at"],
+        "pnl": round(pnl, 4),
+        "open_seconds": open_seconds,
+        "price_age_seconds": price_age,
+        "price_source": price_source,
+        "hold_status": position_hold_status(
+            open_seconds=open_seconds,
+            price_age_seconds=price_age,
+            max_hold_hours=max_hold_hours,
+            stale_price_hours=stale_price_hours,
+        ),
+    }
+
+
+def normalize_state_position_row(
+    row: sqlite3.Row,
+    *,
+    max_hold_hours: int,
+    stale_price_hours: int,
+) -> dict[str, Any]:
+    now = int(time.time())
+    entry = float(row["entry_price"] or 0.0)
+    opened_at = int(row["opened_at"] or 0)
+    open_seconds = max(0, now - opened_at)
+    data = dict(row)
+    data.update(
+        {
+            "current_price": entry,
+            "open_seconds": open_seconds,
+            "price_age_seconds": open_seconds,
+            "price_source": "state",
+            "hold_status": position_hold_status(
+                open_seconds=open_seconds,
+                price_age_seconds=open_seconds,
+                max_hold_hours=max_hold_hours,
+                stale_price_hours=stale_price_hours,
+            ),
+        }
+    )
+    return data
+
+
+def position_mark_from_row(row: sqlite3.Row, entry: float) -> tuple[float, int, str]:
+    candidates = (
+        ("bid", row["best_bid"], row["book_timestamp"]),
+        ("mid", row["mid"], row["book_timestamp"]),
+        ("book_trade", row["book_last_trade_price"], row["book_timestamp"]),
+        ("trade", row["trade_price"], row["trade_timestamp"]),
+    )
+    for source, price, timestamp in candidates:
+        if price is not None and float(price or 0.0) > 0:
+            return float(price), int(timestamp or 0), source
+    return entry, 0, "entry"
+
+
+def position_hold_status(
+    *,
+    open_seconds: int,
+    price_age_seconds: int,
+    max_hold_hours: int,
+    stale_price_hours: int,
+) -> str:
+    if open_seconds >= max(1, max_hold_hours) * 3600:
+        return "MAX HOLD"
+    if price_age_seconds >= max(1, stale_price_hours) * 3600:
+        return "STALE PRICE"
+    return "LIVE"
 
 
 def equity_snapshot(
@@ -1394,7 +1685,7 @@ def equity_snapshot(
 
 
 def normalize_timeframe_seconds(value: int) -> int:
-    allowed = (5 * 60, 30 * 60, 60 * 60, 12 * 3600, 24 * 3600, 48 * 3600)
+    allowed = (5 * 60, 30 * 60, 60 * 60, 12 * 3600, 24 * 3600, 48 * 3600, 7 * 24 * 3600)
     requested = int(value or allowed[0])
     return min(allowed, key=lambda item: abs(item - requested))
 

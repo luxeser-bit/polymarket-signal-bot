@@ -22,6 +22,7 @@ const TIMEFRAMES = [
   [12 * 3600, '12h'],
   [24 * 3600, '24h'],
   [48 * 3600, '48h'],
+  [7 * 24 * 3600, '7d'],
 ];
 
 export default function EquityChart({ history, live }) {

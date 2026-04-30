@@ -114,20 +114,20 @@ class IndexerConfig:
     sync: bool = False
     dry_run: bool = False
     batch_size: int = 1_000
-    max_workers: int = 4
-    block_chunk_size: int = 250
+    max_workers: int = 5
+    block_chunk_size: int = 100
     min_log_chunk_size: int = 10
     poll_seconds: float = 12.0
     log_every: int = 1_000
     reorg_depth: int = 1_000
     default_start_block: int = 0
-    rpc_rps: float = 10.0
+    rpc_rps: float = 25.0
     verify_contracts: bool = True
     test: bool = False
     dry_run_print_limit: int | None = None
     sample_log_limit: int = 5
-    request_timeout: float = 30.0
-    max_retries: int = 5
+    request_timeout: float = 45.0
+    max_retries: int = 6
 
 
 @dataclass(frozen=True)
@@ -569,19 +569,58 @@ class PolygonEventIndexer:
         next_start_to_store = start_block
         completed: dict[int, tuple[int, int, list[RawTransaction], list[BlockInfo]]] = {}
         pending: set[asyncio.Task[tuple[int, int, list[RawTransaction], list[BlockInfo]]]] = set()
+        task_ranges: dict[
+            asyncio.Task[tuple[int, int, list[RawTransaction], list[BlockInfo]]],
+            tuple[int, int],
+        ] = {}
+        chunk_failures: dict[tuple[int, int], int] = {}
 
         def schedule(
             block_range: tuple[int, int],
-        ) -> asyncio.Task[tuple[int, int, list[RawTransaction], list[BlockInfo]]]:
-            return asyncio.create_task(self._index_chunk(rpc, block_range[0], block_range[1]))
+        ) -> None:
+            task = asyncio.create_task(self._index_chunk(rpc, block_range[0], block_range[1]))
+            pending.add(task)
+            task_ranges[task] = block_range
 
-        def record_done(
+        async def record_done(
             done_tasks: Iterable[
                 asyncio.Task[tuple[int, int, list[RawTransaction], list[BlockInfo]]]
             ],
         ) -> None:
             for task in done_tasks:
-                result = task.result()
+                block_range = task_ranges.pop(task, None)
+                try:
+                    result = task.result()
+                except Exception as exc:
+                    if block_range is None:
+                        raise
+                    chunk_start, chunk_end = block_range
+                    chunk_failures[block_range] = chunk_failures.get(block_range, 0) + 1
+                    if chunk_start < chunk_end:
+                        mid = (chunk_start + chunk_end) // 2
+                        LOGGER.warning(
+                            "Chunk %s..%s failed (%s); splitting to %s..%s and %s..%s",
+                            chunk_start,
+                            chunk_end,
+                            exc,
+                            chunk_start,
+                            mid,
+                            mid + 1,
+                            chunk_end,
+                        )
+                        schedule((chunk_start, mid))
+                        schedule((mid + 1, chunk_end))
+                    else:
+                        delay = min(60.0, 2.0 ** min(chunk_failures[block_range], 6))
+                        LOGGER.warning(
+                            "Block %s failed (%s); retrying in %.1fs",
+                            chunk_start,
+                            exc,
+                            delay,
+                        )
+                        await asyncio.sleep(delay)
+                        schedule(block_range)
+                    continue
                 completed[result[0]] = result
 
         def flush_ready() -> int:
@@ -597,13 +636,13 @@ class PolygonEventIndexer:
         for block_range in chunk_ranges(start_block, end_block, self.config.block_chunk_size):
             while len(pending) >= self.config.max_workers:
                 done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
-                record_done(done)
+                await record_done(done)
                 total_events += flush_ready()
-            pending.add(schedule(block_range))
+            schedule(block_range)
 
         while pending:
             done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
-            record_done(done)
+            await record_done(done)
             total_events += flush_ready()
             max_done_block = self.store.last_block() or start_block
             if max_done_block - last_logged >= self.config.log_every:
@@ -1516,18 +1555,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--max-workers",
         type=int,
-        default=int(os.getenv("MAX_WORKERS", "8")),
+        default=int(os.getenv("MAX_WORKERS", "5")),
     )
     parser.add_argument(
         "--rpc-rps",
         type=float,
-        default=float(os.getenv("RPC_RPS", "45")),
+        default=float(os.getenv("RPC_RPS", "25")),
         help="Max JSON-RPC request starts per second. Use 0 to disable throttling.",
     )
     parser.add_argument(
         "--chunk-size",
         type=int,
-        default=int(os.getenv("CHUNK_SIZE", os.getenv("BLOCK_CHUNK_SIZE", "150"))),
+        default=int(os.getenv("CHUNK_SIZE", os.getenv("BLOCK_CHUNK_SIZE", "100"))),
     )
     parser.add_argument("--poll-seconds", type=float, default=12.0)
     parser.add_argument(

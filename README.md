@@ -320,14 +320,14 @@ dashboard and analytics can read while ingestion writes.
 ```powershell
 python -m pip install ".[indexer]"
 $env:POLYGON_RPC_URL="https://polygon-mainnet.g.alchemy.com/v2/YOUR_KEY"
-$env:RPC_RPS="45"
-$env:CHUNK_SIZE="150"
-$env:MAX_WORKERS="8"
+$env:RPC_RPS="25"
+$env:CHUNK_SIZE="100"
+$env:MAX_WORKERS="5"
 $env:INDEXER_DB_PATH="data/indexer.db"
 
 python -m src.indexer --start-block 50000000 --end-block 50001000 --dry-run
 python -m src.indexer --start-block 50000000 --test
-python -m src.indexer --sync --batch-size 2000 --max-workers 8
+python -m src.indexer --sync --batch-size 2000 --max-workers 5
 ```
 
 Without explicit blocks, the indexer continues from the last saved block to the
@@ -335,11 +335,12 @@ current Polygon head. `--dry-run` prints decoded events and does not write to th
 database. The CLOB source uses the current CTF Exchange V2 deployed addresses
 from Polymarket contracts documentation: `0xE111180000d2663C0091e4f400237545B87B996B`
 and `0xe2222d279d744050d28e00520010520000310F59`. The default indexer settings
-are tuned for a paid Alchemy plan with enough headroom for stability:
-`--chunk-size 150`, `--max-workers 8`, `--rpc-rps 45`, explicit event topic
-filters on every `eth_getLogs` call, and automatic chunk splitting down to 5
-blocks when a provider rejects a large log range. Lower `RPC_RPS` or
-`MAX_WORKERS` for free or heavily shared RPC nodes.
+are tuned for a paid Alchemy plan with stability prioritized over peak burst
+speed: `--chunk-size 100`, `--max-workers 5`, `--rpc-rps 25`, explicit event
+topic filters on every `eth_getLogs` call, and automatic chunk splitting down
+to 5 blocks when a provider rejects a large log range. Increase `RPC_RPS` or
+`MAX_WORKERS` only after the dashboard shows stable progress without RPC
+timeouts.
 
 The export creates aggregate views for wallet flow, market flow, category flow,
 daily flow, wallet cohort stability, latest liquidity, wallet outcomes, and

@@ -829,6 +829,8 @@ class LivePaperRunner:
                 reason = "stop_loss"
             elif price >= position.take_profit:
                 reason = "take_profit"
+            elif now - position.opened_at >= self.config.paper_max_hold_hours * 3600:
+                reason = "max_hold"
             if not reason:
                 continue
             closed.append(self._close_position(store, position, price, reason, now))
@@ -1227,6 +1229,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--min-depth-usdc", type=float, default=25.0)
     parser.add_argument("--stop-loss-pct", type=float, default=0.28)
     parser.add_argument("--take-profit-pct", type=float, default=0.40)
+    parser.add_argument(
+        "--paper-max-hold-hours",
+        type=int,
+        default=int(os.environ.get("POLYSIGNAL_PAPER_MAX_HOLD_HOURS", "36")),
+    )
+    parser.add_argument(
+        "--paper-stale-price-hours",
+        type=int,
+        default=int(os.environ.get("POLYSIGNAL_PAPER_STALE_PRICE_HOURS", "48")),
+    )
     parser.add_argument("--no-cohort-policy", action="store_true")
     parser.add_argument("--no-learning-policy", action="store_true")
     return parser
@@ -1271,6 +1283,8 @@ def config_from_args(args: argparse.Namespace) -> LivePaperConfig:
         min_depth_usdc=args.min_depth_usdc,
         stop_loss_pct=args.stop_loss_pct,
         take_profit_pct=args.take_profit_pct,
+        paper_max_hold_hours=max(1, int(args.paper_max_hold_hours)),
+        paper_stale_price_hours=max(1, int(args.paper_stale_price_hours)),
         use_cohort_policy=not args.no_cohort_policy,
         use_learning_policy=not args.no_learning_policy,
     )
