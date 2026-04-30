@@ -19,6 +19,7 @@ _MODULES = [
     "bulk_sync",
     "cli",
     "cohorts",
+    "consensus_engine",
     "dashboard",
     "demo",
     "features",

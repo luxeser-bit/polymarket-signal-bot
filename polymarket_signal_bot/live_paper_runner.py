@@ -58,6 +58,13 @@ from pathlib import Path
 from typing import Any, Iterator
 
 from .api import ApiError, PolymarketClient
+from .consensus_engine import (
+    ConsensusConfig,
+    consensus_filter_signals,
+    consensus_runtime_summary,
+    generate_strategy_signals,
+    persist_consensus_decisions,
+)
 from .cohorts import CohortConfig, wallet_cohort_report
 from .learning import wallet_outcome_lookup, wallet_outcome_report
 from .models import PaperEvent, PaperPosition, Signal, Wallet
@@ -65,7 +72,7 @@ from .monitor import Monitor, MonitorConfig
 from .paper import ExitConfig, PaperBroker, RiskConfig
 from .policy_optimizer import policy_settings_from_recommendation
 from .scoring import score_wallets
-from .signals import SignalConfig, generate_signals
+from .signals import SignalConfig
 from .storage import DEFAULT_DB_PATH, Store
 from .streaming import (
     MARKET_WS_URL,
@@ -684,6 +691,7 @@ class LivePaperRunner:
             limit=2500,
         )
         order_books = store.fetch_order_books([trade.asset for trade in recent_trades])
+        score_map = store.fetch_scores(min_score=self.config.min_wallet_score)
         policy_enabled, policy_mode = self._active_signal_policy(store)
         wallet_cohorts: dict[str, dict[str, object]] = {}
         if policy_enabled and self.config.use_cohort_policy:
@@ -713,9 +721,9 @@ class LivePaperRunner:
             "signal_policy_active",
             f"enabled={int(policy_enabled)} mode={policy_mode} learning={int(self.config.use_learning_policy)}",
         )
-        return generate_signals(
+        signals = generate_strategy_signals(
             recent_trades,
-            store.fetch_scores(min_score=self.config.min_wallet_score),
+            score_map,
             SignalConfig(
                 bankroll=self.config.bankroll,
                 min_wallet_score=self.config.min_wallet_score,
@@ -739,6 +747,22 @@ class LivePaperRunner:
             wallet_cohorts=wallet_cohorts,
             wallet_outcomes=wallet_outcomes,
         )
+        signals, consensus_decisions = consensus_filter_signals(
+            signals,
+            recent_trades=recent_trades,
+            scores=score_map,
+            order_books=order_books,
+            config=ConsensusConfig(
+                min_strategy_confidence=self.config.min_wallet_score,
+                max_spread=self.config.max_spread,
+                min_liquidity_score=self.config.min_liquidity_score,
+                min_depth_usdc=self.config.min_depth_usdc,
+                max_wallet_trades_per_day=self.config.max_wallet_trades_per_day,
+            ),
+        )
+        persist_consensus_decisions(store.conn, consensus_decisions)
+        store.set_runtime_state("consensus_last_summary", consensus_runtime_summary(consensus_decisions))
+        return signals
 
     async def _handle_signals(self, signals: list[Signal]) -> None:
         for signal_item in signals:

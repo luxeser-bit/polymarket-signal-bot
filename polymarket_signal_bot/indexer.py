@@ -17,7 +17,6 @@ import argparse
 import asyncio
 import json
 import logging
-import math
 import os
 import sqlite3
 import time
@@ -340,24 +339,20 @@ class IndexerStore:
 class AsyncRateLimiter:
     def __init__(self, rps: float) -> None:
         self.rps = float(rps or 0)
-        self._capacity = max(1, int(math.ceil(self.rps))) if self.rps > 0 else 0
-        self._semaphore: asyncio.BoundedSemaphore | None = (
-            asyncio.BoundedSemaphore(self._capacity) if self._capacity else None
-        )
+        self._interval = 1.0 / self.rps if self.rps > 0 else 0.0
+        self._lock: asyncio.Lock | None = asyncio.Lock() if self.rps > 0 else None
+        self._next_at = 0.0
 
     async def acquire(self) -> None:
-        if self._semaphore is None:
+        if self._lock is None:
             return
-        await self._semaphore.acquire()
-        asyncio.get_running_loop().call_later(1.0, self._release)
-
-    def _release(self) -> None:
-        if self._semaphore is None:
-            return
-        try:
-            self._semaphore.release()
-        except ValueError:
-            pass
+        loop = asyncio.get_running_loop()
+        async with self._lock:
+            now = loop.time()
+            if now < self._next_at:
+                await asyncio.sleep(self._next_at - now)
+                now = loop.time()
+            self._next_at = max(self._next_at, now) + self._interval
 
 
 class PolygonRpcClient:
@@ -1521,24 +1516,24 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--max-workers",
         type=int,
-        default=int(os.getenv("MAX_WORKERS", "4")),
+        default=int(os.getenv("MAX_WORKERS", "8")),
     )
     parser.add_argument(
         "--rpc-rps",
         type=float,
-        default=float(os.getenv("RPC_RPS", "10")),
+        default=float(os.getenv("RPC_RPS", "45")),
         help="Max JSON-RPC request starts per second. Use 0 to disable throttling.",
     )
     parser.add_argument(
         "--chunk-size",
         type=int,
-        default=int(os.getenv("CHUNK_SIZE", os.getenv("BLOCK_CHUNK_SIZE", "250"))),
+        default=int(os.getenv("CHUNK_SIZE", os.getenv("BLOCK_CHUNK_SIZE", "150"))),
     )
     parser.add_argument("--poll-seconds", type=float, default=12.0)
     parser.add_argument(
         "--min-log-chunk-size",
         type=int,
-        default=int(os.getenv("MIN_LOG_CHUNK_SIZE", "10")),
+        default=int(os.getenv("MIN_LOG_CHUNK_SIZE", "5")),
         help="Smallest block range after adaptive eth_getLogs splitting.",
     )
     parser.add_argument(

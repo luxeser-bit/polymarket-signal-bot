@@ -56,6 +56,7 @@ except ModuleNotFoundError:  # pragma: no cover - optional for indexer progress 
     Web3 = None  # type: ignore[assignment]
 
 from polymarket_signal_bot.cohorts import load_wallet_cohorts
+from polymarket_signal_bot.consensus_engine import consensus_row_to_dict
 from polymarket_signal_bot.live_paper_runner import _portfolio_snapshot
 from polymarket_signal_bot.monitor import Monitor, MonitorConfig
 from polymarket_signal_bot.scoring import calculate_all
@@ -85,6 +86,17 @@ LIVE_PAYLOAD_LOCK = threading.RLock()
 INDEXER_PROGRESS_LOCK = threading.RLock()
 INDEXER_PROGRESS_SAMPLES: list[tuple[float, int]] = []
 POLYGON_BLOCK_CACHE: dict[str, Any] = {"block": None, "expires_at": 0.0}
+INDEXER_WATCHDOG_LOCK = threading.RLock()
+INDEXER_WATCHDOG_STATE: dict[str, Any] = {
+    "pid": 0,
+    "raw_events": -1,
+    "last_block": -1,
+    "last_progress_at": 0.0,
+    "last_check_at": 0.0,
+    "last_restart_at": 0.0,
+    "restart_count": 0,
+    "last_action": "",
+}
 
 
 @dataclass(frozen=True)
@@ -99,10 +111,13 @@ class ServerSettings:
     monitor_interval_seconds: int = 60
     paper_poll_interval_seconds: int = 60
     paper_price_interval_seconds: int = 15
-    indexer_chunk_size: int = 250
-    indexer_max_workers: int = 4
-    indexer_rpc_rps: float = 10.0
+    indexer_chunk_size: int = 150
+    indexer_max_workers: int = 8
+    indexer_rpc_rps: float = 45.0
     indexer_skip_contract_check: bool = True
+    indexer_watchdog_enabled: bool = True
+    indexer_stall_seconds: int = 300
+    indexer_restart_cooldown_seconds: int = 300
     polygon_rpc_url: str = ""
     dry_run: bool = True
     scoring_fallback_max_rows: int = 50_000
@@ -237,6 +252,10 @@ def create_app() -> Any:
     async def api_wallets() -> dict[str, Any]:
         return wallet_metrics(settings_from_env())
 
+    @api.get("/api/consensus")
+    async def api_consensus() -> dict[str, Any]:
+        return consensus_snapshot(settings_from_env())
+
     @api.post("/api/training/start")
     async def training_start(request: TrainingStartRequest | None = Body(default=None)) -> dict[str, Any]:
         settings = settings_from_env()
@@ -259,6 +278,24 @@ def create_app() -> Any:
     @api.get("/api/positions")
     async def api_positions() -> dict[str, Any]:
         return positions_snapshot(settings_from_env())
+
+    @api.get("/api/trade_log")
+    async def api_trade_log(limit: int = 250, market: str = "", date_from: int = 0, date_to: int = 0) -> dict[str, Any]:
+        return trade_log_snapshot(
+            settings_from_env(),
+            limit=limit,
+            market=market,
+            date_from=date_from,
+            date_to=date_to,
+        )
+
+    @api.get("/api/equity")
+    async def api_equity(timeframe_seconds: int = 300, max_points: int = 360) -> dict[str, Any]:
+        return equity_snapshot(
+            settings_from_env(),
+            timeframe_seconds=timeframe_seconds,
+            max_points=max_points,
+        )
 
     @api.post("/api/paper/start")
     async def paper_start(request: PaperStartRequest | None = Body(default=None)) -> dict[str, Any]:
@@ -317,10 +354,13 @@ def settings_from_env() -> ServerSettings:
         monitor_interval_seconds=_env_int("MONITOR_INTERVAL_SECONDS", monitor_defaults.interval_seconds),
         paper_poll_interval_seconds=_env_int("POLYSIGNAL_POLL_INTERVAL", 60),
         paper_price_interval_seconds=_env_int("POLYSIGNAL_PRICE_INTERVAL", 15),
-        indexer_chunk_size=_env_int("INDEXER_CHUNK_SIZE", _env_int("CHUNK_SIZE", 250)),
-        indexer_max_workers=_env_int("INDEXER_MAX_WORKERS", _env_int("MAX_WORKERS", 4)),
-        indexer_rpc_rps=_env_float("INDEXER_RPC_RPS", 10.0),
+        indexer_chunk_size=_env_int("INDEXER_CHUNK_SIZE", _env_int("CHUNK_SIZE", 150)),
+        indexer_max_workers=_env_int("INDEXER_MAX_WORKERS", _env_int("MAX_WORKERS", 8)),
+        indexer_rpc_rps=_env_float("INDEXER_RPC_RPS", _env_float("RPC_RPS", 45.0)),
         indexer_skip_contract_check=_env_bool("INDEXER_SKIP_CONTRACT_CHECK", True),
+        indexer_watchdog_enabled=_env_bool("INDEXER_WATCHDOG_ENABLED", True),
+        indexer_stall_seconds=_env_int("INDEXER_STALL_SECONDS", 300),
+        indexer_restart_cooldown_seconds=_env_int("INDEXER_RESTART_COOLDOWN_SECONDS", 300),
         polygon_rpc_url=os.environ.get("POLYGON_RPC_URL", ""),
         dry_run=_env_bool("DRY_RUN", True),
         scoring_fallback_max_rows=_env_int("API_SCORING_FALLBACK_MAX_ROWS", 50_000),
@@ -652,6 +692,13 @@ def start_component(spec: ComponentSpec) -> dict[str, Any]:
         }
 
 
+def restart_component(spec: ComponentSpec, *, timeout_seconds: float = 10.0) -> dict[str, Any]:
+    stopped = stop_component(spec, timeout_seconds=timeout_seconds)
+    time.sleep(1.0)
+    started = start_component(spec)
+    return {"stopped": stopped, "started": started}
+
+
 def stop_component(spec: ComponentSpec, *, timeout_seconds: float = 10.0) -> dict[str, Any]:
     with PROCESS_LOCK:
         managed = PROCESS_REGISTRY.get(spec.key)
@@ -689,7 +736,10 @@ def stop_component(spec: ComponentSpec, *, timeout_seconds: float = 10.0) -> dic
 
 
 def component_statuses(settings: ServerSettings) -> dict[str, dict[str, Any]]:
-    return {key: component_status(spec) for key, spec in component_specs(settings).items()}
+    specs = component_specs(settings)
+    components = {key: component_status(spec, discover=True) for key, spec in specs.items()}
+    components["indexer"] = indexer_watchdog_status(settings, specs["indexer"], components["indexer"])
+    return components
 
 
 def cached_component_statuses(settings: ServerSettings) -> dict[str, dict[str, Any]]:
@@ -748,6 +798,138 @@ def component_status(spec: ComponentSpec, *, discover: bool = False) -> dict[str
             "log_path": str(spec.log_path),
             "log_tail": tail_file(spec.log_path),
         }
+
+
+def indexer_watchdog_status(
+    settings: ServerSettings,
+    spec: ComponentSpec,
+    status: dict[str, Any],
+) -> dict[str, Any]:
+    status = dict(status)
+    status.setdefault("health", status.get("status", "stopped"))
+    status["watchdog_enabled"] = bool(settings.indexer_watchdog_enabled)
+    if not settings.indexer_watchdog_enabled:
+        return status
+
+    if not status.get("running"):
+        status.update({"health": "stopped", "stalled": False, "stalled_seconds": 0})
+        return status
+
+    now = time.time()
+    pid = int(status.get("pid") or 0)
+    counters = indexer_counter_snapshot(settings.indexer_db)
+    raw_events = int(counters.get("raw_events") or 0)
+    last_block = int(counters.get("last_block") or 0)
+    storage_mtime = indexer_storage_mtime(settings.indexer_db)
+
+    should_restart = False
+    restart_count = 0
+    last_restart_at = 0.0
+    with INDEXER_WATCHDOG_LOCK:
+        state_pid = int(INDEXER_WATCHDOG_STATE.get("pid") or 0)
+        previous_raw = int(INDEXER_WATCHDOG_STATE.get("raw_events") or -1)
+        previous_block = int(INDEXER_WATCHDOG_STATE.get("last_block") or -1)
+        pid_changed = state_pid != pid
+        progressed = raw_events > previous_raw or last_block > previous_block
+
+        if pid_changed or previous_raw < 0 or previous_block < 0 or progressed:
+            INDEXER_WATCHDOG_STATE.update(
+                {
+                    "pid": pid,
+                    "raw_events": raw_events,
+                    "last_block": last_block,
+                    "last_progress_at": now,
+                    "last_check_at": now,
+                    "last_action": "progress" if progressed else "adopted",
+                }
+            )
+        else:
+            if storage_mtime > float(INDEXER_WATCHDOG_STATE.get("last_progress_at") or 0.0):
+                INDEXER_WATCHDOG_STATE["last_progress_at"] = storage_mtime
+            INDEXER_WATCHDOG_STATE["last_check_at"] = now
+
+        last_progress_at = float(INDEXER_WATCHDOG_STATE.get("last_progress_at") or now)
+        stalled_seconds = max(0, int(now - last_progress_at))
+        restart_count = int(INDEXER_WATCHDOG_STATE.get("restart_count") or 0)
+        last_restart_at = float(INDEXER_WATCHDOG_STATE.get("last_restart_at") or 0.0)
+        cooldown_ready = now - last_restart_at >= max(1, settings.indexer_restart_cooldown_seconds)
+        should_restart = stalled_seconds >= max(1, settings.indexer_stall_seconds) and cooldown_ready
+        if should_restart:
+            INDEXER_WATCHDOG_STATE["last_restart_at"] = now
+            INDEXER_WATCHDOG_STATE["restart_count"] = restart_count + 1
+            INDEXER_WATCHDOG_STATE["last_action"] = "restart_requested"
+
+    status.update(
+        {
+            "health": "stalled" if stalled_seconds >= max(1, settings.indexer_stall_seconds) else "running",
+            "stalled": stalled_seconds >= max(1, settings.indexer_stall_seconds),
+            "stalled_seconds": stalled_seconds,
+            "last_progress_at": int(last_progress_at),
+            "watchdog_restart_count": restart_count,
+            "watchdog_last_restart_at": int(last_restart_at) if last_restart_at else 0,
+        }
+    )
+
+    if not should_restart:
+        return status
+
+    restart_result = restart_component(spec, timeout_seconds=10.0)
+    restarted_status = component_status(spec, discover=True)
+    with INDEXER_WATCHDOG_LOCK:
+        INDEXER_WATCHDOG_STATE.update(
+            {
+                "pid": int(restarted_status.get("pid") or 0),
+                "raw_events": raw_events,
+                "last_block": last_block,
+                "last_progress_at": time.time(),
+                "last_check_at": time.time(),
+                "last_action": "restarted",
+            }
+        )
+    clear_component_status_cache()
+    restarted_status.update(
+        {
+            "health": "restarted" if restarted_status.get("running") else "stalled",
+            "stalled": False,
+            "stalled_seconds": 0,
+            "last_progress_at": int(time.time()),
+            "watchdog_enabled": True,
+            "watchdog_action": "restarted",
+            "watchdog_restart_count": restart_count + 1,
+            "watchdog_last_restart_at": int(time.time()),
+            "restart": restart_result,
+        }
+    )
+    return restarted_status
+
+
+def indexer_counter_snapshot(db_path: Path) -> dict[str, int]:
+    result = {"raw_events": 0, "last_block": 0, "updated_at": 0}
+    if not db_path.exists():
+        return result
+    try:
+        with sqlite_connect(db_path) as conn:
+            if table_exists(conn, "raw_transactions"):
+                result["raw_events"] = int(conn.execute("SELECT COUNT(*) FROM raw_transactions").fetchone()[0] or 0)
+            if table_exists(conn, "indexer_state"):
+                row = conn.execute(
+                    "SELECT last_block, updated_at FROM indexer_state ORDER BY updated_at DESC LIMIT 1"
+                ).fetchone()
+                if row:
+                    result["last_block"] = int(row["last_block"] or 0)
+                    result["updated_at"] = int(row["updated_at"] or 0)
+    except Exception:
+        return result
+    return result
+
+
+def indexer_storage_mtime(db_path: Path) -> float:
+    paths = [db_path, db_path.with_name(f"{db_path.name}-wal"), db_path.with_name(f"{db_path.name}-shm")]
+    mtimes: list[float] = []
+    for path in paths:
+        with contextlib.suppress(OSError):
+            mtimes.append(path.stat().st_mtime)
+    return max(mtimes) if mtimes else 0.0
 
 
 def cleanup_component(key: str) -> None:
@@ -852,6 +1034,13 @@ def discover_pid(patterns: tuple[str, ...]) -> int:
 
 
 def indexer_metrics(settings: ServerSettings, *, include_process: bool = True) -> dict[str, Any]:
+    indexer_status = (
+        cached_component_statuses(settings).get("indexer", {})
+        if include_process
+        else {"running": False, "health": "unknown", "stalled": False}
+    )
+    running = bool(indexer_status.get("running"))
+    stalled = bool(indexer_status.get("stalled"))
     snapshot = {
         "raw_events": 0,
         "last_block": 0,
@@ -860,7 +1049,10 @@ def indexer_metrics(settings: ServerSettings, *, include_process: bool = True) -
         "target": TARGET_RAW_EVENTS,
         "updated_at": 0,
         "db_path": str(settings.indexer_db),
-        "running": component_status(component_specs(settings)["indexer"])["running"] if include_process else False,
+        "running": running,
+        "health": str(indexer_status.get("health") or ("running" if running else "stopped")),
+        "stalled": stalled,
+        "stalled_seconds": int(indexer_status.get("stalled_seconds") or 0),
         "error": "",
     }
     if not settings.indexer_db.exists():
@@ -878,7 +1070,7 @@ def indexer_metrics(settings: ServerSettings, *, include_process: bool = True) -
                     snapshot["last_block"] = int(row["last_block"] or 0)
                     snapshot["updated_at"] = int(row["updated_at"] or 0)
         snapshot["progress"] = min(1.0, float(snapshot["raw_events"]) / TARGET_RAW_EVENTS)
-        snapshot["blocks_per_second"] = block_speed(float(snapshot["last_block"]))
+        snapshot["blocks_per_second"] = block_speed(float(snapshot["last_block"])) if running and not stalled else 0.0
         return snapshot
     except Exception as exc:  # noqa: BLE001 - API should stay up during SQLite writes.
         snapshot["error"] = str(exc)
@@ -886,11 +1078,19 @@ def indexer_metrics(settings: ServerSettings, *, include_process: bool = True) -
 
 
 def indexer_progress_snapshot(settings: ServerSettings) -> dict[str, Any]:
+    indexer_status = cached_component_statuses(settings).get("indexer", {})
+    running = bool(indexer_status.get("running"))
+    stalled = bool(indexer_status.get("stalled"))
     metrics = indexer_metrics(settings, include_process=False)
     last_block = int(metrics.get("last_block") or 0)
-    speed = indexer_average_speed(last_block)
-    if speed <= 0:
-        speed = float(metrics.get("blocks_per_second") or 0.0)
+    speed = 0.0
+    if running and not stalled:
+        speed = indexer_average_speed(last_block)
+        if speed <= 0:
+            speed = float(metrics.get("blocks_per_second") or 0.0)
+    else:
+        with INDEXER_PROGRESS_LOCK:
+            INDEXER_PROGRESS_SAMPLES.clear()
     current_block = polygon_current_block(settings)
     eta_seconds: int | None = None
     if current_block is not None and last_block > 0 and current_block > last_block and speed > 0:
@@ -901,6 +1101,11 @@ def indexer_progress_snapshot(settings: ServerSettings) -> dict[str, Any]:
         "current_block_polygon": current_block,
         "estimated_completion_seconds": eta_seconds,
         "speed_blocks_per_second": round(float(speed), 4),
+        "running": running,
+        "health": str(indexer_status.get("health") or ("running" if running else "stopped")),
+        "stalled": stalled,
+        "stalled_seconds": int(indexer_status.get("stalled_seconds") or 0),
+        "pid": int(indexer_status.get("pid") or 0),
         "updated_at": int(time.time()),
         "error": metrics.get("error", ""),
     }
@@ -1003,6 +1208,7 @@ def wallet_metrics(settings: ServerSettings) -> dict[str, Any]:
         "counts": {},
         "top_wallets": [],
         "scored_wallet_rows": [],
+        "cohort_wallets": {},
         "scored_wallets": 0,
         "db_path": str(settings.indexer_db),
         "last_training": latest_training_summary(settings.indexer_db),
@@ -1026,6 +1232,7 @@ def wallet_metrics(settings: ServerSettings) -> dict[str, Any]:
                     f"SELECT {status_expr} AS cohort, COUNT(*) AS wallets FROM wallet_cohorts GROUP BY {status_expr}"
                 ).fetchall()
                 result["counts"] = {str(row["cohort"]): int(row["wallets"] or 0) for row in rows}
+                result["cohort_wallets"] = cohort_wallet_rows(conn, limit=10)
             if table_exists(conn, "scored_wallets"):
                 result["scored_wallets"] = int(conn.execute("SELECT COUNT(*) FROM scored_wallets").fetchone()[0] or 0)
                 result["top_wallets"] = top_wallet_rows(conn, include_cohorts=table_exists(conn, "wallet_cohorts"))
@@ -1119,9 +1326,387 @@ def positions_snapshot(settings: ServerSettings) -> dict[str, Any]:
         return result
 
 
+def equity_snapshot(
+    settings: ServerSettings,
+    *,
+    timeframe_seconds: int = 300,
+    max_points: int = 360,
+) -> dict[str, Any]:
+    timeframe_seconds = normalize_timeframe_seconds(timeframe_seconds)
+    max_points = max(20, min(1000, int(max_points or 360)))
+    now = int(time.time())
+    since = now - timeframe_seconds
+    result: dict[str, Any] = {
+        "points": [],
+        "timeframe_seconds": timeframe_seconds,
+        "current": 0.0,
+        "delta": 0.0,
+        "updated_at": 0,
+        "db_path": str(settings.paper_state_db),
+        "error": "",
+    }
+    if not settings.paper_state_db.exists():
+        result["error"] = "paper state db not found"
+        return result
+    try:
+        with sqlite_connect(settings.paper_state_db) as conn:
+            if not table_exists(conn, "balance_history"):
+                result["error"] = "balance_history not found"
+                return result
+            rows = conn.execute(
+                """
+                SELECT timestamp, balance, pnl
+                FROM balance_history
+                WHERE timestamp >= ?
+                ORDER BY timestamp ASC
+                """,
+                (since,),
+            ).fetchall()
+            if not rows:
+                rows = conn.execute(
+                    """
+                    SELECT timestamp, balance, pnl
+                    FROM balance_history
+                    ORDER BY timestamp DESC
+                    LIMIT 1
+                    """
+                ).fetchall()
+                rows = list(reversed(rows))
+            sampled = downsample_rows(rows, max_points=max_points)
+            points = [
+                {
+                    "time": int(row["timestamp"] or 0),
+                    "label": equity_point_label(int(row["timestamp"] or 0), timeframe_seconds),
+                    "balance": round(float(row["balance"] or 0.0), 4),
+                    "pnl": round(float(row["pnl"] or 0.0), 4),
+                }
+                for row in sampled
+            ]
+        if points:
+            result["points"] = points
+            result["current"] = float(points[-1]["balance"])
+            result["delta"] = round(float(points[-1]["balance"]) - float(points[0]["balance"]), 4)
+            result["updated_at"] = int(points[-1]["time"])
+        return result
+    except Exception as exc:  # noqa: BLE001
+        result["error"] = str(exc)
+        return result
+
+
+def normalize_timeframe_seconds(value: int) -> int:
+    allowed = (5 * 60, 30 * 60, 60 * 60, 12 * 3600, 24 * 3600, 48 * 3600)
+    requested = int(value or allowed[0])
+    return min(allowed, key=lambda item: abs(item - requested))
+
+
+def downsample_rows(rows: list[sqlite3.Row], *, max_points: int) -> list[sqlite3.Row]:
+    if len(rows) <= max_points:
+        return rows
+    step = max(1, len(rows) // max_points)
+    sampled = rows[::step]
+    if sampled[-1] != rows[-1]:
+        sampled.append(rows[-1])
+    return sampled[-max_points:]
+
+
+def equity_point_label(timestamp: int, timeframe_seconds: int) -> str:
+    if timestamp <= 0:
+        return ""
+    dt = datetime.fromtimestamp(timestamp, tz=timezone.utc)
+    if timeframe_seconds <= 3600:
+        return dt.strftime("%H:%M:%S")
+    return dt.strftime("%m-%d %H:%M")
+
+
+def trade_log_snapshot(
+    settings: ServerSettings,
+    *,
+    limit: int = 250,
+    market: str = "",
+    date_from: int = 0,
+    date_to: int = 0,
+) -> dict[str, Any]:
+    limit = max(1, min(1000, int(limit or 250)))
+    result: dict[str, Any] = {
+        "rows": [],
+        "total": 0,
+        "db_path": str(settings.main_db),
+        "paper_state_db": str(settings.paper_state_db),
+        "error": "",
+    }
+    try:
+        rows: list[dict[str, Any]] = []
+        rows.extend(main_trade_log_rows(settings.main_db, limit=limit * 2, market=market, date_from=date_from, date_to=date_to))
+        rows.extend(consensus_reject_rows(settings.main_db, limit=limit, market=market, date_from=date_from, date_to=date_to))
+        if not rows:
+            rows.extend(paper_state_trade_log_rows(settings.paper_state_db, limit=limit, market=market, date_from=date_from, date_to=date_to))
+        rows.sort(key=lambda item: int(item.get("timestamp") or 0), reverse=True)
+        result["rows"] = rows[:limit]
+        result["total"] = len(rows)
+        return result
+    except Exception as exc:  # noqa: BLE001 - dashboard can show partial data.
+        result["error"] = str(exc)
+        return result
+
+
+def main_trade_log_rows(
+    db_path: Path,
+    *,
+    limit: int,
+    market: str = "",
+    date_from: int = 0,
+    date_to: int = 0,
+) -> list[dict[str, Any]]:
+    if not db_path.exists():
+        return []
+    filters = ["event_type IN ('OPENED', 'CLOSED', 'BLOCKED')"]
+    params: list[Any] = []
+    append_trade_log_filters(filters, params, market=market, date_column="event_at", date_from=date_from, date_to=date_to)
+    where = " AND ".join(filters)
+    with sqlite_connect(db_path) as conn:
+        if not table_exists(conn, "paper_events"):
+            return []
+        rows = conn.execute(
+            f"""
+            SELECT
+                event_id,
+                event_at,
+                event_type,
+                signal_id,
+                position_id,
+                wallet,
+                condition_id,
+                asset,
+                outcome,
+                title,
+                reason,
+                price,
+                size_usdc,
+                pnl,
+                metadata_json
+            FROM paper_events
+            WHERE {where}
+            ORDER BY event_at DESC
+            LIMIT ?
+            """,
+            (*params, max(1, int(limit))),
+        ).fetchall()
+    return [normalize_paper_event_row(row) for row in rows]
+
+
+def consensus_reject_rows(
+    db_path: Path,
+    *,
+    limit: int,
+    market: str = "",
+    date_from: int = 0,
+    date_to: int = 0,
+) -> list[dict[str, Any]]:
+    if not db_path.exists():
+        return []
+    filters = ["final_decision = 'REJECT'"]
+    params: list[Any] = []
+    append_trade_log_filters(filters, params, market=market, date_column="decided_at", date_from=date_from, date_to=date_to)
+    where = " AND ".join(filters)
+    with sqlite_connect(db_path) as conn:
+        if not table_exists(conn, "consensus_votes"):
+            return []
+        rows = conn.execute(
+            f"""
+            SELECT
+                signal_id,
+                decided_at,
+                action,
+                wallet,
+                condition_id,
+                asset,
+                outcome,
+                title,
+                suggested_price,
+                size_usdc,
+                skeptic_reason,
+                reason
+            FROM consensus_votes
+            WHERE {where}
+            ORDER BY decided_at DESC
+            LIMIT ?
+            """,
+            (*params, max(1, int(limit))),
+        ).fetchall()
+    return [normalize_consensus_reject_row(row) for row in rows]
+
+
+def paper_state_trade_log_rows(
+    db_path: Path,
+    *,
+    limit: int,
+    market: str = "",
+    date_from: int = 0,
+    date_to: int = 0,
+) -> list[dict[str, Any]]:
+    if not db_path.exists():
+        return []
+    filters = ["1 = 1"]
+    params: list[Any] = []
+    market_text = str(market or "").strip().lower()
+    if market_text:
+        filters.append("(LOWER(COALESCE(market_id, '')) LIKE ? OR LOWER(COALESCE(id, '')) LIKE ?)")
+        like = f"%{market_text}%"
+        params.extend([like, like])
+    if int(date_from or 0) > 0:
+        filters.append("opened_at >= ?")
+        params.append(int(date_from))
+    if int(date_to or 0) > 0:
+        filters.append("opened_at <= ?")
+        params.append(int(date_to))
+    where = " AND ".join(filters)
+    with sqlite_connect(db_path) as conn:
+        if not table_exists(conn, "positions"):
+            return []
+        rows = conn.execute(
+            f"""
+            SELECT id, market_id, side, size, entry_price, status, opened_at, closed_at, pnl
+            FROM positions
+            WHERE {where}
+            ORDER BY opened_at DESC
+            LIMIT ?
+            """,
+            (*params, max(1, int(limit))),
+        ).fetchall()
+    result: list[dict[str, Any]] = []
+    for row in rows:
+        result.append(
+            {
+                "id": f"state-open-{row['id']}",
+                "timestamp": int(row["opened_at"] or 0),
+                "market": str(row["market_id"] or ""),
+                "action": str(row["side"] or "BUY").upper(),
+                "price": float(row["entry_price"] or 0.0),
+                "size": float(row["size"] or 0.0),
+                "reason": "opened",
+                "pnl": 0.0,
+                "status": str(row["status"] or ""),
+                "source": "paper_state",
+                "asset": "",
+                "condition_id": str(row["market_id"] or ""),
+            }
+        )
+        if str(row["status"] or "").upper() == "CLOSED":
+            result.append(
+                {
+                    "id": f"state-close-{row['id']}",
+                    "timestamp": int(row["closed_at"] or row["opened_at"] or 0),
+                    "market": str(row["market_id"] or ""),
+                    "action": "SELL",
+                    "price": 0.0,
+                    "size": float(row["size"] or 0.0),
+                    "reason": "closed",
+                    "pnl": float(row["pnl"] or 0.0),
+                    "status": "CLOSED",
+                    "source": "paper_state",
+                    "asset": "",
+                    "condition_id": str(row["market_id"] or ""),
+                }
+            )
+    return result
+
+
+def append_trade_log_filters(
+    filters: list[str],
+    params: list[Any],
+    *,
+    market: str,
+    date_column: str,
+    date_from: int,
+    date_to: int,
+) -> None:
+    market_text = str(market or "").strip().lower()
+    if market_text:
+        filters.append(
+            "(LOWER(COALESCE(title, '')) LIKE ? OR LOWER(COALESCE(asset, '')) LIKE ? OR LOWER(COALESCE(condition_id, '')) LIKE ?)"
+        )
+        like = f"%{market_text}%"
+        params.extend([like, like, like])
+    if int(date_from or 0) > 0:
+        filters.append(f"{date_column} >= ?")
+        params.append(int(date_from))
+    if int(date_to or 0) > 0:
+        filters.append(f"{date_column} <= ?")
+        params.append(int(date_to))
+
+
+def normalize_paper_event_row(row: sqlite3.Row) -> dict[str, Any]:
+    event_type = str(row["event_type"] or "").upper()
+    reason = str(row["reason"] or "")
+    action = {
+        "OPENED": "BUY",
+        "CLOSED": "SELL",
+        "BLOCKED": "REJECT",
+    }.get(event_type, event_type)
+    if event_type == "CLOSED" and not reason:
+        reason = "closed"
+    return {
+        "id": str(row["event_id"] or row["signal_id"] or ""),
+        "timestamp": int(row["event_at"] or 0),
+        "market": str(row["title"] or row["condition_id"] or row["asset"] or ""),
+        "action": action,
+        "price": float(row["price"] or 0.0),
+        "size": float(row["size_usdc"] or 0.0),
+        "reason": trade_reason_label(reason, event_type=event_type),
+        "pnl": float(row["pnl"] or 0.0),
+        "event_type": event_type,
+        "source": "paper_events",
+        "wallet": str(row["wallet"] or ""),
+        "asset": str(row["asset"] or ""),
+        "condition_id": str(row["condition_id"] or ""),
+        "outcome": str(row["outcome"] or ""),
+    }
+
+
+def normalize_consensus_reject_row(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "id": f"consensus-{row['signal_id']}",
+        "timestamp": int(row["decided_at"] or 0),
+        "market": str(row["title"] or row["condition_id"] or row["asset"] or ""),
+        "action": "REJECT",
+        "price": float(row["suggested_price"] or 0.0),
+        "size": float(row["size_usdc"] or 0.0),
+        "reason": trade_reason_label(str(row["skeptic_reason"] or row["reason"] or "consensus"), event_type="CONSENSUS"),
+        "pnl": 0.0,
+        "event_type": "CONSENSUS_REJECT",
+        "source": "consensus_votes",
+        "wallet": str(row["wallet"] or ""),
+        "asset": str(row["asset"] or ""),
+        "condition_id": str(row["condition_id"] or ""),
+        "outcome": str(row["outcome"] or ""),
+    }
+
+
+def trade_reason_label(reason: str, *, event_type: str = "") -> str:
+    text = str(reason or "").strip()
+    lower = text.lower()
+    if event_type == "CONSENSUS" or "consensus" in lower or "skeptic" in lower:
+        return f"Consensus: {text}" if text else "Consensus"
+    if "take_profit" in lower or lower == "tp":
+        return "TP"
+    if "stop_loss" in lower or lower == "sl":
+        return "SL"
+    if "exit_model" in lower or "early_exit" in lower:
+        return "Exit Model"
+    if "risk_trim" in lower:
+        return "Risk Trim"
+    if "cohort_auto_policy" in lower:
+        return "Cohort Policy"
+    if "duplicate_asset" in lower:
+        return "Duplicate Asset"
+    if event_type == "BLOCKED":
+        return text or "Blocked"
+    return text or "-"
+
+
 def paper_status_snapshot(settings: ServerSettings) -> dict[str, Any]:
     spec = component_specs(settings)["live_paper"]
-    status = component_status(spec)
+    status = component_status(spec, discover=True)
     positions = positions_snapshot(settings)
     main_summary = main_paper_summary(settings)
     return {
@@ -1203,6 +1788,47 @@ def signals_count(db_path: Path) -> int:
         return 0
 
 
+def consensus_snapshot(settings: ServerSettings, *, limit: int = 25) -> dict[str, Any]:
+    result: dict[str, Any] = {
+        "votes": [],
+        "counts": {"EXECUTE": 0, "REJECT": 0},
+        "total": 0,
+        "db_path": str(settings.main_db),
+        "error": "",
+    }
+    if not settings.main_db.exists():
+        result["error"] = "main db not found"
+        return result
+    try:
+        with sqlite_connect(settings.main_db) as conn:
+            if not table_exists(conn, "consensus_votes"):
+                return result
+            count_rows = conn.execute(
+                """
+                SELECT final_decision, COUNT(*) AS votes
+                FROM consensus_votes
+                GROUP BY final_decision
+                """
+            ).fetchall()
+            counts = {str(row["final_decision"]): int(row["votes"] or 0) for row in count_rows}
+            result["counts"] = {"EXECUTE": counts.get("EXECUTE", 0), "REJECT": counts.get("REJECT", 0)}
+            result["total"] = int(sum(counts.values()))
+            rows = conn.execute(
+                """
+                SELECT *
+                FROM consensus_votes
+                ORDER BY decided_at DESC
+                LIMIT ?
+                """,
+                (max(1, int(limit)),),
+            ).fetchall()
+            result["votes"] = [consensus_row_to_dict(row) for row in rows]
+        return result
+    except Exception as exc:  # noqa: BLE001 - dashboard can show partial data.
+        result["error"] = str(exc)
+        return result
+
+
 def top_wallet_rows(conn: sqlite3.Connection, *, include_cohorts: bool) -> list[dict[str, Any]]:
     columns = table_columns(conn, "scored_wallets")
     wallet_expr = scored_wallet_expression(columns, alias="s")
@@ -1280,6 +1906,53 @@ def top_wallet_rows(conn: sqlite3.Connection, *, include_cohorts: bool) -> list[
         """
     rows = conn.execute(query).fetchall()
     return [dict(row) for row in rows]
+
+
+def cohort_wallet_rows(conn: sqlite3.Connection, *, limit: int = 10) -> dict[str, list[dict[str, Any]]]:
+    if not table_exists(conn, "wallet_cohorts"):
+        return {}
+    columns = table_columns(conn, "wallet_cohorts")
+    wallet_expr = cohort_wallet_expression(conn, alias="c")
+    cohort_expr = cohort_status_expression(conn, alias="c")
+    stability_expr = "c.stability_score" if "stability_score" in columns else "0.0"
+    score_expr = "c.score" if "score" in columns else stability_expr
+    pnl_expr = "c.pnl" if "pnl" in columns else "0.0"
+    sharpe_expr = "c.sharpe" if "sharpe" in columns else "0.0"
+    volume_expr = "c.volume" if "volume" in columns else "0.0"
+    trade_count_expr = "c.trade_count" if "trade_count" in columns else "0"
+    win_rate_expr = "c.win_rate" if "win_rate" in columns else "0.0"
+    profit_factor_expr = "c.profit_factor" if "profit_factor" in columns else "0.0"
+    max_drawdown_expr = "c.max_drawdown" if "max_drawdown" in columns else "0.0"
+    avg_hold_expr = "c.avg_hold_time" if "avg_hold_time" in columns else "0.0"
+    updated_expr = "c.updated_at" if "updated_at" in columns else "0"
+    query = f"""
+        SELECT
+            {wallet_expr} AS user_address,
+            {wallet_expr} AS wallet,
+            {cohort_expr} AS cohort,
+            {cohort_expr} AS status,
+            {stability_expr} AS stability_score,
+            {score_expr} AS score,
+            {pnl_expr} AS pnl,
+            {sharpe_expr} AS sharpe,
+            {volume_expr} AS volume,
+            CAST({trade_count_expr} AS INTEGER) AS trade_count,
+            {win_rate_expr} AS win_rate,
+            {profit_factor_expr} AS profit_factor,
+            {max_drawdown_expr} AS max_drawdown,
+            {avg_hold_expr} AS avg_hold_time,
+            {updated_expr} AS updated_at,
+            {updated_expr} AS computed_at
+        FROM wallet_cohorts c
+        WHERE {cohort_expr} = ?
+        ORDER BY {sharpe_expr} DESC, {pnl_expr} DESC, {volume_expr} DESC
+        LIMIT ?
+    """
+    result: dict[str, list[dict[str, Any]]] = {}
+    for cohort in ("STABLE", "CANDIDATE", "WATCH", "NOISE"):
+        rows = conn.execute(query, (cohort, max(1, int(limit)))).fetchall()
+        result[cohort] = [dict(row) for row in rows]
+    return result
 
 
 def scored_wallet_expression(columns: set[str], *, alias: str) -> str:

@@ -4,6 +4,8 @@ import LiveWebSocket from './LiveWebSocket';
 import SystemControl from './SystemControl';
 import IndexerMetrics from './IndexerMetrics';
 import WalletCohorts from './WalletCohorts';
+import ConsensusVotes from './ConsensusVotes';
+import TradeLog from './TradeLog';
 import PositionsTable from './PositionsTable';
 import EquityChart from './EquityChart';
 import PaperTradingControl from './PaperTradingControl';
@@ -17,6 +19,8 @@ export default function DashboardLayout({
   metrics,
   indexerProgress,
   wallets,
+  consensus,
+  tradeLog,
   positions,
   paperStatus,
   onRefreshPaper,
@@ -99,6 +103,14 @@ export default function DashboardLayout({
             onRefreshTraining={onRefreshTraining}
             onRefreshWallets={onRefreshData}
           />
+        </section>
+
+        <section className="col-span-12">
+          <ConsensusVotes data={consensus} />
+        </section>
+
+        <section className="col-span-12">
+          <TradeLog data={tradeLog} />
         </section>
 
         <section className="col-span-12">

@@ -66,7 +66,18 @@ export default function SystemControl({ status, onRefresh }) {
         {ORDER.map((key) => {
           const item = components[key] || {};
           const rowLoading = Boolean(componentLoading[key]);
+          const stalled = item.health === 'stalled' || Boolean(item.stalled);
           const actionLabel = item.running ? 'Stop' : 'Start';
+          const stateText = stalled
+            ? `stalled ${secondsToDuration(item.stalled_seconds || 0)}`
+            : item.running
+              ? `PID ${item.pid}`
+              : 'stopped';
+          const dotClass = stalled
+            ? 'bg-amber-300 shadow-[0_0_12px_rgba(252,211,77,0.65)]'
+            : item.running
+              ? 'bg-good shadow-[0_0_12px_rgba(34,197,94,0.65)]'
+              : 'bg-slate-500';
           return (
             <div
               key={key}
@@ -84,12 +95,12 @@ export default function SystemControl({ status, onRefresh }) {
                   {rowLoading ? '...' : actionLabel}
                 </button>
                 <span
-                  className={`h-2.5 w-2.5 rounded-full ${item.running ? 'bg-good shadow-[0_0_12px_rgba(34,197,94,0.65)]' : 'bg-slate-500'}`}
+                  className={`h-2.5 w-2.5 rounded-full ${dotClass}`}
                 />
                 <span className="truncate text-sm font-medium text-slate-200">{item.name || key}</span>
               </div>
               <div className="text-right text-xs text-slate-500">
-                <div>{item.running ? `PID ${item.pid}` : 'stopped'}</div>
+                <div className={stalled ? 'text-amber-300' : ''}>{stateText}</div>
                 {item.uptime_seconds ? <div>{secondsToDuration(item.uptime_seconds)}</div> : null}
               </div>
             </div>

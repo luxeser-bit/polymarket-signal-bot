@@ -14,12 +14,19 @@ from .analytics import DEFAULT_DUCKDB_PATH, refresh_analytics_snapshot
 from .api import ApiError, PolymarketClient
 from .auto_trainer import run_full_training_cycle
 from .cohorts import CohortConfig, load_wallet_cohorts, wallet_cohort_report
+from .consensus_engine import (
+    ConsensusConfig,
+    consensus_filter_signals,
+    consensus_runtime_summary,
+    generate_strategy_signals,
+    persist_consensus_decisions,
+)
 from .market_flow import MarketFlowConfig, sync_market_flow
 from .models import OrderBookSnapshot, Trade, Wallet, WalletScore
 from .paper import ExitConfig, PaperBroker, RiskConfig
 from .policy_optimizer import policy_settings_from_recommendation
 from .scoring import score_wallets
-from .signals import SignalConfig, generate_signals
+from .signals import SignalConfig
 from .storage import Store
 from .learning import wallet_outcome_lookup, wallet_outcome_report
 
@@ -444,7 +451,7 @@ class Monitor:
                     ),
                 )
                 wallet_cohorts = {str(item["wallet"]): item for item in cohort_report["wallets"]}
-        signals = generate_signals(
+        signals = generate_strategy_signals(
             recent_trades,
             score_map,
             SignalConfig(
@@ -477,6 +484,21 @@ class Monitor:
             if self.config.use_learning_policy
             else {},
         )
+        signals, consensus_decisions = consensus_filter_signals(
+            signals,
+            recent_trades=recent_trades,
+            scores=score_map,
+            order_books=order_books,
+            config=ConsensusConfig(
+                min_strategy_confidence=self.config.min_wallet_score,
+                max_spread=self.config.max_spread,
+                min_liquidity_score=self.config.min_liquidity_score,
+                min_depth_usdc=self.config.min_depth_usdc,
+                max_wallet_trades_per_day=self.config.max_wallet_trades_per_day,
+            ),
+        )
+        persist_consensus_decisions(self.store.conn, consensus_decisions)
+        self.store.set_runtime_state("consensus_last_summary", consensus_runtime_summary(consensus_decisions))
         self.store.set_runtime_state(
             "signal_policy_active",
             f"enabled={int(policy_enabled)} mode={policy_mode} learning={int(self.config.use_learning_policy)}",

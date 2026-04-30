@@ -4,12 +4,21 @@ import { clamp, numberCompact, numberFull, percent } from '../utils/format';
 const TARGET = 86000000;
 
 export default function IndexerMetrics({ metrics, live, progress: indexerProgress }) {
+  const indexerStalled = Boolean(indexerProgress?.stalled ?? live?.components?.indexer?.stalled ?? metrics?.stalled);
+  const indexerRunning = Boolean(indexerProgress?.running ?? live?.components?.indexer?.running ?? metrics?.running) && !indexerStalled;
+  const health = indexerStalled
+    ? `stalled ${formatEta(indexerProgress?.stalled_seconds)}`
+    : indexerRunning
+      ? 'running'
+      : 'stopped';
   const rawEvents = Number(live?.raw_events ?? metrics?.raw_events ?? 0);
   const lastBlock = Number(indexerProgress?.last_block ?? live?.last_block ?? metrics?.last_block ?? 0);
-  const speed = Number(indexerProgress?.speed_blocks_per_second ?? live?.indexer_speed ?? metrics?.blocks_per_second ?? 0);
+  const speed = indexerRunning
+    ? Number(indexerProgress?.speed_blocks_per_second ?? live?.indexer_speed ?? metrics?.blocks_per_second ?? 0)
+    : 0;
   const progress = clamp(metrics?.progress ?? rawEvents / TARGET);
   const lastBlockDate = formatBlockDate(indexerProgress?.last_block_date);
-  const eta = formatEta(indexerProgress?.estimated_completion_seconds);
+  const eta = indexerRunning ? formatEta(indexerProgress?.estimated_completion_seconds) : '-';
 
   return (
     <div className="panel-card h-full p-4">
@@ -29,6 +38,12 @@ export default function IndexerMetrics({ metrics, live, progress: indexerProgres
       </div>
 
       <div className="mt-3 grid gap-2 border border-slate-700/70 bg-slate-950/40 p-3 text-xs uppercase text-slate-400">
+        <div className="flex items-center justify-between gap-3">
+          <span>State</span>
+          <span className={indexerStalled ? 'text-right font-semibold text-amber-300' : 'text-right font-semibold text-cyanLive'}>
+            {health}
+          </span>
+        </div>
         <div className="flex items-center justify-between gap-3">
           <span>Last block date</span>
           <span className="text-right font-semibold text-cyanLive">{lastBlockDate}</span>

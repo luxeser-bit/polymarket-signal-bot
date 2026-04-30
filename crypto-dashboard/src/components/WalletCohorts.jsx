@@ -22,6 +22,9 @@ export default function WalletCohorts({ data, training, onRefreshTraining, onRef
       ? data.top_wallets
       : [];
   const topWallets = scoredRows;
+  const cohortWallets = data?.cohort_wallets && typeof data.cohort_wallets === 'object'
+    ? data.cohort_wallets
+    : {};
   const lastRun = training?.last_run || data?.last_training || null;
   const trainingRunning = Boolean(training?.running);
   const exitExamples =
@@ -184,12 +187,18 @@ export default function WalletCohorts({ data, training, onRefreshTraining, onRef
 
       <div className="mt-4 grid gap-3 lg:grid-cols-2">
         {COHORTS.map(([name, color]) => {
-          const rows = topWallets
-            .filter((wallet) => (wallet.cohort || wallet.status || 'NOISE') === name)
-            .slice(0, 5);
+          const sourceRows = Array.isArray(cohortWallets[name])
+            ? cohortWallets[name]
+            : topWallets.filter((wallet) => (wallet.cohort || wallet.status || 'NOISE') === name);
+          const rows = sourceRows.slice(0, 5);
           return (
             <div key={name} className="min-h-[136px] rounded-lg border border-slate-700/70 bg-slate-950/40 p-3">
-              <div className={`mb-2 text-xs font-semibold uppercase tracking-wide ${color}`}>{name}</div>
+              <div className="mb-2 flex items-center justify-between gap-3">
+                <div className={`text-xs font-semibold uppercase tracking-wide ${color}`}>{name}</div>
+                <div className="text-[10px] font-semibold uppercase tracking-wide text-slate-500">
+                  {numberFull(rows.length)} / {numberFull(counts[name] || sourceRows.length)}
+                </div>
+              </div>
               {rows.length ? (
                 <div className="space-y-1.5">
                   {rows.map((wallet) => (

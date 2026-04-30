@@ -13,6 +13,8 @@ export default function App() {
   const [metrics, setMetrics] = useState(null);
   const [indexerProgress, setIndexerProgress] = useState(null);
   const [wallets, setWallets] = useState(null);
+  const [consensus, setConsensus] = useState(null);
+  const [tradeLog, setTradeLog] = useState(null);
   const [positions, setPositions] = useState(null);
   const [paperStatus, setPaperStatus] = useState(null);
   const [trainingStatus, setTrainingStatus] = useState(null);
@@ -85,18 +87,32 @@ export default function App() {
 
   const refreshData = useCallback(async () => {
     try {
-      const [metricsPayload, walletsPayload, positionsPayload] = await Promise.all([
+      const [metricsPayload, walletsPayload, consensusPayload, positionsPayload] = await Promise.all([
         getJson('/api/metrics'),
         getJson('/api/wallets'),
+        getJson('/api/consensus'),
         getJson('/api/positions'),
       ]);
       setMetrics(metricsPayload);
       setWallets(walletsPayload);
+      setConsensus(consensusPayload);
       setPositions(positionsPayload);
       setApiErrors([]);
     } catch (err) {
       const message = `API unavailable: ${err.message || err}`;
       rememberError(message);
+    }
+  }, [rememberError]);
+
+  const refreshTradeLog = useCallback(async () => {
+    try {
+      const payload = await getJson('/api/trade_log?limit=300');
+      setTradeLog(payload);
+      return payload;
+    } catch (err) {
+      const message = `Trade log unavailable: ${err.message || err}`;
+      rememberError(message);
+      throw err;
     }
   }, [rememberError]);
 
@@ -117,13 +133,15 @@ export default function App() {
     refreshPaper().catch(() => {});
     refreshTraining().catch(() => {});
     refreshIndexerProgress().catch(() => {});
+    refreshTradeLog().catch(() => {});
     refreshData().catch(() => {});
-  }, [refreshData, refreshIndexerProgress, refreshPaper, refreshSystem, refreshTraining]);
+  }, [refreshData, refreshIndexerProgress, refreshPaper, refreshSystem, refreshTradeLog, refreshTraining]);
 
   useInterval(() => refreshSystem().catch(() => {}), 4000);
   useInterval(() => refreshPaper().catch(() => {}), 3000);
   useInterval(() => refreshTraining().catch(() => {}), 3000);
   useInterval(() => refreshIndexerProgress().catch(() => {}), 5000);
+  useInterval(() => refreshTradeLog().catch(() => {}), 5000);
   useInterval(() => refreshData().catch(() => {}), 3000);
 
   useEffect(() => {
@@ -132,11 +150,16 @@ export default function App() {
 
   const mergedMetrics = useMemo(() => {
     if (!live) return metrics;
+    const liveIndexerRunning = Boolean(live.components?.indexer?.running);
+    const liveIndexerStalled = Boolean(live.components?.indexer?.stalled);
     return {
       ...(metrics || {}),
       raw_events: live.raw_events ?? metrics?.raw_events,
       last_block: live.last_block ?? metrics?.last_block,
-      blocks_per_second: live.indexer_speed ?? metrics?.blocks_per_second,
+      blocks_per_second: liveIndexerRunning && !liveIndexerStalled ? live.indexer_speed ?? metrics?.blocks_per_second : 0,
+      running: liveIndexerRunning,
+      stalled: liveIndexerStalled,
+      health: live.components?.indexer?.health ?? metrics?.health,
     };
   }, [live, metrics]);
 
@@ -166,6 +189,8 @@ export default function App() {
       metrics={mergedMetrics}
       indexerProgress={indexerProgress}
       wallets={wallets}
+      consensus={consensus}
+      tradeLog={tradeLog}
       positions={positions}
       paperStatus={paperStatus}
       onRefreshPaper={refreshPaper}

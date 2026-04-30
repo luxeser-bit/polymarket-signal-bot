@@ -23,6 +23,13 @@ from .analytics import (
 from .backtest import BacktestConfig, run_backtest
 from .bulk_sync import BulkSync, BulkSyncConfig
 from .cohorts import CohortConfig, format_cohort_summary, wallet_cohort_report
+from .consensus_engine import (
+    ConsensusConfig,
+    consensus_filter_signals,
+    consensus_runtime_summary,
+    generate_strategy_signals,
+    persist_consensus_decisions,
+)
 from .dashboard import serve_dashboard
 from .demo import demo_trades, demo_wallets
 from .features import build_decision_features, format_feature_summary
@@ -40,7 +47,7 @@ from .policy_optimizer import (
     run_policy_optimizer_from_db,
 )
 from .scoring import score_wallets
-from .signals import SignalConfig, generate_signals
+from .signals import SignalConfig
 from .storage import DEFAULT_DB_PATH, Store
 from .streaming import MARKET_WS_URL, MissingWebsocketError, StreamConfig, StreamProcessor, missing_websocket_message
 from .taxonomy import market_category, market_category_label
@@ -1459,7 +1466,7 @@ def run_scan(args: argparse.Namespace, store: Store):
         "signal_policy_active",
         f"enabled={int(policy_enabled)} mode={policy_mode} learning={int(learning_enabled)}",
     )
-    signals = generate_signals(
+    signals = generate_strategy_signals(
         recent_trades,
         score_map,
         config,
@@ -1467,6 +1474,21 @@ def run_scan(args: argparse.Namespace, store: Store):
         wallet_cohorts=wallet_cohorts,
         wallet_outcomes=wallet_outcomes,
     )
+    signals, consensus_decisions = consensus_filter_signals(
+        signals,
+        recent_trades=recent_trades,
+        scores=score_map,
+        order_books=order_books,
+        config=ConsensusConfig(
+            min_strategy_confidence=args.min_wallet_score,
+            max_spread=args.max_spread,
+            min_liquidity_score=args.min_liquidity_score,
+            min_depth_usdc=args.min_depth_usdc,
+            max_wallet_trades_per_day=args.max_wallet_trades_per_day,
+        ),
+    )
+    persist_consensus_decisions(store.conn, consensus_decisions)
+    store.set_runtime_state("consensus_last_summary", consensus_runtime_summary(consensus_decisions))
     store.insert_signals(signals)
     broker = PaperBroker(store, risk_config=_risk_config_from_args(args), exit_config=_exit_config_from_args(args))
     broker.record_signal_created(signals)

@@ -309,6 +309,34 @@ class Store:
             CREATE INDEX IF NOT EXISTS idx_signal_reviews_status
                 ON signal_reviews(status, updated_at DESC);
 
+            CREATE TABLE IF NOT EXISTS consensus_votes (
+                signal_id TEXT PRIMARY KEY,
+                decided_at INTEGER NOT NULL,
+                final_decision TEXT NOT NULL,
+                strategist_verdict TEXT NOT NULL,
+                strategist_confidence REAL NOT NULL,
+                strategist_reason TEXT NOT NULL DEFAULT '',
+                skeptic_verdict TEXT NOT NULL,
+                skeptic_confidence REAL NOT NULL,
+                skeptic_reason TEXT NOT NULL DEFAULT '',
+                action TEXT NOT NULL DEFAULT '',
+                wallet TEXT NOT NULL DEFAULT '',
+                wallet_score REAL NOT NULL DEFAULT 0,
+                condition_id TEXT NOT NULL DEFAULT '',
+                asset TEXT NOT NULL DEFAULT '',
+                outcome TEXT NOT NULL DEFAULT '',
+                title TEXT NOT NULL DEFAULT '',
+                signal_confidence REAL NOT NULL DEFAULT 0,
+                suggested_price REAL NOT NULL DEFAULT 0,
+                size_usdc REAL NOT NULL DEFAULT 0,
+                reason TEXT NOT NULL DEFAULT '',
+                metadata_json TEXT NOT NULL DEFAULT ''
+            );
+            CREATE INDEX IF NOT EXISTS idx_consensus_votes_time
+                ON consensus_votes(decided_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_consensus_votes_final
+                ON consensus_votes(final_decision, decided_at DESC);
+
             CREATE TABLE IF NOT EXISTS wallet_sync_state (
                 wallet TEXT PRIMARY KEY,
                 last_synced_at INTEGER NOT NULL DEFAULT 0,
