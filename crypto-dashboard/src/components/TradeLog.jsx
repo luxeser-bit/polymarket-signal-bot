@@ -54,6 +54,11 @@ export default function TradeLog({ data }) {
           <TapeStat label="wins" value={numberFull(filteredRows.filter((row) => Number(row.pnl || 0) > 0).length)} />
           <TapeStat label="losses" value={numberFull(filteredRows.filter((row) => Number(row.pnl || 0) < 0).length)} />
         </div>
+        {data?.error ? (
+          <div className="mt-3 border border-red-400/40 bg-red-500/10 px-3 py-2 text-xs uppercase text-red-200">
+            {data.error}
+          </div>
+        ) : null}
       </div>
 
       <div className="max-h-[420px] overflow-auto px-3 py-2">

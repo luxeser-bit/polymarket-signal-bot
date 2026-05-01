@@ -239,11 +239,12 @@ def create_app() -> Any:
     @api.get("/system/status")
     async def system_status() -> dict[str, Any]:
         settings = settings_from_env()
-        return {"components": cached_component_statuses(settings), "time": int(time.time())}
+        components = await asyncio.to_thread(cached_component_statuses, settings)
+        return {"components": components, "time": int(time.time())}
 
     @api.get("/api/metrics")
     async def api_metrics() -> dict[str, Any]:
-        return indexer_metrics(settings_from_env())
+        return await asyncio.to_thread(indexer_metrics, settings_from_env())
 
     @api.get("/api/indexer/progress")
     async def api_indexer_progress() -> dict[str, Any]:
@@ -251,11 +252,11 @@ def create_app() -> Any:
 
     @api.get("/api/wallets")
     async def api_wallets() -> dict[str, Any]:
-        return wallet_metrics(settings_from_env())
+        return await asyncio.to_thread(wallet_metrics, settings_from_env())
 
     @api.get("/api/consensus")
     async def api_consensus() -> dict[str, Any]:
-        return consensus_snapshot(settings_from_env())
+        return await asyncio.to_thread(consensus_snapshot, settings_from_env())
 
     @api.post("/api/training/start")
     async def training_start(request: TrainingStartRequest | None = Body(default=None)) -> dict[str, Any]:
@@ -274,11 +275,11 @@ def create_app() -> Any:
 
     @api.get("/api/training/status")
     async def training_status() -> dict[str, Any]:
-        return training_status_snapshot(settings_from_env())
+        return await asyncio.to_thread(training_status_snapshot, settings_from_env())
 
     @api.get("/api/positions")
     async def api_positions() -> dict[str, Any]:
-        return positions_snapshot(settings_from_env())
+        return await asyncio.to_thread(positions_snapshot, settings_from_env())
 
     @api.get("/api/orderbook/{market_id}")
     async def api_orderbook(market_id: str) -> dict[str, Any]:
@@ -286,7 +287,8 @@ def create_app() -> Any:
 
     @api.get("/api/trade_log")
     async def api_trade_log(limit: int = 250, market: str = "", date_from: int = 0, date_to: int = 0) -> dict[str, Any]:
-        return trade_log_snapshot(
+        return await asyncio.to_thread(
+            trade_log_snapshot,
             settings_from_env(),
             limit=limit,
             market=market,
@@ -296,7 +298,8 @@ def create_app() -> Any:
 
     @api.get("/api/equity")
     async def api_equity(timeframe_seconds: int = 300, max_points: int = 360) -> dict[str, Any]:
-        return equity_snapshot(
+        return await asyncio.to_thread(
+            equity_snapshot,
             settings_from_env(),
             timeframe_seconds=timeframe_seconds,
             max_points=max_points,
@@ -318,7 +321,7 @@ def create_app() -> Any:
 
     @api.get("/api/paper/status")
     async def paper_status() -> dict[str, Any]:
-        return paper_status_snapshot(settings_from_env())
+        return await asyncio.to_thread(paper_status_snapshot, settings_from_env())
 
     @api.websocket("/ws/live")
     async def ws_live(websocket: WebSocket) -> None:
@@ -334,7 +337,7 @@ def create_app() -> Any:
                 except TimeoutError:
                     payload = {"error": "live payload timeout", "time": int(time.time())}
                 await websocket.send_json(payload)
-                await asyncio.sleep(0.5)
+                await asyncio.sleep(1.5)
         except WebSocketDisconnect:
             return
         except Exception as exc:  # noqa: BLE001 - keep the server process alive.
@@ -2329,7 +2332,7 @@ def live_payload(settings: ServerSettings) -> dict[str, Any]:
     payload = build_live_payload(settings)
     with LIVE_PAYLOAD_LOCK:
         LIVE_PAYLOAD_CACHE["payload"] = dict(payload)
-        LIVE_PAYLOAD_CACHE["expires_at"] = now + 1.0
+        LIVE_PAYLOAD_CACHE["expires_at"] = now + 3.0
     return payload
 
 

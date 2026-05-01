@@ -111,10 +111,13 @@ export default function App() {
       return payload;
     } catch (err) {
       const message = `Trade log unavailable: ${err.message || err}`;
-      rememberError(message);
-      throw err;
+      setTradeLog((current) => ({
+        ...(current || {}),
+        error: message,
+      }));
+      return null;
     }
-  }, [rememberError]);
+  }, []);
 
   const refreshIndexerProgress = useCallback(async () => {
     try {
