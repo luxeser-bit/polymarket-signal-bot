@@ -152,11 +152,15 @@ export default function App() {
     if (!live) return metrics;
     const liveIndexerRunning = Boolean(live.components?.indexer?.running);
     const liveIndexerStalled = Boolean(live.components?.indexer?.stalled);
+    const rawEvents = Math.max(Number(live.raw_events || 0), Number(metrics?.raw_events || 0));
+    const lastBlock = Math.max(Number(live.last_block || 0), Number(metrics?.last_block || 0));
+    const progress = Math.max(Number(live.progress || 0), Number(metrics?.progress || 0), rawEvents / 86000000);
     return {
       ...(metrics || {}),
-      raw_events: live.raw_events ?? metrics?.raw_events,
-      last_block: live.last_block ?? metrics?.last_block,
+      raw_events: rawEvents,
+      last_block: lastBlock,
       blocks_per_second: liveIndexerRunning && !liveIndexerStalled ? live.indexer_speed ?? metrics?.blocks_per_second : 0,
+      progress,
       running: liveIndexerRunning,
       stalled: liveIndexerStalled,
       health: live.components?.indexer?.health ?? metrics?.health,

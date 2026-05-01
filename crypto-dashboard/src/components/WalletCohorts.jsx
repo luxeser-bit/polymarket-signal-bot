@@ -12,7 +12,7 @@ const COHORTS = [
 ];
 const TARGET_WALLETS = 14000;
 
-export default function WalletCohorts({ data, training, onRefreshTraining, onRefreshWallets }) {
+export default function WalletCohorts({ data, metrics, training, onRefreshTraining, onRefreshWallets }) {
   const [loading, setLoading] = useState(false);
   const [sampleMode, setSampleMode] = useState(false);
   const counts = data?.counts || {};
@@ -32,6 +32,9 @@ export default function WalletCohorts({ data, training, onRefreshTraining, onRef
   const exitRows = Array.isArray(data?.exit_examples?.examples) ? data.exit_examples.examples : [];
   const modelMetrics = data?.model_metrics || {};
   const scoredWallets = Number(data?.scored_wallets || 0);
+  const currentRawRows = Number(metrics?.raw_events || data?.raw_transactions || 0);
+  const trainedRawRows = Number(lastRun?.raw_transactions || 0);
+  const newRowsSinceTraining = Math.max(0, currentRawRows - trainedRawRows);
   const smartFlowWallets = Number(counts.STABLE || 0) + Number(counts.CANDIDATE || 0);
   const walletProgress = Math.min(1, smartFlowWallets / TARGET_WALLETS);
   const walletProgressPct = walletProgress * 100;
@@ -110,11 +113,17 @@ export default function WalletCohorts({ data, training, onRefreshTraining, onRef
             <span className={trainingRunning ? 'text-good' : 'text-slate-500'}>
               {trainingRunning ? `Running ${secondsToDuration(training?.uptime_seconds || 0)}` : 'Idle'}
             </span>
+            {currentRawRows ? (
+              <span> - current {numberFull(currentRawRows)} rows</span>
+            ) : null}
             {lastRun?.updated_at ? (
-              <span> - last {timestampLabel(lastRun.updated_at)} - {numberFull(lastRun.raw_transactions || 0)} rows</span>
+              <span> - trained {timestampLabel(lastRun.updated_at)} on {numberFull(trainedRawRows)} rows</span>
             ) : (
               <span> - no training run yet</span>
             )}
+            {newRowsSinceTraining > 0 ? (
+              <span> - +{numberFull(newRowsSinceTraining)} new</span>
+            ) : null}
             <span> - exit examples {numberFull(exitExamples)}</span>
           </div>
         </div>
@@ -190,7 +199,7 @@ export default function WalletCohorts({ data, training, onRefreshTraining, onRef
           const sourceRows = Array.isArray(cohortWallets[name])
             ? cohortWallets[name]
             : topWallets.filter((wallet) => (wallet.cohort || wallet.status || 'NOISE') === name);
-          const rows = sourceRows.slice(0, 5);
+          const rows = sourceRows.slice(0, 50);
           return (
             <div key={name} className="min-h-[136px] rounded-lg border border-slate-700/70 bg-slate-950/40 p-3">
               <div className="mb-2 flex items-center justify-between gap-3">
@@ -200,7 +209,7 @@ export default function WalletCohorts({ data, training, onRefreshTraining, onRef
                 </div>
               </div>
               {rows.length ? (
-                <div className="space-y-1.5">
+                <div className="max-h-44 space-y-1.5 overflow-auto pr-1">
                   {rows.map((wallet) => (
                     <div key={wallet.user_address || wallet.wallet} className="grid grid-cols-[1fr_auto_auto] gap-2 text-xs">
                       <span className="truncate text-slate-300">{shortAddress(wallet.user_address || wallet.wallet)}</span>

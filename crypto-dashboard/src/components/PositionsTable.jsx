@@ -2,7 +2,7 @@ import { useMemo } from 'react';
 import { FiList } from 'react-icons/fi';
 import { money, numberFull, secondsToDuration, shortAddress } from '../utils/format';
 
-export default function PositionsTable({ data }) {
+export default function PositionsTable({ data, onSelectMarket, selectedMarketId = '' }) {
   const rows = useMemo(() => {
     const positions = Array.isArray(data?.open_positions) ? data.open_positions : [];
     return positions
@@ -48,7 +48,12 @@ export default function PositionsTable({ data }) {
           </thead>
           <tbody>
             {rows.map((row) => (
-              <tr key={row.id} className={`trade-tape-row ${rowClass(row)}`}>
+              <tr
+                key={row.id}
+                className={`trade-tape-row cursor-pointer ${selectedMarketId && selectedMarketId === (row.asset || row.marketId) ? 'bg-cyanLive/[0.08]' : rowClass(row)}`}
+                onClick={() => onSelectMarket?.(row)}
+                title="Load order book depth"
+              >
                 <td className="border-b border-slate-800/90 py-1.5 pr-3">
                   <div className="flex min-w-0 items-center gap-2">
                     <span className="text-slate-500">{row.outcome || 'POS'}</span>

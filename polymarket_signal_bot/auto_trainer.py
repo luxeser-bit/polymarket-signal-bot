@@ -148,7 +148,9 @@ def train_exit_model(
     examples_path: str | Path = DEFAULT_EXAMPLES_PATH,
     limit: int | None = None,
 ) -> dict[str, Any]:
+    LOGGER.info("collecting strict BUY->SELL exit examples wallets=%s limit=%s", len(stable_wallets), limit)
     examples = _exit_examples(Path(db_path), stable_wallets=stable_wallets, limit=limit)
+    LOGGER.info("collected exit examples=%s", len(examples))
     model = _fit_exit_model(examples)
     stats = {**_exit_stats(examples), **_model_stats(model)}
     model_path = Path(model_path)
@@ -203,7 +205,7 @@ def _exit_examples(
             price,
             CASE WHEN price > 0 THEN ABS(amount) * price ELSE ABS(amount) END AS notional
         FROM raw_transactions
-        WHERE LOWER(user_address) IN ({placeholders})
+        WHERE user_address IN ({placeholders})
           AND market_id != ''
           AND event_type = 'OrderFilled'
           AND UPPER(side) IN ('BUY', 'SELL')
@@ -211,11 +213,25 @@ def _exit_examples(
           AND ABS(amount) > 0
           AND timestamp > 0
     ),
-    buys AS (
-        SELECT * FROM fills WHERE side = 'BUY'
+    ordered AS (
+        SELECT
+            *,
+            ROW_NUMBER() OVER fill_order AS fill_seq
+        FROM fills
+        WINDOW fill_order AS (
+            PARTITION BY wallet, market_id
+            ORDER BY timestamp, block_number, log_index, hash
+        )
     ),
-    sells AS (
-        SELECT * FROM fills WHERE side = 'SELL'
+    with_next_sell AS (
+        SELECT
+            *,
+            MIN(CASE WHEN side = 'SELL' THEN fill_seq END) OVER (
+                PARTITION BY wallet, market_id
+                ORDER BY fill_seq
+                ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+            ) AS next_sell_seq
+        FROM ordered
     ),
     pairs AS (
         SELECT
@@ -235,46 +251,14 @@ def _exit_examples(
             s.amount AS exit_amount,
             s.price AS exit_price,
             s.notional AS exit_notional
-        FROM buys b
-        JOIN sells s
+        FROM with_next_sell b
+        JOIN ordered s
           ON s.wallet = b.wallet
          AND s.market_id = b.market_id
-         AND (
-             s.timestamp > b.timestamp
-             OR (
-                 s.timestamp = b.timestamp
-                 AND (
-                     s.block_number > b.block_number
-                     OR (s.block_number = b.block_number AND s.log_index > b.log_index)
-                 )
-             )
-         )
-        WHERE NOT EXISTS (
-            SELECT 1
-            FROM sells closer
-            WHERE closer.wallet = b.wallet
-              AND closer.market_id = b.market_id
-              AND (
-                  closer.timestamp > b.timestamp
-                  OR (
-                      closer.timestamp = b.timestamp
-                      AND (
-                          closer.block_number > b.block_number
-                          OR (closer.block_number = b.block_number AND closer.log_index > b.log_index)
-                      )
-                  )
-              )
-              AND (
-                  closer.timestamp < s.timestamp
-                  OR (
-                      closer.timestamp = s.timestamp
-                      AND (
-                          closer.block_number < s.block_number
-                          OR (closer.block_number = s.block_number AND closer.log_index < s.log_index)
-                      )
-                  )
-              )
-        )
+         AND s.fill_seq = b.next_sell_seq
+        WHERE b.side = 'BUY'
+          AND s.side = 'SELL'
+          AND b.next_sell_seq IS NOT NULL
     ),
     examples AS (
         SELECT

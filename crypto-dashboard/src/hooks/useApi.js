@@ -8,7 +8,8 @@ export function apiUrl(path) {
 }
 
 export async function getJson(path, options = {}) {
-  const response = await fetch(apiUrl(path), {
+  const response = await fetchWithTimeout(apiUrl(path), {
+    timeoutMs: 30000,
     headers: { Accept: 'application/json' },
     ...options,
   });
@@ -18,19 +19,40 @@ export async function getJson(path, options = {}) {
   return response.json();
 }
 
-export async function postJson(path, body) {
-  const response = await fetch(apiUrl(path), {
+export async function postJson(path, body, options = {}) {
+  const response = await fetchWithTimeout(apiUrl(path), {
+    timeoutMs: 60000,
     method: 'POST',
     headers: {
       Accept: 'application/json',
       'Content-Type': 'application/json',
     },
     body: body === undefined ? undefined : JSON.stringify(body),
+    ...options,
   });
   if (!response.ok) {
     throw new Error(`${response.status} ${response.statusText}`);
   }
   return response.json();
+}
+
+async function fetchWithTimeout(url, options = {}) {
+  const { timeoutMs = 30000, ...fetchOptions } = options;
+  const controller = new AbortController();
+  const timeout = window.setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, {
+      ...fetchOptions,
+      signal: fetchOptions.signal || controller.signal,
+    });
+  } catch (err) {
+    if (err?.name === 'AbortError') {
+      throw new Error(`Request timed out after ${Math.round(timeoutMs / 1000)}s`);
+    }
+    throw err;
+  } finally {
+    window.clearTimeout(timeout);
+  }
 }
 
 export function useApiResource(path, { interval = 0, initialData = null } = {}) {

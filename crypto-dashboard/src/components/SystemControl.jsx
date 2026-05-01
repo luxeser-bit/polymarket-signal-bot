@@ -20,10 +20,10 @@ export default function SystemControl({ status, onRefresh }) {
     try {
       await postJson(allRunning ? '/system/stop' : '/system/start');
       toast.success(allRunning ? 'System stopped' : 'System started');
-      await onRefresh?.();
     } catch (err) {
       toast.error(`System command failed: ${err.message || err}`);
     } finally {
+      await onRefresh?.().catch(() => {});
       setLoading(false);
     }
   }
@@ -33,10 +33,10 @@ export default function SystemControl({ status, onRefresh }) {
     try {
       await postJson(`/system/${key}/${running ? 'stop' : 'start'}`);
       toast.success(`${components[key]?.name || key} ${running ? 'stopped' : 'started'}`);
-      await onRefresh?.();
     } catch (err) {
       toast.error(`Component command failed: ${err.message || err}`);
     } finally {
+      await onRefresh?.().catch(() => {});
       setComponentLoading((items) => ({ ...items, [key]: false }));
     }
   }

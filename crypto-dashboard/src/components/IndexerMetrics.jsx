@@ -11,12 +11,16 @@ export default function IndexerMetrics({ metrics, live, progress: indexerProgres
     : indexerRunning
       ? 'running'
       : 'stopped';
-  const rawEvents = Number(live?.raw_events ?? metrics?.raw_events ?? 0);
-  const lastBlock = Number(indexerProgress?.last_block ?? live?.last_block ?? metrics?.last_block ?? 0);
+  const rawEvents = Math.max(Number(live?.raw_events || 0), Number(metrics?.raw_events || 0));
+  const lastBlock = Math.max(
+    Number(indexerProgress?.last_block || 0),
+    Number(live?.last_block || 0),
+    Number(metrics?.last_block || 0),
+  );
   const speed = indexerRunning
     ? Number(indexerProgress?.speed_blocks_per_second ?? live?.indexer_speed ?? metrics?.blocks_per_second ?? 0)
     : 0;
-  const progress = clamp(metrics?.progress ?? rawEvents / TARGET);
+  const progress = clamp(Math.max(Number(metrics?.progress || 0), Number(live?.progress || 0), rawEvents / TARGET));
   const lastBlockDate = formatBlockDate(indexerProgress?.last_block_date);
   const eta = indexerRunning ? formatEta(indexerProgress?.estimated_completion_seconds) : '-';
 

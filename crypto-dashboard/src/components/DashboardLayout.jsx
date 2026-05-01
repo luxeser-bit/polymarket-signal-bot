@@ -1,4 +1,5 @@
 import { Toaster } from 'react-hot-toast';
+import { useEffect, useMemo, useState } from 'react';
 import { FiActivity } from 'react-icons/fi';
 import LiveWebSocket from './LiveWebSocket';
 import SystemControl from './SystemControl';
@@ -7,6 +8,7 @@ import WalletCohorts from './WalletCohorts';
 import ConsensusVotes from './ConsensusVotes';
 import TradeLog from './TradeLog';
 import PositionsTable from './PositionsTable';
+import OrderBookDepth from './OrderBookDepth';
 import EquityChart from './EquityChart';
 import PaperTradingControl from './PaperTradingControl';
 import { numberFull } from '../utils/format';
@@ -44,6 +46,19 @@ export default function DashboardLayout({
   );
   const tradesCount = Number(metrics?.raw_events || live?.raw_events || 0);
   const runwayProgressWidth = systemUptimeSeconds > 0 ? Math.max(0.6, runwayProgress * 100) : 0;
+  const firstPositionMarket = useMemo(() => {
+    const row = Array.isArray(positions?.open_positions) ? positions.open_positions[0] : null;
+    if (!row) return null;
+    return orderBookMarketFromPosition(row);
+  }, [positions]);
+  const [selectedOrderBookMarket, setSelectedOrderBookMarket] = useState(null);
+  useEffect(() => {
+    if (!selectedOrderBookMarket && firstPositionMarket) {
+      setSelectedOrderBookMarket(firstPositionMarket);
+    }
+  }, [firstPositionMarket, selectedOrderBookMarket]);
+  const activeOrderBookMarket = selectedOrderBookMarket || firstPositionMarket;
+  const activeOrderBookKey = activeOrderBookMarket?.asset || activeOrderBookMarket?.marketId || '';
 
   return (
     <div className="terminal-screen min-h-screen px-1 py-4 lg:px-2">
@@ -94,11 +109,16 @@ export default function DashboardLayout({
         </section>
 
         <section className="col-span-12 2xl:col-span-7">
-          <EquityChart history={equityHistory} live={live} />
+          <EquityChart
+            history={equityHistory}
+            live={live}
+            orderBookPanel={<OrderBookDepth market={activeOrderBookMarket} embedded />}
+          />
         </section>
         <section className="col-span-12 2xl:col-span-5">
           <WalletCohorts
             data={wallets}
+            metrics={metrics}
             training={trainingStatus}
             onRefreshTraining={onRefreshTraining}
             onRefreshWallets={onRefreshData}
@@ -114,9 +134,23 @@ export default function DashboardLayout({
         </section>
 
         <section className="col-span-12">
-          <PositionsTable data={positions} />
+          <PositionsTable
+            data={positions}
+            selectedMarketId={activeOrderBookKey}
+            onSelectMarket={(row) => setSelectedOrderBookMarket(orderBookMarketFromPosition(row))}
+          />
         </section>
       </main>
     </div>
   );
+}
+
+function orderBookMarketFromPosition(row) {
+  return {
+    id: row.id || row.position_id || '',
+    asset: row.asset || '',
+    marketId: row.marketId || row.market_id || row.condition_id || '',
+    market: row.market || row.title || row.market_id || row.asset || '',
+    outcome: row.outcome || '',
+  };
 }

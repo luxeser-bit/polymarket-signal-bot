@@ -25,7 +25,7 @@ const TIMEFRAMES = [
   [7 * 24 * 3600, '7d'],
 ];
 
-export default function EquityChart({ history, live }) {
+export default function EquityChart({ history, live, orderBookPanel = null }) {
   const [timeframe, setTimeframe] = useState(5 * 60);
   const [equity, setEquity] = useState(null);
 
@@ -138,6 +138,11 @@ export default function EquityChart({ history, live }) {
           </div>
         </div>
       </div>
+      {orderBookPanel ? (
+        <div className="mt-4">
+          {orderBookPanel}
+        </div>
+      ) : null}
       <div className="mt-3 text-xs text-slate-500">
         Last update {timestampLabel(equity?.updated_at || live?.time)}
       </div>

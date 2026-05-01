@@ -114,7 +114,7 @@ class IndexerConfig:
     sync: bool = False
     dry_run: bool = False
     batch_size: int = 1_000
-    max_workers: int = 5
+    max_workers: int = 2
     block_chunk_size: int = 100
     min_log_chunk_size: int = 10
     poll_seconds: float = 12.0
@@ -172,6 +172,9 @@ class IndexerStore:
         self.conn = sqlite3.connect(self.path, timeout=30)
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA journal_mode=WAL")
+        self.conn.execute("PRAGMA synchronous=NORMAL")
+        self.conn.execute("PRAGMA temp_store=MEMORY")
+        self.conn.execute("PRAGMA cache_size=-200000")
         self.conn.execute("PRAGMA busy_timeout=30000")
 
     def __enter__(self) -> "IndexerStore":
@@ -713,7 +716,7 @@ class PolygonEventIndexer:
             logs.extend(contract_logs)
 
         block_numbers = sorted({hex_to_int(log.get("blockNumber", "0x0")) for log in logs})
-        blocks = [await rpc.get_block(block_number) for block_number in block_numbers]
+        blocks = await self._load_blocks(rpc, block_numbers)
         block_map = {block.number: block for block in blocks}
         tx_condition_ids = await self._load_tx_condition_ids(rpc, logs)
         rows: list[RawTransaction] = []
@@ -729,6 +732,18 @@ class PolygonEventIndexer:
             rows.extend(decoded)
         rows.sort(key=lambda row: (row.block_number, row.log_index, row.hash))
         return start_block, end_block, rows, blocks
+
+    async def _load_blocks(self, rpc: PolygonRpcClient, block_numbers: Sequence[int]) -> list[BlockInfo]:
+        if not block_numbers:
+            return []
+        limit = max(1, self.config.max_workers * 4)
+        semaphore = asyncio.Semaphore(limit)
+
+        async def load(block_number: int) -> BlockInfo:
+            async with semaphore:
+                return await rpc.get_block(block_number)
+
+        return list(await asyncio.gather(*(load(block_number) for block_number in block_numbers)))
 
     async def _fetch_logs_for_contract(
         self,
@@ -778,16 +793,27 @@ class PolygonEventIndexer:
             }
         )
         tx_hashes = [tx_hash for tx_hash in tx_hashes if tx_hash]
-        condition_ids: dict[str, str] = {}
-        for tx_hash in tx_hashes:
-            try:
+        limit = max(1, self.config.max_workers * 4)
+        semaphore = asyncio.Semaphore(limit)
+
+        async def load(tx_hash: str) -> tuple[str, str]:
+            async with semaphore:
                 tx = await rpc.get_transaction(tx_hash)
-            except Exception as exc:  # noqa: BLE001 - missing tx input falls back to tokenId.
-                LOGGER.debug("Failed to load transaction %s for conditionId: %s", tx_hash, exc)
-                continue
             condition_id = condition_id_from_tx_input(str((tx or {}).get("input") or ""))
+            return tx_hash, condition_id
+
+        condition_ids: dict[str, str] = {}
+        results = await asyncio.gather(
+            *(load(tx_hash) for tx_hash in tx_hashes),
+            return_exceptions=True,
+        )
+        for tx_hash, result in zip(tx_hashes, results, strict=False):
+            if isinstance(result, Exception):
+                LOGGER.debug("Failed to load transaction %s for conditionId: %s", tx_hash, result)
+                continue
+            loaded_hash, condition_id = result
             if condition_id:
-                condition_ids[tx_hash] = condition_id
+                condition_ids[loaded_hash] = condition_id
         return condition_ids
 
     def _log_order_fill_sample(self, row: RawTransaction) -> None:
@@ -1555,7 +1581,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--max-workers",
         type=int,
-        default=int(os.getenv("MAX_WORKERS", "5")),
+        default=int(os.getenv("MAX_WORKERS", "2")),
     )
     parser.add_argument(
         "--rpc-rps",
@@ -1572,7 +1598,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--min-log-chunk-size",
         type=int,
-        default=int(os.getenv("MIN_LOG_CHUNK_SIZE", "5")),
+        default=max(10, int(os.getenv("MIN_LOG_CHUNK_SIZE", "10"))),
         help="Smallest block range after adaptive eth_getLogs splitting.",
     )
     parser.add_argument(
@@ -1607,7 +1633,7 @@ def config_from_args(args: argparse.Namespace) -> IndexerConfig:
         batch_size=int(args.batch_size),
         max_workers=max(1, int(args.max_workers)),
         block_chunk_size=max(1, int(args.chunk_size)),
-        min_log_chunk_size=max(1, int(args.min_log_chunk_size)),
+        min_log_chunk_size=max(10, int(args.min_log_chunk_size)),
         poll_seconds=float(args.poll_seconds),
         default_start_block=max(0, int(args.default_start_block)),
         rpc_rps=max(0.0, float(args.rpc_rps)),

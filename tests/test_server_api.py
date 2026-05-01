@@ -116,6 +116,65 @@ class ServerApiTests(unittest.TestCase):
         self.assertEqual(snapshot["open_positions_count"], 1)
         self.assertEqual(snapshot["total_positions"], 2)
 
+    def test_orderbook_snapshot_falls_back_to_local_depth(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "polysignal.db"
+            conn = sqlite3.connect(db_path)
+            conn.execute(
+                """
+                CREATE TABLE order_books_latest (
+                    asset TEXT,
+                    market TEXT,
+                    raw_json TEXT,
+                    best_bid REAL,
+                    best_ask REAL,
+                    mid REAL,
+                    spread REAL,
+                    bid_depth_usdc REAL,
+                    ask_depth_usdc REAL,
+                    timestamp INTEGER,
+                    updated_at INTEGER
+                )
+                """
+            )
+            conn.execute(
+                "INSERT INTO order_books_latest VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    "asset-1",
+                    "market-1",
+                    json.dumps(
+                        {
+                            "market": "market-1",
+                            "asset_id": "asset-1",
+                            "timestamp": 1700000000,
+                            "bids": [{"price": "0.40", "size": "100"}],
+                            "asks": [{"price": "0.45", "size": "80"}],
+                        }
+                    ),
+                    0.4,
+                    0.45,
+                    0.425,
+                    0.05,
+                    40,
+                    36,
+                    1700000000,
+                    1700000000,
+                ),
+            )
+            conn.commit()
+            conn.close()
+            settings = api.ServerSettings(main_db=db_path)
+
+            with patch.object(api.PolymarketClient, "order_book", side_effect=api.ApiError("offline")):
+                snapshot = api.orderbook_snapshot(settings, "asset-1")
+
+        self.assertEqual(snapshot["source"], "sqlite")
+        self.assertEqual(snapshot["asset"], "asset-1")
+        self.assertEqual(snapshot["market_id"], "market-1")
+        self.assertEqual(snapshot["spread"], 0.05)
+        self.assertEqual(snapshot["total_bid_depth"], 40)
+        self.assertEqual(snapshot["total_ask_depth"], 36)
+
     def test_wallet_metrics_reads_scores_and_cohorts(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             db_path = Path(tmp) / "indexer.db"

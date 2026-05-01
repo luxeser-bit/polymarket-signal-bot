@@ -57,6 +57,7 @@ except ModuleNotFoundError:  # pragma: no cover - optional for indexer progress 
 
 from polymarket_signal_bot.cohorts import load_wallet_cohorts
 from polymarket_signal_bot.consensus_engine import consensus_row_to_dict
+from polymarket_signal_bot.api import ApiConfig, ApiError, PolymarketClient
 from polymarket_signal_bot.live_paper_runner import _portfolio_snapshot
 from polymarket_signal_bot.monitor import Monitor, MonitorConfig
 from polymarket_signal_bot.scoring import calculate_all
@@ -278,6 +279,10 @@ def create_app() -> Any:
     @api.get("/api/positions")
     async def api_positions() -> dict[str, Any]:
         return positions_snapshot(settings_from_env())
+
+    @api.get("/api/orderbook/{market_id}")
+    async def api_orderbook(market_id: str) -> dict[str, Any]:
+        return await asyncio.to_thread(orderbook_snapshot, settings_from_env(), market_id)
 
     @api.get("/api/trade_log")
     async def api_trade_log(limit: int = 250, market: str = "", date_from: int = 0, date_to: int = 0) -> dict[str, Any]:
@@ -1615,6 +1620,310 @@ def position_hold_status(
     if price_age_seconds >= max(1, stale_price_hours) * 3600:
         return "STALE PRICE"
     return "LIVE"
+
+
+def orderbook_snapshot(settings: ServerSettings, market_id: str) -> dict[str, Any]:
+    identifier = str(market_id or "").strip()
+    result: dict[str, Any] = {
+        "market_id": identifier,
+        "asset": "",
+        "title": "",
+        "outcome": "",
+        "bids": [],
+        "asks": [],
+        "spread": 0.0,
+        "mid_price": 0.0,
+        "total_bid_depth": 0.0,
+        "total_ask_depth": 0.0,
+        "low_liquidity": False,
+        "source": "",
+        "updated_at": 0,
+        "error": "",
+    }
+    if not identifier:
+        result["error"] = "market_id is required"
+        return result
+
+    local = resolve_orderbook_reference(settings.main_db, identifier) or {}
+    asset = str(local.get("asset") or identifier)
+    result.update(
+        {
+            "market_id": str(local.get("market_id") or local.get("market") or identifier),
+            "asset": asset,
+            "title": str(local.get("title") or ""),
+            "outcome": str(local.get("outcome") or ""),
+        }
+    )
+
+    live_error = ""
+    if asset:
+        try:
+            client = PolymarketClient(
+                ApiConfig(
+                    clob_base=os.environ.get("POLYMARKET_CLOB_BASE", "https://clob.polymarket.com"),
+                    timeout_seconds=_env_int("POLYMARKET_CLOB_TIMEOUT", 8),
+                    min_delay_seconds=0.0,
+                )
+            )
+            payload = client.order_book(asset)
+            if isinstance(payload, dict) and (payload.get("bids") or payload.get("asks")):
+                return normalize_orderbook_payload(
+                    payload,
+                    fallback=result,
+                    source="clob",
+                    low_liquidity_threshold=_env_float("ORDERBOOK_LOW_LIQUIDITY_USD", 5000.0),
+                )
+        except (ApiError, OSError, RuntimeError, ValueError) as exc:
+            live_error = str(exc)
+
+    raw_payload = local.get("raw_payload")
+    if isinstance(raw_payload, dict):
+        snapshot = normalize_orderbook_payload(
+            raw_payload,
+            fallback=result,
+            source="sqlite",
+            low_liquidity_threshold=_env_float("ORDERBOOK_LOW_LIQUIDITY_USD", 5000.0),
+        )
+        if live_error:
+            snapshot["warning"] = f"live CLOB unavailable: {live_error[:180]}"
+        return snapshot
+
+    if local:
+        synthetic = synthetic_orderbook_payload(local)
+        snapshot = normalize_orderbook_payload(
+            synthetic,
+            fallback=result,
+            source="sqlite_summary",
+            low_liquidity_threshold=_env_float("ORDERBOOK_LOW_LIQUIDITY_USD", 5000.0),
+        )
+        if live_error:
+            snapshot["warning"] = f"live CLOB unavailable: {live_error[:180]}"
+        return snapshot
+
+    result["error"] = live_error or "order book not found"
+    return result
+
+
+def resolve_orderbook_reference(db_path: Path, identifier: str) -> dict[str, Any] | None:
+    if not db_path.exists():
+        return None
+    with sqlite_connect(db_path) as conn:
+        has_order_books = table_exists(conn, "order_books_latest")
+        if has_order_books:
+            row = conn.execute(
+                """
+                SELECT ob.*, '' AS title, '' AS outcome, ob.market AS condition_id
+                FROM order_books_latest ob
+                WHERE ob.asset = ? OR ob.market = ?
+                ORDER BY ob.updated_at DESC
+                LIMIT 1
+                """,
+                (identifier, identifier),
+            ).fetchone()
+            if row:
+                return orderbook_local_row(row)
+
+        if table_exists(conn, "paper_positions") and has_order_books:
+            row = conn.execute(
+                """
+                SELECT
+                    p.asset,
+                    p.condition_id,
+                    p.title,
+                    p.outcome,
+                    ob.*
+                FROM paper_positions p
+                LEFT JOIN order_books_latest ob ON ob.asset = p.asset
+                WHERE p.position_id = ? OR p.asset = ? OR p.condition_id = ?
+                ORDER BY p.opened_at DESC
+                LIMIT 1
+                """,
+                (identifier, identifier, identifier),
+            ).fetchone()
+            if row:
+                return orderbook_local_row(row)
+        elif table_exists(conn, "paper_positions"):
+            row = conn.execute(
+                """
+                SELECT
+                    p.asset,
+                    p.condition_id,
+                    p.title,
+                    p.outcome,
+                    NULL AS market,
+                    NULL AS raw_json,
+                    NULL AS best_bid,
+                    NULL AS best_ask,
+                    NULL AS mid,
+                    NULL AS spread,
+                    NULL AS bid_depth_usdc,
+                    NULL AS ask_depth_usdc,
+                    NULL AS timestamp,
+                    NULL AS updated_at
+                FROM paper_positions p
+                WHERE p.position_id = ? OR p.asset = ? OR p.condition_id = ?
+                ORDER BY p.opened_at DESC
+                LIMIT 1
+                """,
+                (identifier, identifier, identifier),
+            ).fetchone()
+            if row:
+                return orderbook_local_row(row)
+
+        if table_exists(conn, "trades") and has_order_books:
+            row = conn.execute(
+                """
+                SELECT
+                    t.asset,
+                    t.condition_id,
+                    t.title,
+                    t.outcome,
+                    ob.*
+                FROM trades t
+                LEFT JOIN order_books_latest ob ON ob.asset = t.asset
+                WHERE t.asset = ? OR t.condition_id = ?
+                ORDER BY t.timestamp DESC
+                LIMIT 1
+                """,
+                (identifier, identifier),
+            ).fetchone()
+            if row:
+                return orderbook_local_row(row)
+        elif table_exists(conn, "trades"):
+            row = conn.execute(
+                """
+                SELECT
+                    t.asset,
+                    t.condition_id,
+                    t.title,
+                    t.outcome,
+                    NULL AS market,
+                    NULL AS raw_json,
+                    NULL AS best_bid,
+                    NULL AS best_ask,
+                    NULL AS mid,
+                    NULL AS spread,
+                    NULL AS bid_depth_usdc,
+                    NULL AS ask_depth_usdc,
+                    NULL AS timestamp,
+                    NULL AS updated_at
+                FROM trades t
+                WHERE t.asset = ? OR t.condition_id = ?
+                ORDER BY t.timestamp DESC
+                LIMIT 1
+                """,
+                (identifier, identifier),
+            ).fetchone()
+            if row:
+                return orderbook_local_row(row)
+    return None
+
+
+def orderbook_local_row(row: sqlite3.Row) -> dict[str, Any]:
+    raw_payload: dict[str, Any] | None = None
+    raw_text = str(row["raw_json"] or "") if "raw_json" in row.keys() else ""
+    if raw_text:
+        with contextlib.suppress(json.JSONDecodeError, TypeError):
+            payload = json.loads(raw_text)
+            if isinstance(payload, dict):
+                raw_payload = payload
+    return {
+        "asset": str(row["asset"] or ""),
+        "market_id": str(row["condition_id"] or row["market"] or ""),
+        "market": str(row["market"] or row["condition_id"] or ""),
+        "title": str(row["title"] or ""),
+        "outcome": str(row["outcome"] or ""),
+        "best_bid": _row_float(row, "best_bid"),
+        "best_ask": _row_float(row, "best_ask"),
+        "mid": _row_float(row, "mid"),
+        "spread": _row_float(row, "spread"),
+        "bid_depth_usdc": _row_float(row, "bid_depth_usdc"),
+        "ask_depth_usdc": _row_float(row, "ask_depth_usdc"),
+        "timestamp": _row_int(row, "timestamp") or _row_int(row, "updated_at"),
+        "raw_payload": raw_payload,
+    }
+
+
+def synthetic_orderbook_payload(local: dict[str, Any]) -> dict[str, Any]:
+    bid = float(local.get("best_bid") or 0.0)
+    ask = float(local.get("best_ask") or 0.0)
+    bid_depth = float(local.get("bid_depth_usdc") or 0.0)
+    ask_depth = float(local.get("ask_depth_usdc") or 0.0)
+    return {
+        "market": local.get("market_id") or local.get("market") or "",
+        "asset_id": local.get("asset") or "",
+        "timestamp": local.get("timestamp") or 0,
+        "bids": [{"price": bid, "size": bid_depth / bid if bid > 0 else 0.0}] if bid > 0 else [],
+        "asks": [{"price": ask, "size": ask_depth / ask if ask > 0 else 0.0}] if ask > 0 else [],
+    }
+
+
+def normalize_orderbook_payload(
+    payload: dict[str, Any],
+    *,
+    fallback: dict[str, Any],
+    source: str,
+    low_liquidity_threshold: float,
+) -> dict[str, Any]:
+    bids_all = parse_book_levels(payload.get("bids"), reverse=True)
+    asks_all = parse_book_levels(payload.get("asks"), reverse=False)
+    best_bid = max((level["price"] for level in bids_all), default=0.0)
+    best_ask = min((level["price"] for level in asks_all), default=0.0)
+    last_trade = _number_value(payload.get("last_trade_price"))
+    mid_price = (best_bid + best_ask) / 2 if best_bid > 0 and best_ask > 0 else last_trade or best_bid or best_ask
+    spread = best_ask - best_bid if best_bid > 0 and best_ask > 0 else 0.0
+    total_bid_depth = sum(level["notional"] for level in bids_all)
+    total_ask_depth = sum(level["notional"] for level in asks_all)
+    timestamp = normalize_orderbook_timestamp(payload.get("timestamp"))
+    return {
+        **fallback,
+        "market_id": str(payload.get("market") or fallback.get("market_id") or ""),
+        "asset": str(payload.get("asset_id") or payload.get("token_id") or fallback.get("asset") or ""),
+        "bids": bids_all[:20],
+        "asks": asks_all[:20],
+        "spread": round(max(0.0, spread), 6),
+        "mid_price": round(float(mid_price or 0.0), 6),
+        "total_bid_depth": round(total_bid_depth, 4),
+        "total_ask_depth": round(total_ask_depth, 4),
+        "low_liquidity": min(total_bid_depth, total_ask_depth) < low_liquidity_threshold,
+        "source": source,
+        "updated_at": timestamp,
+        "error": "",
+    }
+
+
+def parse_book_levels(levels: Any, *, reverse: bool) -> list[dict[str, float]]:
+    parsed: list[dict[str, float]] = []
+    if not isinstance(levels, list):
+        return parsed
+    for level in levels:
+        if isinstance(level, dict):
+            price = _number_value(level.get("price"))
+            size = _number_value(level.get("size"))
+        elif isinstance(level, (list, tuple)) and len(level) >= 2:
+            price = _number_value(level[0])
+            size = _number_value(level[1])
+        else:
+            continue
+        if price <= 0 or size <= 0:
+            continue
+        parsed.append({"price": round(price, 6), "size": round(size, 4), "notional": round(price * size, 4)})
+    return sorted(parsed, key=lambda item: item["price"], reverse=reverse)
+
+
+def normalize_orderbook_timestamp(value: Any) -> int:
+    timestamp = _number_value(value)
+    if timestamp > 10_000_000_000:
+        timestamp /= 1000
+    return int(timestamp or time.time())
+
+
+def _row_float(row: sqlite3.Row, key: str) -> float:
+    return float(row[key] or 0.0) if key in row.keys() else 0.0
+
+
+def _row_int(row: sqlite3.Row, key: str) -> int:
+    return int(row[key] or 0) if key in row.keys() else 0
 
 
 def equity_snapshot(
