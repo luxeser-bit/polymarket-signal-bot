@@ -71,7 +71,7 @@ PROCESS_LOCK = threading.RLock()
 PROCESS_REGISTRY: dict[str, "ManagedProcess"] = {}
 ADOPTED_PROCESS_REGISTRY: dict[str, "AdoptedProcess"] = {}
 COMPONENT_STATUS_CACHE: dict[str, Any] = {"components": None, "expires_at": 0.0}
-COMPONENT_STATUS_CACHE_SECONDS = 5.0
+COMPONENT_STATUS_CACHE_SECONDS = 30.0
 TRAINING_LOCK = threading.RLock()
 TRAINING_PROCESS: "ManagedTrainingProcess | None" = None
 METRICS_LOCK = threading.RLock()
@@ -779,11 +779,13 @@ def cached_component_statuses(settings: ServerSettings) -> dict[str, dict[str, A
         cached = COMPONENT_STATUS_CACHE.get("components")
         if cached is not None and float(COMPONENT_STATUS_CACHE.get("expires_at") or 0) > now:
             return dict(cached)
-    components = component_statuses(settings)
-    with PROCESS_LOCK:
+        # Process discovery is expensive on Windows because it falls back to
+        # PowerShell/CIM. Keep this inside the lock so a dashboard refresh does
+        # not fan out into many concurrent discovery subprocesses.
+        components = component_statuses(settings)
         COMPONENT_STATUS_CACHE["components"] = dict(components)
         COMPONENT_STATUS_CACHE["expires_at"] = now + COMPONENT_STATUS_CACHE_SECONDS
-    return components
+        return dict(components)
 
 
 def clear_component_status_cache() -> None:
