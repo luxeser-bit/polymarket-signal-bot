@@ -156,11 +156,13 @@ export default function App() {
     const liveIndexerRunning = Boolean(live.components?.indexer?.running);
     const liveIndexerStalled = Boolean(live.components?.indexer?.stalled);
     const rawEvents = Math.max(Number(live.raw_events || 0), Number(metrics?.raw_events || 0));
+    const duneOrderFilled = Math.max(Number(live.dune_orderfilled || 0), Number(metrics?.dune_orderfilled || 0));
     const lastBlock = Math.max(Number(live.last_block || 0), Number(metrics?.last_block || 0));
     const progress = Math.max(Number(live.progress || 0), Number(metrics?.progress || 0), rawEvents / 86000000);
     return {
       ...(metrics || {}),
       raw_events: rawEvents,
+      dune_orderfilled: duneOrderFilled,
       last_block: lastBlock,
       blocks_per_second: liveIndexerRunning && !liveIndexerStalled ? live.indexer_speed ?? metrics?.blocks_per_second : 0,
       progress,

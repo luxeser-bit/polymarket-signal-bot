@@ -12,6 +12,7 @@ dependencies = []
 analytics = ["duckdb>=1.0"]
 stream = ["websockets>=12.0"]
 indexer = ["httpx>=0.27", "eth-hash[pycryptodome]>=0.7", "clickhouse-driver>=0.2"]
+dune = ["httpx>=0.27", "python-dotenv>=1.0"]
 server = ["fastapi>=0.111", "uvicorn[standard]>=0.30", "python-dotenv>=1.0", "wsproto>=1.2", "web3>=6.20"]
 training = ["joblib>=1.3", "scikit-learn>=1.4"]
 all = [
@@ -20,9 +21,9 @@ all = [
     "httpx>=0.27",
     "eth-hash[pycryptodome]>=0.7",
     "clickhouse-driver>=0.2",
+    "python-dotenv>=1.0",
     "fastapi>=0.111",
     "uvicorn[standard]>=0.30",
-    "python-dotenv>=1.0",
     "wsproto>=1.2",
     "joblib>=1.3",
     "scikit-learn>=1.4",

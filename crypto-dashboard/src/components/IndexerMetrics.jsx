@@ -12,6 +12,7 @@ export default function IndexerMetrics({ metrics, live, progress: indexerProgres
       ? 'running'
       : 'stopped';
   const rawEvents = Math.max(Number(live?.raw_events || 0), Number(metrics?.raw_events || 0));
+  const duneOrderFilled = Math.max(Number(live?.dune_orderfilled || 0), Number(metrics?.dune_orderfilled || 0));
   const lastBlock = Math.max(
     Number(indexerProgress?.last_block || 0),
     Number(live?.last_block || 0),
@@ -34,10 +35,11 @@ export default function IndexerMetrics({ metrics, live, progress: indexerProgres
         <FiDatabase className="text-cyan-300" size={22} aria-hidden="true" />
       </div>
 
-      <div className="grid grid-cols-2 gap-3">
+      <div className="grid grid-cols-2 gap-3 xl:grid-cols-3">
         <Metric label="Raw events" value={numberFull(rawEvents)} />
         <Metric label="Last block" value={numberFull(lastBlock)} />
         <Metric label="Speed" value={`${speed.toFixed(2)} blk/s`} />
+        <Metric label="OrderFilled Dune" value={numberFull(duneOrderFilled)} />
         <Metric label="Target" value={numberCompact(TARGET, 1)} />
       </div>
 

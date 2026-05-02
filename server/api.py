@@ -82,7 +82,7 @@ METRICS_CURSOR: dict[str, float] = {
     "speed_at": 0.0,
 }
 METRICS_SPEED_STALE_SECONDS = 30.0
-INDEXER_COUNTER_CACHE: dict[str, Any] = {"snapshot": None, "expires_at": 0.0}
+INDEXER_COUNTER_CACHE: dict[str, Any] = {"snapshot": None, "expires_at": 0.0, "path": ""}
 INDEXER_COUNTER_CACHE_SECONDS = 2.0
 LIVE_PAYLOAD_CACHE: dict[str, Any] = {"payload": None, "expires_at": 0.0}
 LIVE_PAYLOAD_LOCK = threading.RLock()
@@ -995,17 +995,23 @@ def indexer_watchdog_status(
 
 
 def indexer_counter_snapshot(db_path: Path) -> dict[str, int]:
-    result = {"raw_events": 0, "last_block": 0, "updated_at": 0}
+    result = {"raw_events": 0, "dune_orderfilled": 0, "last_block": 0, "updated_at": 0}
     if not db_path.exists():
         return result
     now = time.time()
+    cache_path = str(db_path.resolve())
     with METRICS_LOCK:
         cached = INDEXER_COUNTER_CACHE.get("snapshot")
-        if cached is not None and float(INDEXER_COUNTER_CACHE.get("expires_at") or 0) > now:
+        if (
+            cached is not None
+            and INDEXER_COUNTER_CACHE.get("path") == cache_path
+            and float(INDEXER_COUNTER_CACHE.get("expires_at") or 0) > now
+        ):
             return dict(cached)
     try:
         with sqlite_connect(db_path) as conn:
             result["raw_events"] = raw_events_count(conn)
+            result["dune_orderfilled"] = counter_value(conn, "dune_orderfilled")
             if table_exists(conn, "indexer_state"):
                 row = conn.execute(
                     "SELECT last_block, updated_at FROM indexer_state ORDER BY updated_at DESC LIMIT 1"
@@ -1018,6 +1024,7 @@ def indexer_counter_snapshot(db_path: Path) -> dict[str, int]:
     with METRICS_LOCK:
         INDEXER_COUNTER_CACHE["snapshot"] = dict(result)
         INDEXER_COUNTER_CACHE["expires_at"] = now + INDEXER_COUNTER_CACHE_SECONDS
+        INDEXER_COUNTER_CACHE["path"] = cache_path
     return result
 
 
@@ -1141,6 +1148,7 @@ def indexer_metrics(settings: ServerSettings, *, include_process: bool = True) -
     stalled = bool(indexer_status.get("stalled"))
     snapshot = {
         "raw_events": 0,
+        "dune_orderfilled": 0,
         "last_block": 0,
         "blocks_per_second": 0.0,
         "progress": 0.0,
@@ -1159,6 +1167,7 @@ def indexer_metrics(settings: ServerSettings, *, include_process: bool = True) -
     try:
         counters = indexer_counter_snapshot(settings.indexer_db)
         snapshot["raw_events"] = int(counters.get("raw_events") or 0)
+        snapshot["dune_orderfilled"] = int(counters.get("dune_orderfilled") or 0)
         snapshot["last_block"] = int(counters.get("last_block") or 0)
         snapshot["updated_at"] = int(counters.get("updated_at") or 0)
         snapshot["progress"] = min(1.0, float(snapshot["raw_events"]) / TARGET_RAW_EVENTS)
@@ -2345,6 +2354,7 @@ def build_live_payload(settings: ServerSettings) -> dict[str, Any]:
     main_summary = main_paper_summary(settings)
     return {
         "raw_events": metrics["raw_events"],
+        "dune_orderfilled": metrics.get("dune_orderfilled", 0),
         "last_block": metrics["last_block"],
         "indexer_speed": metrics["blocks_per_second"],
         "progress": metrics["progress"],
@@ -2762,16 +2772,24 @@ def table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
 
 def raw_events_count(conn: sqlite3.Connection) -> int:
     if table_exists(conn, "indexer_counters"):
-        row = conn.execute(
-            "SELECT value FROM indexer_counters WHERE name = 'raw_events' LIMIT 1"
-        ).fetchone()
-        if row is not None:
-            return int(row["value"] or 0)
+        value = counter_value(conn, "raw_events")
+        if value > 0:
+            return value
     if table_exists(conn, "raw_transactions"):
         # Fallback for old databases before the indexer initializes counters.
         row = conn.execute("SELECT MAX(rowid) FROM raw_transactions").fetchone()
         return int(row[0] or 0)
     return 0
+
+
+def counter_value(conn: sqlite3.Connection, name: str) -> int:
+    if not table_exists(conn, "indexer_counters"):
+        return 0
+    row = conn.execute(
+        "SELECT value FROM indexer_counters WHERE name = ? LIMIT 1",
+        (name,),
+    ).fetchone()
+    return int(row["value"] or 0) if row is not None else 0
 
 
 def tail_file(path: Path, *, lines: int = 20) -> str:

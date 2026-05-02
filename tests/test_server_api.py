@@ -43,12 +43,19 @@ class ServerApiTests(unittest.TestCase):
             conn.executescript(
                 """
                 CREATE TABLE raw_transactions (hash TEXT PRIMARY KEY);
+                CREATE TABLE indexer_counters (
+                    name TEXT PRIMARY KEY,
+                    value INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL
+                );
                 CREATE TABLE indexer_state (
                     name TEXT PRIMARY KEY,
                     last_block INTEGER NOT NULL,
                     updated_at INTEGER NOT NULL
                 );
                 INSERT INTO raw_transactions(hash) VALUES ('0x1'), ('0x2');
+                INSERT INTO indexer_counters(name, value, updated_at)
+                    VALUES ('raw_events', 2, 1700000000), ('dune_orderfilled', 1, 1700000000);
                 INSERT INTO indexer_state(name, last_block, updated_at)
                     VALUES ('polygon', 123, 1700000000);
                 """
@@ -60,6 +67,7 @@ class ServerApiTests(unittest.TestCase):
                 metrics = api.indexer_metrics(settings)
 
         self.assertEqual(metrics["raw_events"], 2)
+        self.assertEqual(metrics["dune_orderfilled"], 1)
         self.assertEqual(metrics["last_block"], 123)
         self.assertGreater(metrics["progress"], 0)
 
