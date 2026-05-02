@@ -716,8 +716,14 @@ class PolygonEventIndexer:
             logs.extend(contract_logs)
 
         block_numbers = sorted({hex_to_int(log.get("blockNumber", "0x0")) for log in logs})
-        blocks = await self._load_blocks(rpc, block_numbers)
-        block_map = {block.number: block for block in blocks}
+        block_map = blocks_from_logs(logs)
+        missing_block_numbers = [
+            block_number for block_number in block_numbers if block_number not in block_map
+        ]
+        if missing_block_numbers:
+            fetched_blocks = await self._load_blocks(rpc, missing_block_numbers)
+            block_map.update({block.number: block for block in fetched_blocks})
+        blocks = [block_map[block_number] for block_number in block_numbers if block_number in block_map]
         tx_condition_ids = await self._load_tx_condition_ids(rpc, logs)
         rows: list[RawTransaction] = []
         for log in logs:
@@ -1432,6 +1438,32 @@ def hex_to_int(value: Any) -> int:
     if not text:
         return 0
     return int(text, 16) if text.startswith("0x") else int(text)
+
+
+def block_info_from_log(log: dict[str, Any]) -> BlockInfo | None:
+    """Build block metadata from Alchemy-enriched logs when blockTimestamp is present."""
+    try:
+        block_number = hex_to_int(log.get("blockNumber", "0x0"))
+        timestamp = hex_to_int(log.get("blockTimestamp", "0x0"))
+    except (TypeError, ValueError):
+        return None
+    if block_number <= 0 or timestamp <= 0:
+        return None
+    return BlockInfo(
+        number=block_number,
+        hash=str(log.get("blockHash") or ""),
+        timestamp=timestamp,
+    )
+
+
+def blocks_from_logs(logs: Sequence[dict[str, Any]]) -> dict[int, BlockInfo]:
+    """Use RPC log blockTimestamp fields to avoid one eth_getBlockByNumber per event block."""
+    block_map: dict[int, BlockInfo] = {}
+    for log in logs:
+        block = block_info_from_log(log)
+        if block is not None:
+            block_map[block.number] = block
+    return block_map
 
 
 def normalize_address(value: str) -> str:

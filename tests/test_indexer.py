@@ -239,6 +239,59 @@ class IndexerTests(unittest.TestCase):
 
 
 class AdaptiveLogFetchTests(unittest.IsolatedAsyncioTestCase):
+    async def test_index_chunk_uses_alchemy_log_timestamps_without_block_rpc(self) -> None:
+        to_address = "0x3333333333333333333333333333333333333333"
+
+        class FakeRpc:
+            async def get_logs(
+                self,
+                *,
+                address: str,
+                from_block: int,
+                to_block: int,
+                topics: list[str] | None = None,
+            ) -> list[dict[str, object]]:
+                return [
+                    {
+                        "address": address,
+                        "blockNumber": "0x64",
+                        "blockHash": "0xabc",
+                        "blockTimestamp": "0x65f0c480",
+                        "transactionHash": "0xtx",
+                        "logIndex": "0x1",
+                        "topics": [
+                            TRANSFER_SINGLE_TOPIC,
+                            _topic_address("0x4444444444444444444444444444444444444444"),
+                            _topic_address("0x0000000000000000000000000000000000000000"),
+                            _topic_address(to_address),
+                        ],
+                        "data": "0x" + _word(999) + _word(2_500_000),
+                    }
+                ]
+
+            async def get_block(self, block_number: int) -> BlockInfo:
+                raise AssertionError("eth_getBlockByNumber should not be called")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            contract = ContractSpec(
+                "ConditionalTokens",
+                "0x4d97dcd97ec945f40cf65f87097ace5ea0476045",
+                ("TransferSingle",),
+            )
+            with IndexerStore(Path(tmp) / "state.db") as store:
+                indexer = PolygonEventIndexer(
+                    IndexerConfig(rpc_url="http://rpc"),
+                    store=store,
+                    contracts=[contract],
+                )
+
+                _, _, rows, blocks = await indexer._index_chunk(FakeRpc(), 100, 100)
+
+        self.assertEqual(len(blocks), 1)
+        self.assertEqual(blocks[0], BlockInfo(100, "0xabc", 1710277760))
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].timestamp, 1710277760)
+
     async def test_fetch_logs_splits_rejected_ranges(self) -> None:
         class FakeRpc:
             def __init__(self) -> None:
