@@ -1,7 +1,7 @@
 import { FiDatabase } from 'react-icons/fi';
 import { clamp, numberCompact, numberFull, percent } from '../utils/format';
 
-const TARGET = 86000000;
+const FALLBACK_TARGET = 186000000;
 
 export default function IndexerMetrics({ metrics, live, progress: indexerProgress }) {
   const indexerStalled = Boolean(indexerProgress?.stalled ?? live?.components?.indexer?.stalled ?? metrics?.stalled);
@@ -12,6 +12,7 @@ export default function IndexerMetrics({ metrics, live, progress: indexerProgres
       ? 'running'
       : 'stopped';
   const rawEvents = Math.max(Number(live?.raw_events || 0), Number(metrics?.raw_events || 0));
+  const target = Number(metrics?.target || live?.target || FALLBACK_TARGET);
   const duneOrderFilled = Math.max(Number(live?.dune_orderfilled || 0), Number(metrics?.dune_orderfilled || 0));
   const lastBlock = Math.max(
     Number(indexerProgress?.last_block || 0),
@@ -21,7 +22,7 @@ export default function IndexerMetrics({ metrics, live, progress: indexerProgres
   const speed = indexerRunning
     ? Number(indexerProgress?.speed_blocks_per_second ?? live?.indexer_speed ?? metrics?.blocks_per_second ?? 0)
     : 0;
-  const progress = clamp(Math.max(Number(metrics?.progress || 0), Number(live?.progress || 0), rawEvents / TARGET));
+  const progress = clamp(Math.max(Number(metrics?.progress || 0), Number(live?.progress || 0), rawEvents / target));
   const lastBlockDate = formatBlockDate(indexerProgress?.last_block_date);
   const eta = indexerRunning ? formatEta(indexerProgress?.estimated_completion_seconds) : '-';
 
@@ -40,7 +41,7 @@ export default function IndexerMetrics({ metrics, live, progress: indexerProgres
         <Metric label="Last block" value={numberFull(lastBlock)} />
         <Metric label="Speed" value={`${speed.toFixed(2)} blk/s`} />
         <Metric label="OrderFilled Dune" value={numberFull(duneOrderFilled)} />
-        <Metric label="Target" value={numberCompact(TARGET, 1)} />
+        <Metric label="Target" value={numberCompact(target, 1)} />
       </div>
 
       <div className="mt-3 grid gap-2 border border-slate-700/70 bg-slate-950/40 p-3 text-xs uppercase text-slate-400">
@@ -62,7 +63,7 @@ export default function IndexerMetrics({ metrics, live, progress: indexerProgres
 
       <div className="mt-5">
         <div className="mb-2 flex items-center justify-between text-xs text-slate-400">
-          <span>{numberFull(rawEvents)} / {numberFull(TARGET)}</span>
+          <span>{numberFull(rawEvents)} / {numberFull(target)}</span>
           <span>{percent(progress, 4)}</span>
         </div>
         <div className="h-3 overflow-hidden rounded-full bg-slate-950">

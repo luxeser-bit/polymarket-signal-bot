@@ -64,7 +64,7 @@ from polymarket_signal_bot.scoring import calculate_all
 from polymarket_signal_bot.storage import DEFAULT_DB_PATH, Store
 
 
-TARGET_RAW_EVENTS = 86_000_000
+TARGET_RAW_EVENTS = 186_000_000
 COMPONENT_KEYS = ("indexer", "monitor", "live_paper")
 SERVER_LOG_DIR = ROOT / "data" / "server_logs"
 PROCESS_LOCK = threading.RLock()
@@ -2360,6 +2360,7 @@ def build_live_payload(settings: ServerSettings) -> dict[str, Any]:
         "last_block": metrics["last_block"],
         "indexer_speed": metrics["blocks_per_second"],
         "progress": metrics["progress"],
+        "target": metrics["target"],
         "balance": positions["balance"] or main_summary.get("balance", 0.0),
         "pnl": positions["pnl"] or main_summary.get("total_pnl", 0.0),
         "open_positions": positions["open_positions_count"] or main_summary.get("open_positions", 0),
