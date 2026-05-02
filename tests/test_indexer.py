@@ -53,6 +53,50 @@ class IndexerTests(unittest.TestCase):
             self.assertIn("raw_transactions", tables)
             self.assertIn("indexer_state", tables)
             self.assertIn("indexer_blocks", tables)
+            self.assertIn("indexer_counters", tables)
+
+    def test_store_tracks_raw_event_counter(self) -> None:
+        row = RawTransaction(
+            hash="0xtx",
+            log_index=1,
+            block_number=101,
+            block_hash="0xblock",
+            timestamp=1700000000,
+            user_address="0x1111111111111111111111111111111111111111",
+            market_id="market",
+            side="BUY",
+            price=0.5,
+            amount=1.0,
+            event_type="OrderFilled",
+            contract=CTF_EXCHANGE_ADDRESS,
+            raw_json="{}",
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            with IndexerStore(Path(tmp) / "state.db") as store:
+                store.init_schema()
+                self.assertEqual(
+                    store.conn.execute(
+                        "SELECT value FROM indexer_counters WHERE name = 'raw_events'"
+                    ).fetchone()[0],
+                    0,
+                )
+
+                self.assertEqual(store.insert_raw_transactions([row]), 1)
+                self.assertEqual(store.insert_raw_transactions([row]), 0)
+                self.assertEqual(
+                    store.conn.execute(
+                        "SELECT value FROM indexer_counters WHERE name = 'raw_events'"
+                    ).fetchone()[0],
+                    1,
+                )
+
+                store.delete_from_block(101)
+                self.assertEqual(
+                    store.conn.execute(
+                        "SELECT value FROM indexer_counters WHERE name = 'raw_events'"
+                    ).fetchone()[0],
+                    0,
+                )
 
     def test_decode_order_filled_buy(self) -> None:
         maker = "0x1111111111111111111111111111111111111111"

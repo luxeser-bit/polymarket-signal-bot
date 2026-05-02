@@ -82,6 +82,8 @@ METRICS_CURSOR: dict[str, float] = {
     "speed_at": 0.0,
 }
 METRICS_SPEED_STALE_SECONDS = 30.0
+INDEXER_COUNTER_CACHE: dict[str, Any] = {"snapshot": None, "expires_at": 0.0}
+INDEXER_COUNTER_CACHE_SECONDS = 2.0
 LIVE_PAYLOAD_CACHE: dict[str, Any] = {"payload": None, "expires_at": 0.0}
 LIVE_PAYLOAD_LOCK = threading.RLock()
 INDEXER_PROGRESS_LOCK = threading.RLock()
@@ -996,10 +998,14 @@ def indexer_counter_snapshot(db_path: Path) -> dict[str, int]:
     result = {"raw_events": 0, "last_block": 0, "updated_at": 0}
     if not db_path.exists():
         return result
+    now = time.time()
+    with METRICS_LOCK:
+        cached = INDEXER_COUNTER_CACHE.get("snapshot")
+        if cached is not None and float(INDEXER_COUNTER_CACHE.get("expires_at") or 0) > now:
+            return dict(cached)
     try:
         with sqlite_connect(db_path) as conn:
-            if table_exists(conn, "raw_transactions"):
-                result["raw_events"] = int(conn.execute("SELECT COUNT(*) FROM raw_transactions").fetchone()[0] or 0)
+            result["raw_events"] = raw_events_count(conn)
             if table_exists(conn, "indexer_state"):
                 row = conn.execute(
                     "SELECT last_block, updated_at FROM indexer_state ORDER BY updated_at DESC LIMIT 1"
@@ -1009,6 +1015,9 @@ def indexer_counter_snapshot(db_path: Path) -> dict[str, int]:
                     result["updated_at"] = int(row["updated_at"] or 0)
     except Exception:
         return result
+    with METRICS_LOCK:
+        INDEXER_COUNTER_CACHE["snapshot"] = dict(result)
+        INDEXER_COUNTER_CACHE["expires_at"] = now + INDEXER_COUNTER_CACHE_SECONDS
     return result
 
 
@@ -1148,16 +1157,10 @@ def indexer_metrics(settings: ServerSettings, *, include_process: bool = True) -
         snapshot["error"] = "indexer db not found"
         return snapshot
     try:
-        with sqlite_connect(settings.indexer_db) as conn:
-            if table_exists(conn, "raw_transactions"):
-                snapshot["raw_events"] = int(conn.execute("SELECT COUNT(*) FROM raw_transactions").fetchone()[0] or 0)
-            if table_exists(conn, "indexer_state"):
-                row = conn.execute(
-                    "SELECT last_block, updated_at FROM indexer_state ORDER BY updated_at DESC LIMIT 1"
-                ).fetchone()
-                if row:
-                    snapshot["last_block"] = int(row["last_block"] or 0)
-                    snapshot["updated_at"] = int(row["updated_at"] or 0)
+        counters = indexer_counter_snapshot(settings.indexer_db)
+        snapshot["raw_events"] = int(counters.get("raw_events") or 0)
+        snapshot["last_block"] = int(counters.get("last_block") or 0)
+        snapshot["updated_at"] = int(counters.get("updated_at") or 0)
         snapshot["progress"] = min(1.0, float(snapshot["raw_events"]) / TARGET_RAW_EVENTS)
         snapshot["blocks_per_second"] = block_speed(float(snapshot["last_block"])) if running and not stalled else 0.0
         return snapshot
@@ -2734,9 +2737,9 @@ def block_speed(last_block: float) -> float:
 @contextlib.contextmanager
 def sqlite_connect(path: Path) -> Any:
     uri = f"{path.resolve().as_uri()}?mode=ro"
-    conn = sqlite3.connect(uri, uri=True, timeout=30)
+    conn = sqlite3.connect(uri, uri=True, timeout=5)
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA busy_timeout=30000")
+    conn.execute("PRAGMA busy_timeout=5000")
     try:
         yield conn
     finally:
@@ -2755,6 +2758,20 @@ def table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
     if not table_exists(conn, table):
         return set()
     return {str(row["name"]) for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+
+
+def raw_events_count(conn: sqlite3.Connection) -> int:
+    if table_exists(conn, "indexer_counters"):
+        row = conn.execute(
+            "SELECT value FROM indexer_counters WHERE name = 'raw_events' LIMIT 1"
+        ).fetchone()
+        if row is not None:
+            return int(row["value"] or 0)
+    if table_exists(conn, "raw_transactions"):
+        # Fallback for old databases before the indexer initializes counters.
+        row = conn.execute("SELECT MAX(rowid) FROM raw_transactions").fetchone()
+        return int(row[0] or 0)
+    return 0
 
 
 def tail_file(path: Path, *, lines: int = 20) -> str:

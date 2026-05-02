@@ -226,9 +226,16 @@ class IndexerStore:
                 timestamp INTEGER NOT NULL,
                 updated_at INTEGER NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS indexer_counters (
+                name TEXT PRIMARY KEY,
+                value INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
             """
         )
         self.conn.commit()
+        self.ensure_counter("raw_events")
 
     def last_block(self, name: str = "polygon") -> int | None:
         row = self.conn.execute(
@@ -261,7 +268,7 @@ class IndexerStore:
         with self.conn:
             cursor = self.conn.executemany(
                 """
-                INSERT OR REPLACE INTO raw_transactions(
+                INSERT OR IGNORE INTO raw_transactions(
                     hash, log_index, block_number, block_hash, timestamp,
                     user_address, market_id, side, price, amount, event_type,
                     contract, raw_json, inserted_at
@@ -288,7 +295,9 @@ class IndexerStore:
                     for row in rows
                 ],
             )
-        return int(cursor.rowcount or 0)
+            inserted = int(cursor.rowcount or 0)
+            self.increment_counter("raw_events", inserted)
+        return inserted
 
     def upsert_blocks(self, blocks: Iterable[BlockInfo]) -> None:
         block_rows = list(blocks)
@@ -329,14 +338,48 @@ class IndexerStore:
 
     def delete_from_block(self, block_number: int) -> None:
         with self.conn:
-            self.conn.execute(
+            cursor = self.conn.execute(
                 "DELETE FROM raw_transactions WHERE block_number >= ?",
                 (block_number,),
             )
+            deleted = int(cursor.rowcount or 0)
+            self.increment_counter("raw_events", -deleted)
             self.conn.execute(
                 "DELETE FROM indexer_blocks WHERE block_number >= ?",
                 (block_number,),
             )
+
+    def ensure_counter(self, name: str) -> None:
+        row = self.conn.execute(
+            "SELECT value FROM indexer_counters WHERE name = ?",
+            (name,),
+        ).fetchone()
+        if row is not None:
+            return
+        value = 0
+        if name == "raw_events":
+            value = int(self.conn.execute("SELECT COUNT(*) FROM raw_transactions").fetchone()[0] or 0)
+        now = int(time.time())
+        self.conn.execute(
+            "INSERT INTO indexer_counters(name, value, updated_at) VALUES (?, ?, ?)",
+            (name, value, now),
+        )
+        self.conn.commit()
+
+    def increment_counter(self, name: str, delta: int) -> None:
+        if delta == 0:
+            return
+        now = int(time.time())
+        self.conn.execute(
+            """
+            INSERT INTO indexer_counters(name, value, updated_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(name) DO UPDATE SET
+                value = MAX(0, indexer_counters.value + ?),
+                updated_at = excluded.updated_at
+            """,
+            (name, max(0, delta), now, delta),
+        )
 
 
 class AsyncRateLimiter:
