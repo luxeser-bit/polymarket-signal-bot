@@ -76,8 +76,8 @@ class AutoTrainerTests(unittest.TestCase):
         self.assertEqual({example["entry_hash"] for example in examples}, {"0xbuy-1", "0xbuy-2"})
         self.assertEqual({example["exit_hash"] for example in examples}, {"0xsell-close"})
         hold_by_entry = {example["entry_hash"]: example["hold_seconds"] for example in examples}
-        self.assertEqual(hold_by_entry["0xbuy-1"], 20)
-        self.assertEqual(hold_by_entry["0xbuy-2"], 10)
+        self.assertEqual(hold_by_entry["0xbuy-1"], 70)
+        self.assertEqual(hold_by_entry["0xbuy-2"], 60)
 
     def test_exit_model_reports_train_test_metrics(self) -> None:
         examples = [
@@ -257,11 +257,11 @@ def _seed_strict_exit_pairs(db_path: Path) -> None:
         ("0xsell-before", 1, 1, now + 1, "0xaaa", "market-a", "SELL", 0.30, 10, "OrderFilled", now),
         ("0xbuy-1", 2, 2, now + 10, "0xaaa", "market-a", "BUY", 0.40, 100, "OrderFilled", now),
         ("0xbuy-2", 3, 3, now + 20, "0xaaa", "market-a", "BUY", 0.42, 120, "OrderFilled", now),
-        ("0xsell-close", 4, 4, now + 30, "0xaaa", "market-a", "SELL", 0.55, 100, "OrderFilled", now),
-        ("0xsell-later", 5, 5, now + 60, "0xaaa", "market-a", "SELL", 0.65, 100, "OrderFilled", now),
-        ("0xbuy-open", 6, 6, now + 70, "0xaaa", "market-open", "BUY", 0.20, 100, "OrderFilled", now),
-        ("0xother-buy", 7, 7, now + 80, "0xbbb", "market-a", "BUY", 0.10, 100, "OrderFilled", now),
-        ("0xother-sell", 8, 8, now + 90, "0xbbb", "market-a", "SELL", 0.15, 100, "OrderFilled", now),
+        ("0xsell-close", 4, 4, now + 80, "0xaaa", "market-a", "SELL", 0.55, 100, "OrderFilled", now),
+        ("0xsell-later", 5, 5, now + 110, "0xaaa", "market-a", "SELL", 0.65, 100, "OrderFilled", now),
+        ("0xbuy-open", 6, 6, now + 120, "0xaaa", "market-open", "BUY", 0.20, 100, "OrderFilled", now),
+        ("0xother-buy", 7, 7, now + 130, "0xbbb", "market-a", "BUY", 0.10, 100, "OrderFilled", now),
+        ("0xother-sell", 8, 8, now + 170, "0xbbb", "market-a", "SELL", 0.15, 100, "OrderFilled", now),
         ("0xnoise-transfer", 9, 9, now + 100, "0xaaa", "market-a", "BUY", 0.99, 100, "TransferSingle", now),
     ]
     conn.executemany(

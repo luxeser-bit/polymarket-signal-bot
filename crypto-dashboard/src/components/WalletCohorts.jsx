@@ -31,6 +31,7 @@ export default function WalletCohorts({ data, metrics, training, onRefreshTraini
     training?.exit_examples?.count ?? data?.exit_examples?.count ?? lastRun?.exit_examples ?? 0;
   const exitRows = Array.isArray(data?.exit_examples?.examples) ? data.exit_examples.examples : [];
   const modelMetrics = data?.model_metrics || {};
+  const enhancedExitModel = isXGBoostModel(modelMetrics.model_type);
   const scoredWallets = Number(data?.scored_wallets || 0);
   const currentRawRows = Number(metrics?.raw_events || data?.raw_transactions || 0);
   const trainedRawRows = Number(lastRun?.raw_transactions || 0);
@@ -143,7 +144,11 @@ export default function WalletCohorts({ data, metrics, training, onRefreshTraini
         <MetricTile label="median hold" value={secondsToDuration(modelMetrics.median_hold_time || 0)} />
         <MetricTile label="mae" value={modelMetrics.mae == null ? '-' : secondsToDuration(modelMetrics.mae)} />
         <MetricTile label="r2" value={modelMetrics.r2 == null ? '-' : Number(modelMetrics.r2 || 0).toFixed(3)} />
-        <MetricTile label="model" value={modelLabel(modelMetrics.model_type, modelMetrics.fallback_reason)} />
+        <MetricTile
+          label="model"
+          value={modelLabel(modelMetrics.model_type, modelMetrics.fallback_reason)}
+          highlight={enhancedExitModel}
+        />
       </div>
 
       <div className="grid grid-cols-4 gap-2">
@@ -270,10 +275,15 @@ export default function WalletCohorts({ data, metrics, training, onRefreshTraini
   );
 }
 
-function MetricTile({ label, value }) {
+function MetricTile({ label, value, highlight = false }) {
   return (
-    <div className="rounded-lg border border-slate-700/70 bg-slate-950/40 p-3">
-      <div className="text-sm font-semibold text-slate-100">{value}</div>
+    <div className={highlight
+      ? 'rounded-lg border border-emerald-300/80 bg-emerald-950/20 p-3 shadow-[0_0_18px_rgba(52,211,153,0.18)]'
+      : 'rounded-lg border border-slate-700/70 bg-slate-950/40 p-3'}
+    >
+      <div className={highlight ? 'text-sm font-semibold text-emerald-300' : 'text-sm font-semibold text-slate-100'}>
+        {highlight ? '◆ ' : ''}{value}
+      </div>
       <div className="mt-1 text-[10px] font-semibold uppercase tracking-wide text-slate-500">{label}</div>
     </div>
   );
@@ -281,8 +291,14 @@ function MetricTile({ label, value }) {
 
 function modelLabel(modelType, fallbackReason) {
   const raw = String(modelType || '').toLowerCase();
+  if (raw.includes('xgboost') || raw.includes('xgb')) return 'XGBoost';
   if (raw.includes('ridge')) return 'Ridge';
   if (raw.includes('dummy')) return 'Dummy';
   if (fallbackReason) return 'Dummy';
   return '-';
+}
+
+function isXGBoostModel(modelType) {
+  const raw = String(modelType || '').toLowerCase();
+  return raw.includes('xgboost') || raw.includes('xgb');
 }
