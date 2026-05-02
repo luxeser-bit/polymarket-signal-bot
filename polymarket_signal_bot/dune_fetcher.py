@@ -48,7 +48,7 @@ class DuneFetcherConfig:
     full: bool = False
     dry_run: bool = False
     page_size: int = DUNE_PAGE_SIZE
-    performance: str = "medium"
+    performance: str = "small"
     poll_seconds: float = 5.0
     max_wait_seconds: float = 3600.0
     request_timeout: float = 60.0
@@ -69,6 +69,11 @@ class DuneTrade:
     side: str
     market_id: str
     action: str = ""
+    evt_index: int = 0
+    unique_key: str = ""
+    token_outcome: str = ""
+    shares: float = 0.0
+    contract_address: str = ""
 
     @property
     def timestamp(self) -> int:
@@ -122,7 +127,7 @@ class DuneApiClient:
             raise DuneFetcherError("Dune client is not connected")
         response = await self._client.post(
             "/sql/execute",
-            json={"query_sql": sql, "performance": self.config.performance},
+            json={"sql": sql, "performance": self.config.performance},
         )
         payload = self._json_response(response)
         execution_id = str(payload.get("execution_id") or "")
@@ -258,14 +263,12 @@ class DuneTradeStore:
             return InsertResult(candidates=0, inserted=0, skipped_existing=0)
         existing_pairs = self.existing_tx_block_pairs(trades)
         candidates: list[RawTransaction] = []
-        seen_pairs = set(existing_pairs)
         skipped_existing = 0
         for trade in trades:
             pair = (trade.tx_hash, trade.block_number)
-            if pair in seen_pairs:
+            if pair in existing_pairs:
                 skipped_existing += 1
                 continue
-            seen_pairs.add(pair)
             candidates.append(dune_trade_to_raw_transaction(trade))
 
         inserted = self.insert_raw_transactions(candidates)
@@ -289,6 +292,7 @@ class DuneTradeStore:
                 SELECT hash, block_number
                 FROM raw_transactions
                 WHERE hash IN ({placeholders})
+                  AND event_type = 'OrderFilled'
                 """,
                 list(chunk),
             ).fetchall()
@@ -451,14 +455,19 @@ def build_market_trades_sql(
         LOWER(CAST(tx_hash AS VARCHAR)) AS tx_hash,
         LOWER(CAST(maker AS VARCHAR)) AS maker,
         LOWER(CAST(taker AS VARCHAR)) AS taker,
-        CAST(token_id AS VARCHAR) AS token_id,
+        CAST(asset_id AS VARCHAR) AS token_id,
         CAST(price AS DOUBLE) AS price,
         CAST(amount AS DOUBLE) AS amount,
-        UPPER(CAST(side AS VARCHAR)) AS side,
-        CAST(condition_id AS VARCHAR) AS market_id{action_select}
+        'BUY' AS side,
+        CAST(condition_id AS VARCHAR) AS market_id{action_select},
+        CAST(evt_index AS BIGINT) AS evt_index,
+        CAST(unique_key AS VARCHAR) AS unique_key,
+        CAST(token_outcome AS VARCHAR) AS token_outcome,
+        CAST(shares AS DOUBLE) AS shares,
+        LOWER(CAST(contract_address AS VARCHAR)) AS contract_address
     FROM polymarket_polygon.market_trades
     WHERE {where}
-    ORDER BY block_time ASC, block_number ASC, tx_hash ASC
+    ORDER BY block_time ASC, block_number ASC, tx_hash ASC, evt_index ASC
     """.strip()
 
 
@@ -495,23 +504,30 @@ def dedupe_key(trade: DuneTrade) -> tuple[Any, ...]:
         round(trade.amount, 10),
         trade.side,
         trade.market_id,
+        trade.token_id,
     )
 
 
 def normalize_dune_trade(row: dict[str, Any]) -> DuneTrade:
-    market_id = str(row.get("market_id") or row.get("condition_id") or row.get("token_id") or "")
+    token_id = str(row.get("token_id") or row.get("asset_id") or "")
+    market_id = str(row.get("market_id") or row.get("condition_id") or token_id or "")
     return DuneTrade(
         block_time=str(row.get("block_time") or ""),
         block_number=int(row.get("block_number") or 0),
         tx_hash=str(row.get("tx_hash") or row.get("hash") or "").lower(),
         maker=normalize_address(str(row.get("maker") or "")),
         taker=normalize_address(str(row.get("taker") or "")),
-        token_id=str(row.get("token_id") or ""),
+        token_id=token_id,
         price=float(row.get("price") or 0.0),
         amount=float(row.get("amount") or 0.0),
         side=normalize_side(str(row.get("side") or "")),
         market_id=market_id,
         action=str(row.get("action") or ""),
+        evt_index=int(row.get("evt_index") or 0),
+        unique_key=str(row.get("unique_key") or ""),
+        token_outcome=str(row.get("token_outcome") or ""),
+        shares=float(row.get("shares") or 0.0),
+        contract_address=normalize_address(str(row.get("contract_address") or "")),
     )
 
 
@@ -526,6 +542,11 @@ def dune_trade_to_raw_transaction(trade: DuneTrade) -> RawTransaction:
         "token_id": trade.token_id,
         "condition_id": trade.market_id,
         "action": trade.action,
+        "evt_index": trade.evt_index,
+        "unique_key": trade.unique_key,
+        "token_outcome": trade.token_outcome,
+        "shares": trade.shares,
+        "side_inferred": True,
     }
     return RawTransaction(
         hash=trade.tx_hash,
@@ -539,7 +560,7 @@ def dune_trade_to_raw_transaction(trade: DuneTrade) -> RawTransaction:
         price=trade.price,
         amount=trade.amount,
         event_type="OrderFilled",
-        contract="dune:polymarket_polygon.market_trades",
+        contract=trade.contract_address or "dune:polymarket_polygon.market_trades",
         raw_json=json.dumps(raw_json, sort_keys=True),
     )
 
@@ -552,8 +573,10 @@ def trade_user_address(trade: DuneTrade) -> str:
 
 
 def synthetic_log_index(trade: DuneTrade) -> int:
+    if trade.evt_index:
+        return 2_000_000_000 + min(999_999_999, max(0, trade.evt_index))
     digest = hashlib.sha1(
-        f"{trade.tx_hash}|{trade.block_number}|{trade.market_id}|{trade.side}|{trade.price}|{trade.amount}".encode(
+        f"{trade.tx_hash}|{trade.block_number}|{trade.market_id}|{trade.token_id}|{trade.side}|{trade.price}|{trade.amount}".encode(
             "utf-8"
         )
     ).hexdigest()
@@ -572,6 +595,9 @@ def dune_trade_to_example(trade: DuneTrade) -> dict[str, Any]:
         "price": trade.price,
         "amount": trade.amount,
         "action": trade.action,
+        "evt_index": trade.evt_index,
+        "token_outcome": trade.token_outcome,
+        "shares": trade.shares,
     }
 
 
@@ -641,7 +667,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--db", default=os.getenv("INDEXER_DB_PATH", str(DEFAULT_INDEXER_DB_PATH)))
     parser.add_argument("--page-size", type=int, default=int(os.getenv("DUNE_PAGE_SIZE", str(DUNE_PAGE_SIZE))))
     parser.add_argument("--batch-size", type=int, default=int(os.getenv("DUNE_BATCH_SIZE", "2000")))
-    parser.add_argument("--performance", choices=("small", "medium", "large"), default=os.getenv("DUNE_PERFORMANCE", "medium"))
+    parser.add_argument("--performance", choices=("small", "medium", "large"), default=os.getenv("DUNE_PERFORMANCE", "small"))
     parser.add_argument("--poll-seconds", type=float, default=float(os.getenv("DUNE_POLL_SECONDS", "5")))
     parser.add_argument("--max-wait-seconds", type=float, default=float(os.getenv("DUNE_MAX_WAIT_SECONDS", "3600")))
     parser.add_argument("--log-level", default=os.getenv("LOG_LEVEL", "INFO"))
